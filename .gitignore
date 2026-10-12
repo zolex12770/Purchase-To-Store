@@ -1,0 +1,80 @@
+# ── Dependencies ──────────────────────────────────────────────────────────────
+node_modules/
+.pnp/
+.pnp.js
+
+# ── Build output ──────────────────────────────────────────────────────────────
+dist/
+build/
+*.tsbuildinfo
+
+# ── Secrets and environment (SRS §25, §27) ────────────────────────────────────
+# Only .env.example is ever committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+google-credentials*.json
+
+# ── DATABASE/ exports ──────────────────────────────────────────────────────────
+# DATABASE/ holds generated exports of REAL business data (SQL dumps, Excel
+# workbooks, Google Sheet archives) — see DATABASE/README.md. The schema and
+# docs are versioned; the data itself is not, for the same reason .env isn't.
+DATABASE/SQL/zolex_data_*.sql
+DATABASE/EXCEL/*.xlsx
+DATABASE/GOOGLE_SHEET/*.json
+DATABASE/BACKUPS/*/
+!DATABASE/SQL/schema_mysql.sql
+!DATABASE/README.md
+
+# ── Data, backups and logs ────────────────────────────────────────────────────
+# These belong OUTSIDE the project (see ZOLEX_DATA_ROOT). The patterns below are
+# a backstop in case anyone points the data root at the repository by mistake.
+ZolexERP/
+data/
+data-test/
+backups/
+uploads/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+pgdata/
+
+# ── Editors and OS ────────────────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Test and tooling artefacts ────────────────────────────────────────────────
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+.cache/
+.temp/
+tmp/
+check_pm2.js
+tmp_sales_sop_structure.txt
+
+# ── Archives ─────────────────────────────────────────────────────────────────
+# Source archives are almost entirely node_modules and can silently carry an
+# .env if one was present when they were made. Build them outside the repo.
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# ── Deployment secrets ───────────────────────────────────────────────────────
+deploy/.env.deploy
+deploy/backups/
+deploy/certs/
+# ...but the TEMPLATE must ship: `.env.*` above would otherwise swallow it.
+!deploy/.env.deploy.example

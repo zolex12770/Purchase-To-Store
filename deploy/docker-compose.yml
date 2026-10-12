@@ -1,0 +1,107 @@
+# =============================================================================
+# ZOLEX Purchase-to-Store ERP — production stack
+#
+#   docker compose --env-file ./.env.deploy up -d --build
+#
+# Three services: PostgreSQL, the API, and nginx serving the built frontend and
+# proxying /api to the API.
+#
+# Nothing here contains a secret. Every credential comes from `.env.deploy`,
+# which is git-ignored and must be created from `.env.deploy.example`.
+#
+# Persistent data lives in named volumes, never inside a container layer and
+# never inside the source tree (SRS §19, §23, §26).
+# =============================================================================
+
+name: zolex
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env.deploy}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env.deploy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.deploy}
+      # Deterministic collation, so ORDER BY does not change with the host locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - zolex_pgdata:/var/lib/postgresql/data
+      # Backups land on the host so they survive `docker compose down -v`.
+      - ${ZOLEX_BACKUP_DIR:-./backups}:/backups
+    healthcheck:
+      # The API must not start migrating against a database that is still booting.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # Not published to the host: only the API needs to reach it.
+    expose:
+      - "5432"
+    networks: [zolex]
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      DB_DRIVER: pg
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL in .env.deploy}
+      AUTH_SECRET: ${AUTH_SECRET:?generate with openssl rand -base64 48}
+      AUTH_REFRESH_SECRET: ${AUTH_REFRESH_SECRET:?generate with openssl rand -base64 48}
+      ZOLEX_DATA_ROOT: /data
+      # Demo data is refused in production regardless, but be explicit.
+      SEED_DEMO_DATA: "false"
+      GOOGLE_SHEET_ID: ${GOOGLE_SHEET_ID:-}
+      # Mounted read-only below; leave blank to run without Google Sheets.
+      GOOGLE_SERVICE_ACCOUNT_KEY_FILE: ${GOOGLE_SERVICE_ACCOUNT_KEY_FILE:-}
+    volumes:
+      - zolex_data:/data
+      - ${ZOLEX_BACKUP_DIR:-./backups}:/data/backups
+      # The Google key is mounted read-only and never copied into the image.
+      - ${GOOGLE_KEY_HOST_PATH:-/dev/null}:/run/secrets/google-sheets.json:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    expose:
+      - "4000"
+    networks: [zolex]
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        # Baked in at build time: the browser calls /api on the same origin.
+        VITE_API_BASE_URL: /api/v1
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Let's Encrypt certificates, if you terminate TLS here.
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+    networks: [zolex]
+
+volumes:
+  zolex_pgdata:
+  zolex_data:
+
+networks:
+  zolex:
+    driver: bridge

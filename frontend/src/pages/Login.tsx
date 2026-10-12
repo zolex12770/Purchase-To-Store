@@ -1,0 +1,267 @@
+/**
+ * Sign-in (SRS §6, §28 of the brief).
+ *
+ * Employee ID + password, show/hide, validation, loading and error states.
+ * No credential is ever hard-coded into this bundle — the hint shown in
+ * development is a pointer to the seeded bootstrap account, and it is suppressed
+ * in a production build.
+ */
+import { useState, type FormEvent } from 'react';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
+import { Zap, Eye, EyeOff, ArrowRight, ShieldCheck, AlertCircle, KeyRound } from 'lucide-react';
+import { useAuth } from '../lib/auth';
+import { ApiError } from '../lib/api';
+import { Button, Field, Input } from '../components/ui';
+
+export default function Login() {
+  const { signIn } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const [employeeId, setEmployeeId] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+
+  const from = (location.state as { from?: string } | null)?.from ?? '/home';
+
+  async function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setFieldErrors({});
+
+    const issues: Record<string, string> = {};
+    if (!employeeId.trim()) issues.employeeId = 'Enter your Employee ID.';
+    if (!password) issues.password = 'Enter your password.';
+    if (Object.keys(issues).length > 0) { setFieldErrors(issues); return; }
+
+    setSubmitting(true);
+    try {
+      await signIn(employeeId.trim(), password);
+      navigate(from, { replace: true });
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.message);
+        setFieldErrors(err.fieldErrors);
+      } else {
+        setError('Cannot reach the Zolex server. Check that the backend is running.');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div style={{ minHeight: '100vh', display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', background: 'var(--bg-app)' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(460px, 100%), 1fr))', minHeight: '100vh' }}>
+        {/* ── Brand panel ───────────────────────────────────────────────── */}
+        <div
+          style={{
+            background: 'var(--grad-brand-deep)', color: '#fff',
+            padding: 'var(--sp-12) var(--sp-10)',
+            display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
+            position: 'relative', overflow: 'hidden',
+          }}
+        >
+          {/* Slow-drifting colour mesh. Purely decorative, and it stops entirely
+              under prefers-reduced-motion via the global rule in base.css. */}
+          <div
+            aria-hidden
+            style={{
+              position: 'absolute', inset: '-25%',
+              background:
+                'radial-gradient(46% 40% at 22% 18%, rgba(139,92,246,0.42), transparent 62%),' +
+                'radial-gradient(42% 36% at 82% 30%, rgba(31,160,224,0.34), transparent 62%),' +
+                'radial-gradient(48% 42% at 62% 88%, rgba(238,176,42,0.26), transparent 62%)',
+              backgroundSize: '200% 200%',
+              animation: 'zx-gradient-drift 26s var(--ease) infinite',
+            }}
+          />
+          {/* Fine grid, so the panel reads as engineered rather than merely coloured. */}
+          <div
+            aria-hidden
+            style={{
+              position: 'absolute', inset: 0, opacity: 0.5,
+              backgroundImage:
+                'linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),' +
+                'linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px)',
+              backgroundSize: '52px 52px',
+              maskImage: 'radial-gradient(120% 90% at 50% 40%, #000 30%, transparent 78%)',
+              WebkitMaskImage: 'radial-gradient(120% 90% at 50% 40%, #000 30%, transparent 78%)',
+            }}
+          />
+
+          <Link to="/" className="row" style={{ gap: 11, textDecoration: 'none', position: 'relative' }}>
+            <span style={{ width: 36, height: 36, borderRadius: 10, background: 'var(--grad-accent)', display: 'grid', placeItems: 'center', boxShadow: '0 3px 14px rgba(238,176,42,0.5)' }}>
+              <Zap size={20} color="#fff" strokeWidth={2.5} />
+            </span>
+            <span>
+              <div style={{ color: '#fff', fontWeight: 700, fontSize: 'var(--text-xl)', letterSpacing: '0.09em', lineHeight: 1 }}>ZOLEX</div>
+              <div style={{ color: 'rgba(255,255,255,0.6)', fontSize: '11px', marginTop: 3 }}>Purchase-to-Store Enterprise ERP</div>
+            </span>
+          </Link>
+
+          <div style={{ position: 'relative', maxWidth: 460 }}>
+            <h1
+              style={{
+                fontSize: 'clamp(1.7rem, 3.6vw, 2.6rem)', lineHeight: 1.15,
+                letterSpacing: '-0.028em', marginBottom: 'var(--sp-4)', color: '#fff',
+              }}
+            >
+              Every quantity balances.<br />
+              <span
+                style={{
+                  background: 'linear-gradient(100deg, var(--gold-300), var(--violet-300) 60%, var(--sky-300))',
+                  WebkitBackgroundClip: 'text', backgroundClip: 'text',
+                  WebkitTextFillColor: 'transparent', color: 'transparent',
+                }}
+              >
+                Every number traces back.
+              </span>
+            </h1>
+            <p style={{ fontSize: 'var(--text-md)', color: 'rgba(255,255,255,0.72)', lineHeight: 1.65 }}>
+              Indent, approval, purchase order and goods receipt on one auditable ledger for
+              Zeeta Electrical Engineering.
+            </p>
+
+            <div className="stack" style={{ gap: 'var(--sp-3)', marginTop: 'var(--sp-8)' }}>
+              {[
+                'Master-driven forms that fill themselves',
+                'Consolidate several indents into one purchase order',
+                'Partial and final receipt with correct balances',
+                'Drill from any KPI to the source transaction',
+              ].map((t) => (
+                <div key={t} className="row" style={{ gap: 10, fontSize: 'var(--text-sm)', color: 'rgba(255,255,255,0.8)' }}>
+                  <ShieldCheck size={15} style={{ color: 'var(--accent-300)', flexShrink: 0 }} />
+                  {t}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ position: 'relative', fontSize: 'var(--text-xs)', color: 'rgba(255,255,255,0.45)' }}>
+            Zeeta Electrical Engineering Pvt. Ltd. · Purchase-to-Store ERP v1.0
+          </div>
+        </div>
+
+        {/* ── Form panel ────────────────────────────────────────────────── */}
+        <div
+          style={{
+            display: 'grid', placeItems: 'center', padding: 'var(--sp-8) var(--sp-6)',
+            background: 'var(--bg-app)', backgroundImage: 'var(--bg-app-accent)',
+          }}
+        >
+          <div
+            className="card"
+            style={{
+              width: '100%', maxWidth: 424,
+              padding: 'var(--sp-8) var(--sp-7)',
+              boxShadow: 'var(--shadow-xl)',
+              borderRadius: 'var(--radius-lg)',
+              animation: 'zx-fade-up var(--dur-slow) var(--ease-out)',
+              overflow: 'visible',
+            }}
+          >
+            <div style={{ marginBottom: 'var(--sp-7)' }}>
+              <h2 style={{ fontSize: 'var(--text-2xl)', color: 'var(--ink-900)', letterSpacing: '-0.02em' }}>Sign in</h2>
+              <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)', marginTop: 5 }}>
+                Use the Employee ID issued by your administrator.
+              </p>
+            </div>
+
+            {error && (
+              <div
+                role="alert"
+                className="row"
+                style={{
+                  gap: 9, padding: 'var(--sp-3) var(--sp-4)', marginBottom: 'var(--sp-5)',
+                  borderRadius: 'var(--radius-sm)', background: 'var(--danger-50)',
+                  border: '1px solid var(--danger-100)', color: 'var(--danger-700)',
+                  fontSize: 'var(--text-sm)', alignItems: 'flex-start',
+                  animation: 'zx-rise var(--dur) var(--ease-out)',
+                }}
+              >
+                <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <form onSubmit={onSubmit} className="stack" style={{ gap: 'var(--sp-4)' }} noValidate>
+              <Field label="Employee ID" required error={fieldErrors.employeeId}>
+                <Input
+                  value={employeeId}
+                  onChange={(e) => setEmployeeId(e.target.value)}
+                  placeholder="e.g. 10221"
+                  autoComplete="username"
+                  autoFocus
+                  invalid={Boolean(fieldErrors.employeeId)}
+                  disabled={submitting}
+                />
+              </Field>
+
+              <Field label="Password" required error={fieldErrors.password}>
+                <div style={{ position: 'relative' }}>
+                  <Input
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Your password"
+                    autoComplete="current-password"
+                    invalid={Boolean(fieldErrors.password)}
+                    disabled={submitting}
+                    style={{ paddingRight: 38 }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    style={{
+                      position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)',
+                      color: 'var(--ink-400)', display: 'grid', placeItems: 'center',
+                    }}
+                  >
+                    {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                  </button>
+                </div>
+              </Field>
+
+              <Button type="submit" variant="primary" size="lg" block loading={submitting} iconRight={!submitting ? <ArrowRight size={17} /> : undefined}>
+                {submitting ? 'Signing in…' : 'Sign in'}
+              </Button>
+            </form>
+
+            {import.meta.env.DEV && (
+              <div
+                style={{
+                  marginTop: 'var(--sp-6)', padding: 'var(--sp-3) var(--sp-4)',
+                  borderRadius: 'var(--radius-sm)', background: 'var(--warning-50)',
+                  border: '1px dashed var(--warning-100)',
+                }}
+              >
+                <div className="row" style={{ gap: 7, marginBottom: 4 }}>
+                  <KeyRound size={13} style={{ color: 'var(--warning-600)' }} />
+                  <span style={{ fontSize: 'var(--text-xs)', fontWeight: 600, color: 'var(--warning-700)' }}>
+                    Development environment
+                  </span>
+                </div>
+                <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--ink-600)', lineHeight: 1.6 }}>
+                  Bootstrap administrator <strong>10221</strong> or <strong>10422</strong> with the seeded
+                  password. You will be required to change it at first sign-in, and this hint does not
+                  appear in a production build.
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginTop: 'var(--sp-6)', textAlign: 'center' }}>
+              <Link to="/" style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
+                ← Back to overview
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

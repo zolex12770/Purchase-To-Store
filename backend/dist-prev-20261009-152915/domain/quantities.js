@@ -1,0 +1,161 @@
+/**
+ * Quantity control (ADR-005; SRS §11.3, §12, §20, §34).
+ *
+ * The ONLY place in the codebase that decides whether a requested quantity is
+ * allowed. The PO service, the GRN service, the import pipeline and the sync
+ * engine all call through here, so there is exactly one definition of "eligible"
+ * and "outstanding" (SRS §54: no duplicate business logic).
+ *
+ * Every function takes a transaction handle and locks its source row before
+ * reading the balance, so the check and the write cannot be separated by a
+ * competing request.
+ */
+import { txQueryOne } from '../db/index.js';
+import { BusinessRuleError, NotFoundError } from '../core/errors.js';
+import { dec, toQty } from './money.js';
+/**
+ * Locks an indent line and returns its authoritative balance.
+ *
+ * The FOR UPDATE is taken on `purchase_indent_lines` (the base table) because a
+ * view cannot be locked; holding that row serialises every PO that would consume
+ * from this line for the remainder of the caller's transaction.
+ */
+export async function lockIndentLineBalance(tx, indentLineId) {
+    const locked = await txQueryOne(tx, 'SELECT id FROM purchase_indent_lines WHERE id = $1 FOR UPDATE', [indentLineId]);
+    if (!locked)
+        throw NotFoundError(`Indent line ${indentLineId}`);
+    const balance = await txQueryOne(tx, 'SELECT * FROM v_indent_line_balance WHERE indent_line_id = $1', [indentLineId]);
+    if (!balance)
+        throw NotFoundError(`Indent line ${indentLineId}`);
+    return balance;
+}
+/**
+ * Asserts that `requestedQty` may be drawn from an indent line.
+ *
+ *   eligible = indent_qty − already-ordered qty  (SRS §11.3)
+ */
+export function assertIndentDrawAllowed(balance, requestedQty) {
+    if (balance.indent_status !== 'APPROVED') {
+        throw BusinessRuleError(`Indent ${balance.indent_no} is not approved (currently ${balance.indent_status}); ` +
+            `only approved indents can be converted into a purchase order.`, { indentNo: balance.indent_no, status: balance.indent_status });
+    }
+    if (balance.is_closed) {
+        throw BusinessRuleError(`Line ${balance.line_no} of indent ${balance.indent_no} (${balance.item_code}) has been closed ` +
+            `and cannot be ordered against.`);
+    }
+    const requested = dec(requestedQty);
+    if (requested.lessThanOrEqualTo(0)) {
+        throw BusinessRuleError('Quantity must be greater than zero.');
+    }
+    const pending = dec(balance.pending_qty);
+    if (requested.greaterThan(pending)) {
+        throw BusinessRuleError(`Cannot order ${toQty(requested)} of ${balance.item_code} against indent ${balance.indent_no} ` +
+            `line ${balance.line_no}: only ${toQty(pending)} remains eligible ` +
+            `(indent ${toQty(balance.indent_qty)} − already ordered ${toQty(balance.ordered_qty)}).`, {
+            itemCode: balance.item_code,
+            indentNo: balance.indent_no,
+            lineNo: balance.line_no,
+            requested: toQty(requested),
+            available: toQty(pending),
+            indentQty: toQty(balance.indent_qty),
+            orderedQty: toQty(balance.ordered_qty),
+        });
+    }
+}
+/** Locks a PO line and returns its authoritative balance. */
+export async function lockPoLineBalance(tx, poLineId) {
+    const locked = await txQueryOne(tx, 'SELECT id FROM purchase_order_lines WHERE id = $1 FOR UPDATE', [poLineId]);
+    if (!locked)
+        throw NotFoundError(`Purchase order line ${poLineId}`);
+    const balance = await txQueryOne(tx, 'SELECT * FROM v_po_line_balance WHERE po_line_id = $1', [poLineId]);
+    if (!balance)
+        throw NotFoundError(`Purchase order line ${poLineId}`);
+    return balance;
+}
+/**
+ * Asserts that `requestedQty` may be received against a PO line.
+ *
+ *   outstanding = po_qty − already-received qty  (SRS §12)
+ *
+ * `excludeGrnId` lets an existing draft GRN be re-validated on edit without its
+ * own quantity counting against itself.
+ */
+export function assertGrnReceiptAllowed(balance, requestedQty, alreadyOnThisGrn = '0') {
+    if (balance.po_status === 'DRAFT') {
+        throw BusinessRuleError(`Purchase order ${balance.po_no} has not been issued yet. Issue the PO before receiving goods.`, { poNo: balance.po_no, status: balance.po_status });
+    }
+    if (balance.po_status === 'CANCELLED') {
+        throw BusinessRuleError(`Purchase order ${balance.po_no} has been cancelled.`);
+    }
+    if (balance.po_status === 'SHORT_CLOSED') {
+        throw BusinessRuleError(`Purchase order ${balance.po_no} has been short-closed and accepts no further receipts.`);
+    }
+    if (balance.is_closed) {
+        throw BusinessRuleError(`Line ${balance.line_no} of PO ${balance.po_no} (${balance.item_code}) is closed.`);
+    }
+    const requested = dec(requestedQty);
+    if (requested.lessThanOrEqualTo(0)) {
+        throw BusinessRuleError('GRN quantity must be greater than zero.');
+    }
+    // Outstanding is measured against POSTED receipts; a draft GRN being edited adds
+    // back its own previously-entered quantity so the user is not blocked by themselves.
+    const outstanding = dec(balance.pending_grn_qty).plus(dec(alreadyOnThisGrn));
+    if (requested.greaterThan(outstanding)) {
+        throw BusinessRuleError(`Cannot receive ${toQty(requested)} of ${balance.item_code} against PO ${balance.po_no} ` +
+            `line ${balance.line_no}: only ${toQty(outstanding)} is outstanding ` +
+            `(ordered ${toQty(balance.po_qty)} − received ${toQty(balance.received_qty)}).`, {
+            itemCode: balance.item_code,
+            poNo: balance.po_no,
+            lineNo: balance.line_no,
+            requested: toQty(requested),
+            outstanding: toQty(outstanding),
+            poQty: toQty(balance.po_qty),
+            receivedQty: toQty(balance.received_qty),
+        });
+    }
+}
+/* ── Derived status recomputation (ADR-003) ─────────────────────────────────── */
+/**
+ * Recomputes a purchase order's status from its receipts and persists it.
+ * Called inside the transaction of every operation that changes receipts, so
+ * `purchase_order_headers.status` can never drift from `derived_status`.
+ */
+export async function recomputePoStatus(tx, poId) {
+    const row = await txQueryOne(tx, 'SELECT status, derived_status FROM v_po_header_balance WHERE po_id = $1', [poId]);
+    if (!row)
+        throw NotFoundError(`Purchase order ${poId}`);
+    // DRAFT / CANCELLED / SHORT_CLOSED are administrative states the receipts must not override.
+    if (['DRAFT', 'CANCELLED', 'SHORT_CLOSED'].includes(row.status))
+        return row.status;
+    if (row.derived_status !== row.status) {
+        await tx.query(`UPDATE purchase_order_headers
+          SET status = $2, updated_at = now()
+        WHERE id = $1`, [poId, row.derived_status]);
+    }
+    return row.derived_status;
+}
+/**
+ * Closes an approved indent once every line is fully ordered, so it stops
+ * appearing in the "awaiting PO" work list. Idempotent.
+ */
+export async function recomputeIndentClosure(tx, indentId) {
+    const row = await txQueryOne(tx, `SELECT h.status, b.total_pending_qty, b.line_count
+       FROM purchase_indent_headers h
+       JOIN v_indent_header_balance b ON b.indent_id = h.id
+      WHERE h.id = $1`, [indentId]);
+    if (!row)
+        return;
+    const fullyOrdered = Number(row.line_count) > 0 && dec(row.total_pending_qty).lessThanOrEqualTo(0);
+    if (row.status === 'APPROVED' && fullyOrdered) {
+        await tx.query(`UPDATE purchase_indent_headers
+          SET status = 'CLOSED', closed_at = now(), close_reason = 'Fully ordered', updated_at = now()
+        WHERE id = $1`, [indentId]);
+    }
+    else if (row.status === 'CLOSED' && !fullyOrdered) {
+        // A cancelled PO released quantity back — reopen the indent.
+        await tx.query(`UPDATE purchase_indent_headers
+          SET status = 'APPROVED', closed_at = NULL, close_reason = NULL, updated_at = now()
+        WHERE id = $1`, [indentId]);
+    }
+}
+//# sourceMappingURL=quantities.js.map

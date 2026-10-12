@@ -1,0 +1,151 @@
+/* ═══════════════════════════ SIMPLE WORKFLOW ═══════════════════════════
+   Screens used by shop-floor staff: large touch targets, one obvious next
+   step, and plain words. Everything here is additive — no existing class is
+   redefined — so the analytical screens are untouched.                     */
+
+/* Home: the work that is waiting for the person signed in. */
+.work-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(250px, 100%), 1fr));
+  gap: var(--sp-4);
+}
+.work-card {
+  position: relative; display: flex; flex-direction: column; gap: var(--sp-2);
+  padding: var(--sp-5); text-align: left; font-family: inherit; cursor: pointer;
+  background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xs); color: var(--text-primary);
+  border-left: 5px solid var(--work-accent, var(--brand-500));
+  transition: transform var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+.work-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.work-card:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.work-card-count {
+  font-size: 2.5rem; line-height: 1; font-weight: var(--weight-extrabold);
+  font-variant-numeric: tabular-nums; color: var(--work-accent, var(--brand-600));
+}
+.work-card-count.is-zero { color: var(--ink-400); }
+.work-card-title { font-size: var(--text-lg); font-weight: var(--weight-bold); }
+.work-card-hint { font-size: var(--text-sm); color: var(--text-muted); line-height: 1.45; }
+.work-card-action {
+  display: inline-flex; align-items: center; gap: 6px; margin-top: auto; padding-top: var(--sp-2);
+  font-size: var(--text-md); font-weight: var(--weight-bold); color: var(--work-accent, var(--brand-600));
+}
+.work-section-title {
+  font-size: var(--text-lg); font-weight: var(--weight-bold); color: var(--text-primary);
+  margin: var(--sp-6) 0 var(--sp-3);
+}
+
+/* Two or three large choices: which way does the user want to do this? */
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
+  gap: var(--sp-4);
+}
+.choice-card {
+  display: flex; gap: var(--sp-4); align-items: flex-start; text-align: left; font-family: inherit;
+  padding: var(--sp-6); cursor: pointer; color: var(--text-primary);
+  background: var(--bg-surface); border: 2px solid var(--border); border-radius: var(--radius-md);
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+.choice-card:hover { border-color: var(--brand-500); box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.choice-card:focus-visible { outline: none; border-color: var(--brand-500); box-shadow: var(--shadow-focus); }
+.choice-card-icon {
+  flex: 0 0 auto; display: grid; place-items: center; width: 56px; height: 56px;
+  border-radius: var(--radius); background: var(--brand-50); color: var(--brand-600);
+}
+.choice-card-title { font-size: var(--text-xl); font-weight: var(--weight-bold); margin-bottom: 4px; }
+.choice-card-text { font-size: var(--text-md); color: var(--text-muted); line-height: 1.5; }
+.choice-card-go {
+  display: inline-flex; align-items: center; gap: 6px; margin-top: var(--sp-3);
+  font-size: var(--text-md); font-weight: var(--weight-bold); color: var(--brand-600);
+}
+
+/* Step 1, Step 2, Step 3. */
+.step-bar { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+.step-bar-item {
+  display: inline-flex; align-items: center; gap: var(--sp-2); padding: 8px 14px;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--bg-surface); color: var(--text-muted);
+  font-size: var(--text-md); font-weight: var(--weight-semibold);
+}
+.step-bar-item .step-no {
+  display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%;
+  background: var(--ink-100); color: var(--ink-600); font-size: var(--text-sm); font-weight: var(--weight-bold);
+}
+.step-bar-item.is-current { border-color: var(--brand-500); background: var(--brand-50); color: var(--brand-700); }
+.step-bar-item.is-current .step-no { background: var(--brand-500); color: #fff; }
+.step-bar-item.is-done { color: var(--success-700); border-color: var(--success-100); background: var(--success-50); }
+.step-bar-item.is-done .step-no { background: var(--success-500); color: #fff; }
+.step-bar-sep { color: var(--ink-300); }
+
+/* Pick-list grouped by document (Indent and its items, PO and its items). */
+.pick-wrap { max-height: 60vh; overflow: auto; border-top: 1px solid var(--border-subtle); }
+.pick-table { width: 100%; border-collapse: collapse; font-size: var(--text-md); }
+.pick-table th {
+  text-align: left; padding: 10px 12px; font-size: var(--text-xs); font-weight: var(--weight-bold);
+  text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted);
+  background: var(--bg-inset); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 1;
+}
+.pick-table th.right, .pick-table td.right { text-align: right; }
+.pick-table td { padding: 12px; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
+.pick-table tr.pick-group td {
+  background: var(--bg-inset); border-top: 2px solid var(--border); border-bottom: 1px solid var(--border);
+  font-weight: var(--weight-bold); cursor: pointer;
+}
+.pick-table tr.pick-line { cursor: pointer; }
+.pick-table tr.pick-line:hover td { background: var(--bg-hover); }
+.pick-table tr.pick-line.is-picked td { background: var(--brand-50); }
+.pick-table tr.pick-line.is-blocked { cursor: not-allowed; }
+.pick-table tr.pick-line.is-blocked td { color: var(--ink-400); background: var(--bg-sunken); }
+.pick-table tr.pick-group.is-blocked td { color: var(--text-muted); cursor: not-allowed; }
+.pick-check { width: 22px; height: 22px; cursor: pointer; accent-color: var(--brand-500); }
+.pick-check:disabled { cursor: not-allowed; }
+.pick-reason { display: block; font-size: var(--text-xs); font-weight: var(--weight-normal); color: var(--warning-700); margin-top: 2px; }
+
+/* "You have chosen N items — continue". Stays in view while the list scrolls. */
+.select-bar {
+  position: sticky; bottom: 0; z-index: 5; display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap;
+  padding: var(--sp-3) var(--sp-4); margin-top: var(--sp-3);
+  background: var(--bg-surface); border: 2px solid var(--brand-500); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+}
+.select-bar.is-empty { border-color: var(--border); box-shadow: var(--shadow-sm); }
+.select-bar-text { font-size: var(--text-lg); font-weight: var(--weight-bold); }
+.select-bar-sub { font-size: var(--text-sm); color: var(--text-muted); }
+
+/* Plain-language guidance at the top of a step. */
+.help-strip {
+  display: flex; gap: var(--sp-3); align-items: flex-start; padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4); border-radius: var(--radius-sm); font-size: var(--text-md); line-height: 1.5;
+  background: var(--info-50); border: 1px solid var(--info-100); color: var(--info-700);
+}
+.help-strip.is-warning { background: var(--warning-50); border-color: var(--warning-100); color: var(--warning-700); }
+.help-strip.is-danger { background: var(--danger-50); border-color: var(--danger-100); color: var(--danger-700); }
+.help-strip.is-success { background: var(--success-50); border-color: var(--success-100); color: var(--success-700); }
+
+/* Review-before-save summary. */
+.review-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+  gap: var(--sp-3); margin-bottom: var(--sp-4);
+}
+.review-cell { padding: var(--sp-3); border-radius: var(--radius-sm); background: var(--bg-inset); border: 1px solid var(--border-subtle); }
+.review-cell-label { font-size: var(--text-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; font-weight: var(--weight-bold); }
+.review-cell-value { font-size: var(--text-lg); font-weight: var(--weight-bold); margin-top: 2px; word-break: break-word; }
+
+/* A number someone has to read or type must never be cut off.
+   The line tables (Indent, PO, Requisition) declare a width on every column,
+   but with `width: auto` the browser still lays the table out automatically and
+   is free to squeeze a column down to its smallest content — and a form control
+   reports a tiny one. A PO quantity of 2,510 was being shown as "25". Giving the
+   controls a real minimum width is what the column then cannot shrink below;
+   the table scrolls sideways instead, as it was always meant to. */
+.table-fixed td .input { min-width: 96px; }
+.table-fixed td .input.input-num { min-width: 104px; }
+.table-fixed td button.input { min-width: 170px; }
+
+@media (max-width: 640px) {
+  .choice-card { padding: var(--sp-4); }
+  .work-card-count { font-size: 2rem; }
+  .select-bar { padding: var(--sp-3); }
+  .pick-table td, .pick-table th { padding: 8px; }
+}

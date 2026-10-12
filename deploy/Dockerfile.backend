@@ -1,0 +1,57 @@
+# =============================================================================
+# ZOLEX API — production image
+#
+# Multi-stage: TypeScript is compiled in the builder, and only the compiled
+# output plus production dependencies reach the final image. No source, no dev
+# tooling, no test fixtures.
+#
+# Build from the REPOSITORY ROOT:
+#   docker build -f deploy/Dockerfile.backend -t zolex-api .
+# =============================================================================
+
+# ── Stage 1: build ───────────────────────────────────────────────────────────
+FROM node:22-alpine AS build
+
+WORKDIR /app/backend
+
+# Copy manifests first so `npm ci` is cached until dependencies actually change.
+COPY backend/package.json backend/package-lock.json* ./
+RUN npm ci
+
+COPY backend/tsconfig.json ./
+COPY backend/src ./src
+RUN npm run build
+
+# Reduce to production dependencies only, in place.
+RUN npm prune --omit=dev
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM node:22-alpine AS runtime
+
+# tini reaps zombies and, critically, forwards SIGTERM so the API can close the
+# database cleanly. A hard kill is what damages an embedded PGlite directory.
+RUN apk add --no-cache tini
+
+ENV NODE_ENV=production \
+    PORT=4000 \
+    ZOLEX_DATA_ROOT=/data
+
+WORKDIR /app
+
+COPY --from=build /app/backend/node_modules ./node_modules
+COPY --from=build /app/backend/dist ./dist
+# Migrations are read at runtime and are NOT compiled into dist.
+COPY backend/src/db/migrations ./dist/db/migrations
+
+# Run unprivileged. The node image already provides uid/gid 1000 as `node`.
+RUN mkdir -p /data && chown -R node:node /data /app
+USER node
+
+VOLUME ["/data"]
+EXPOSE 4000
+
+# 15s grace: enough for in-flight requests to finish and the pool to drain.
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/index.js"]
