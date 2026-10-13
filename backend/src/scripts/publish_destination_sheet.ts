@@ -29,12 +29,15 @@ interface TabPublicationResult {
   error?: string;
 }
 
-export async function publishDestinationSheet() {
+export async function publishDestinationSheet(targetTab?: string) {
   const runId = 'PUB-' + new Date().toISOString().replace(/[:.]/g, '-');
   console.log('===============================================================');
   console.log('STARTING DESTINATION SPREADSHEET REPAIR & PUBLICATION');
   console.log('Run ID:', runId);
   console.log('Destination Sheet ID:', env.GOOGLE_DB_SPREADSHEET_ID);
+  if (targetTab) {
+    console.log('Filtering Target Tab:', targetTab);
+  }
   console.log('===============================================================\n');
 
   const auth = new GoogleAuth({
@@ -68,6 +71,17 @@ export async function publishDestinationSheet() {
     dataRows: any[][],
     gridMaxRows: number = 6000,
   ): Promise<TabPublicationResult> {
+    if (targetTab && tabName.toLowerCase() !== targetTab.toLowerCase()) {
+      return {
+        tabName,
+        writtenRows: 0,
+        columnsCount: headers.length,
+        batchesSent: 0,
+        cellsUpdated: 0,
+        readBackRows: 0,
+        status: 'PASS',
+      };
+    }
     console.log(`\n--- Publishing Tab: [${tabName}] ---`);
     console.log(`  * Headers: ${headers.length} columns`);
     console.log(`  * Data rows to write: ${dataRows.length}`);
@@ -176,7 +190,7 @@ export async function publishDestinationSheet() {
            COALESCE(i.hsn_code, '') as hsn_code,
            COALESCE(i.live_stock_qty, 0)::numeric as live_stock_qty,
            COALESCE(it.name, '') as indent_type,
-           CASE WHEN i.qc_required THEN 'YES' ELSE 'NO' END as qc_required,
+           CASE WHEN i.qc_required THEN 'YES' ELSE '' END as qc_required,
            COALESCE(dept.name, '') as department,
            COALESCE(cc.name, '') as cost_centre
       FROM items i
@@ -566,7 +580,7 @@ export async function publishDestinationSheet() {
 }
 
 if (process.argv[1]?.endsWith('publish_destination_sheet.ts') || process.argv[1]?.endsWith('publish_destination_sheet.js')) {
-  publishDestinationSheet()
+  publishDestinationSheet(process.argv[2])
     .then(() => process.exit(0))
     .catch(async (err) => {
       console.error('FATAL PUBLICATION ERROR:', err);
