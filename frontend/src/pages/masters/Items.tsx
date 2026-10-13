@@ -127,6 +127,11 @@ export default function Items() {
 
   const save = useMutation({
     mutationFn: (b: Partial<Item>) => {
+      if (b.min_stock && b.max_stock && Number(b.min_stock) > Number(b.max_stock)) {
+        throw new ApiError(422, 'VALIDATION_ERROR', 'Minimum stock cannot exceed maximum stock.', [
+          { field: 'minStock', message: 'Minimum stock cannot exceed maximum stock.' },
+        ]);
+      }
       const payload = {
         itemCode: b.item_code, itemDescription: b.item_description,
         itemTypeId: b.item_type_id ?? null, departmentId: b.department_id ?? null,
@@ -189,6 +194,14 @@ export default function Items() {
           {qty(i.live_stock_qty)}
         </span>
       ),
+    },
+    {
+      key: 'minStock', header: 'Min Stock', align: 'right', optional: true,
+      render: (i) => i.min_stock != null ? <span className="num">{qty(i.min_stock)}</span> : <span className="cell-faint">—</span>,
+    },
+    {
+      key: 'maxStock', header: 'Max Stock', align: 'right', optional: true,
+      render: (i) => i.max_stock != null ? <span className="num">{qty(i.max_stock)}</span> : <span className="cell-faint">—</span>,
     },
     { key: 'uom', header: 'UOM', align: 'center', render: (i) => <Badge tone="neutral" plain>{i.uom_code ?? '—'}</Badge> },
     { key: 'status', header: 'Status', align: 'center', render: (i) => <Badge tone={i.is_active ? 'success' : 'neutral'}>{i.is_active ? 'Active' : 'Inactive'}</Badge> },
@@ -349,6 +362,9 @@ export default function Items() {
                     ? `${money(detail.data.summary.min_rate)} – ${money(detail.data.summary.max_rate)}`
                     : '—'}
                 </DetailItem>
+                <DetailItem label="Min stock">{detail.data.min_stock != null ? qty(detail.data.min_stock) : '—'}</DetailItem>
+                <DetailItem label="Max stock">{detail.data.max_stock != null ? qty(detail.data.max_stock) : '—'}</DetailItem>
+                <DetailItem label="Reorder level">{detail.data.reorder_level != null ? qty(detail.data.reorder_level) : '—'}</DetailItem>
                 <div style={{ gridColumn: '1 / -1' }}>
                   <DetailItem label="Item specification">{text(detail.data.item_specification)}</DetailItem>
                 </div>
@@ -632,6 +648,42 @@ export default function Items() {
               <Input value={editing.hsn_code ?? ''}
                      onChange={(e) => setEditing({ ...editing, hsn_code: e.target.value })}
                      invalid={Boolean(errors.hsnCode)} style={{ fontFamily: 'var(--font-mono)' }} maxLength={8} />
+            </Field>
+            <Field label="Min stock" error={errors.minStock} hint="Minimum stock threshold">
+              <Input
+                numeric type="number" step="0.01" min="0"
+                value={editing.min_stock ?? ''}
+                onChange={(e) => setEditing({ ...editing, min_stock: e.target.value })}
+                invalid={Boolean(errors.minStock)}
+                placeholder="0"
+              />
+            </Field>
+            <Field label="Max stock" error={errors.maxStock} hint="Maximum stock cap">
+              <Input
+                numeric type="number" step="0.01" min="0"
+                value={editing.max_stock ?? ''}
+                onChange={(e) => setEditing({ ...editing, max_stock: e.target.value })}
+                invalid={Boolean(errors.maxStock)}
+                placeholder="0"
+              />
+            </Field>
+            <Field label="Reorder level" error={errors.reorderLevel} hint="Shortage trigger level">
+              <Input
+                numeric type="number" step="0.01" min="0"
+                value={editing.reorder_level ?? ''}
+                onChange={(e) => setEditing({ ...editing, reorder_level: e.target.value })}
+                invalid={Boolean(errors.reorderLevel)}
+                placeholder="0"
+              />
+            </Field>
+            <Field label="Reorder qty" error={errors.reorderQty} hint="Standard replenishment batch">
+              <Input
+                numeric type="number" step="0.01" min="0"
+                value={editing.reorder_qty ?? ''}
+                onChange={(e) => setEditing({ ...editing, reorder_qty: e.target.value })}
+                invalid={Boolean(errors.reorderQty)}
+                placeholder="0"
+              />
             </Field>
             <Field label="Item specification" span="full" hint="Auto-fills onto indent and PO lines">
               <Textarea value={editing.item_specification ?? ''}

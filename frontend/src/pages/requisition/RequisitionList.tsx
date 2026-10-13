@@ -238,7 +238,7 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
       key: 'actions', header: '', align: 'right', locked: true, width: '120px',
       render: (r) => (
         <div className="row" style={{ gap: 2, justifyContent: 'flex-end' }} onClick={(e) => e.stopPropagation()}>
-          {scope === 'hod-pending' && r.status === 'PENDING_APPROVAL' && can('requisition.approve') && (
+          {r.status === 'PENDING_APPROVAL' && can('requisition.approve') && (
             <>
               <Button variant="ghost" size="sm" title="Approve" onClick={() => { setAction({ row: r, kind: 'approve' }); setReason(''); }}>
                 <CheckCircle2 size={14} style={{ color: 'var(--success-600)' }} />
@@ -251,7 +251,7 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
               </Button>
             </>
           )}
-          {scope === 'store-queue' && can('requisition.issue') && (
+          {(scope === 'store-queue' || r.status === 'APPROVED' || r.status === 'PARTIALLY_ISSUED') && can('requisition.issue') && (
             <Button variant="ghost" size="sm" title="Issue material" onClick={() => navigate(`/requisitions/${r.id}?issue=1`)}>
               <PackageCheck size={14} style={{ color: 'var(--success-600)' }} />
             </Button>

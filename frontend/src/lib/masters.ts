@@ -110,6 +110,11 @@ export interface ItemOption {
   uom_code: string | null;
   uom_name: string | null;
   hsn_code: string;
+  live_stock_qty?: number | string | null;
+  department_id?: number | null;
+  cost_centre_id?: number | null;
+  min_stock?: number | string | null;
+  max_stock?: number | string | null;
 }
 
 export function useItemSearch(term: string) {

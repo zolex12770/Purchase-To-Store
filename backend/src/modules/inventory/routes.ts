@@ -453,11 +453,23 @@ router.post(
         const reorderQty = Number(item.reorder_qty);
         const maxStock = item.max_stock != null ? Number(item.max_stock) : null;
         const pipeline = Number(item.pending_indent_qty) + Number(item.pending_po_qty);
+        const effectiveAvailable = available + pipeline;
 
-        // Target calculation
-        const target = maxStock ?? (reorderLevel > 0 ? reorderLevel : minStock);
-        const shortfall = target - (available + pipeline);
-        const suggestedQty = Math.max(reorderQty > 0 ? reorderQty : 1, shortfall > 0 ? shortfall : 1);
+        // Skip if pipeline already covers minimum stock and reorder level
+        if (minStock > 0 && effectiveAvailable >= minStock) {
+          if (reorderLevel <= 0 || effectiveAvailable > reorderLevel) {
+            continue;
+          }
+        } else if (reorderLevel > 0 && effectiveAvailable > reorderLevel) {
+          continue;
+        }
+
+        // Target calculation: replenish up to max_stock, or reorder_level / min_stock
+        const target = maxStock != null && maxStock > minStock ? maxStock : (reorderLevel > 0 ? reorderLevel : minStock);
+        const shortfall = target - effectiveAvailable;
+        if (shortfall <= 0) continue;
+
+        const suggestedQty = Math.max(reorderQty > 0 ? reorderQty : 0, Math.max(1, shortfall));
 
         const reason = available < minStock
           ? 'Below Minimum Stock'

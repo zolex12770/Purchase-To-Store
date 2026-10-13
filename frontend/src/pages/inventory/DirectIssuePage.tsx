@@ -23,6 +23,8 @@ import {
   Button, Card, CardBody, Badge, Modal,
 } from '../../components/ui';
 import { qty, formatDate, count, toShortUom } from '../../lib/format';
+import { useLookupOptions, useUserOptions, type ItemOption } from '../../lib/masters';
+import { ItemSelect } from '../../components/MasterSelect';
 
 interface DirectIssueHeader {
   id: number;
@@ -55,23 +57,6 @@ interface DirectIssueDetail extends DirectIssueHeader {
     uom_code: string;
     remarks: string;
   }[];
-}
-
-interface ItemOption {
-  id: number;
-  item_code: string;
-  item_description: string;
-  uom_code: string;
-  live_stock_qty: string;
-  department_id: number | null;
-  cost_centre_id: number | null;
-}
-
-interface UserOption {
-  id: number;
-  employee_id: string;
-  employee_name: string;
-  department_id: number | null;
 }
 
 interface LineDraft {
@@ -135,36 +120,13 @@ export default function DirectIssuePage() {
   const items = res?.data ?? [];
   const meta = res?.meta;
 
-  // Query: Users for Recipient picker
-  const { data: usersData } = useQuery({
-    queryKey: ['users-picker'],
-    queryFn: () => api.get<UserOption[]>('/users?pageSize=200'),
-    staleTime: 300_000,
-  });
+  // User options from standard hook
+  const { data: usersData } = useUserOptions();
   const users = usersData ?? [];
 
-  // Query: Supporting lookups
-  const { data: deptsData } = useQuery({
-    queryKey: ['lookups-dept'],
-    queryFn: () => api.get<{ id: number; name: string }[]>('/lookups/DEPARTMENT'),
-    staleTime: 300_000,
-  });
-  const departments = deptsData ?? [];
-
-  const { data: costCentresData } = useQuery({
-    queryKey: ['lookups-cc'],
-    queryFn: () => api.get<{ id: number; name: string }[]>('/lookups/COST_CENTRE'),
-    staleTime: 300_000,
-  });
-  const costCentres = costCentresData ?? [];
-
-  // Query: Items with live stock for line builder
-  const { data: itemsData } = useQuery({
-    queryKey: ['items-picker-with-stock'],
-    queryFn: () => api.get<ItemOption[]>('/items?pageSize=1000'),
-    staleTime: 60_000,
-  });
-  const allItems = itemsData ?? [];
+  // Supporting lookups from standard hook
+  const { options: departments } = useLookupOptions('DEPARTMENT');
+  const { options: costCentres } = useLookupOptions('COST_CENTRE');
 
   // Detail Modal Query
   const { data: detailData, isLoading: detailLoading } = useQuery({
@@ -197,10 +159,23 @@ export default function DirectIssuePage() {
     setLines([{ itemId: null, itemCode: '', itemDescription: '', uomCode: '', availableStock: 0, issueQty: '1', remarks: '' }]);
   };
 
-  const handleLineItemSelect = (index: number, itemIdStr: string) => {
-    const itId = Number(itemIdStr);
-    const selected = allItems.find((i) => i.id === itId);
-    if (!selected) return;
+  const handleLineItemSelect = (index: number, selected: ItemOption | null) => {
+    if (!selected) {
+      setLines((prev) => {
+        const copy = [...prev];
+        copy[index] = {
+          itemId: null,
+          itemCode: '',
+          itemDescription: '',
+          uomCode: '',
+          availableStock: 0,
+          issueQty: '1',
+          remarks: copy[index]?.remarks || '',
+        };
+        return copy;
+      });
+      return;
+    }
 
     setLines((prev) => {
       const copy = [...prev];
@@ -210,7 +185,7 @@ export default function DirectIssuePage() {
         itemCode: selected.item_code,
         itemDescription: selected.item_description,
         uomCode: selected.uom_code || 'NOS',
-        availableStock: Number(selected.live_stock_qty),
+        availableStock: Number(selected.live_stock_qty ?? 0),
         issueQty: '1',
       };
       return copy;
@@ -475,7 +450,7 @@ export default function DirectIssuePage() {
             >
               <option value="">All Recipients</option>
               {users.map((u) => (
-                <option key={u.id} value={u.id}>{u.employee_name} ({u.employee_id})</option>
+                <option key={u.id} value={u.id}>{u.employeeName} ({u.employeeId})</option>
               ))}
             </select>
 
@@ -488,7 +463,7 @@ export default function DirectIssuePage() {
             >
               <option value="">All Departments</option>
               {departments.map((d) => (
-                <option key={d.id} value={d.id}>{d.name}</option>
+                <option key={d.value} value={d.value}>{d.label}</option>
               ))}
             </select>
 
@@ -501,7 +476,7 @@ export default function DirectIssuePage() {
             >
               <option value="">All Cost Centres</option>
               {costCentres.map((cc) => (
-                <option key={cc.id} value={cc.id}>{cc.name}</option>
+                <option key={cc.value} value={cc.value}>{cc.label}</option>
               ))}
             </select>
 
@@ -550,12 +525,12 @@ export default function DirectIssuePage() {
                   const id = e.target.value ? Number(e.target.value) : null;
                   setRecipientUserId(id);
                   const sel = users.find((u) => u.id === id);
-                  if (sel?.department_id && !departmentId) setDepartmentId(sel.department_id);
+                  if (sel?.departmentId && !departmentId) setDepartmentId(sel.departmentId);
                 }}
               >
                 <option value="">Select recipient employee…</option>
                 {users.map((u) => (
-                  <option key={u.id} value={u.id}>{u.employee_name} ({u.employee_id})</option>
+                  <option key={u.id} value={u.id}>{u.employeeName} ({u.employeeId})</option>
                 ))}
               </select>
             </div>
@@ -573,7 +548,7 @@ export default function DirectIssuePage() {
               >
                 <option value="">Select department…</option>
                 {departments.map((d) => (
-                  <option key={d.id} value={d.id}>{d.name}</option>
+                  <option key={d.value} value={d.value}>{d.label}</option>
                 ))}
               </select>
             </div>
@@ -591,7 +566,7 @@ export default function DirectIssuePage() {
               >
                 <option value="">Select cost centre…</option>
                 {costCentres.map((cc) => (
-                  <option key={cc.id} value={cc.id}>{cc.name}</option>
+                  <option key={cc.value} value={cc.value}>{cc.label}</option>
                 ))}
               </select>
             </div>
@@ -637,7 +612,7 @@ export default function DirectIssuePage() {
               <table className="table" style={{ width: '100%', fontSize: 'var(--text-xs)' }}>
                 <thead>
                   <tr>
-                    <th style={{ width: '40%' }}>Select Item</th>
+                    <th style={{ width: '45%' }}>Select Item</th>
                     <th style={{ width: '15%', textAlign: 'right' }}>Available</th>
                     <th style={{ width: '18%', textAlign: 'right' }}>Issue Qty</th>
                     <th>Line Remarks</th>
@@ -647,20 +622,13 @@ export default function DirectIssuePage() {
                 <tbody>
                   {lines.map((l, idx) => (
                     <tr key={idx}>
-                      <td>
-                        <select
-                          className="select"
-                          style={{ width: '100%', height: 30, fontSize: '11px' }}
-                          value={l.itemId ?? ''}
-                          onChange={(e) => handleLineItemSelect(idx, e.target.value)}
-                        >
-                          <option value="">Select item from store…</option>
-                          {allItems.map((it) => (
-                            <option key={it.id} value={it.id}>
-                              {it.item_code} - {it.item_description} (Stock: {Number(it.live_stock_qty).toFixed(1)} {it.uom_code || 'NOS'})
-                            </option>
-                          ))}
-                        </select>
+                      <td style={{ minWidth: 240 }}>
+                        <ItemSelect
+                          value={l.itemId}
+                          selectedCode={l.itemCode}
+                          selectedDescription={l.itemDescription}
+                          onChange={(_id, it) => handleLineItemSelect(idx, it)}
+                        />
                       </td>
                       <td style={{ textAlign: 'right' }}>
                         {l.itemId != null ? (

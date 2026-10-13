@@ -40,7 +40,10 @@ export function ItemSelect({
     () => (data ?? [])
       .filter((it) => !excludeIds?.has(it.id) || it.id === value)
       .map((it) => ({
-        value: it.id, label: it.item_code, sublabel: it.item_description, meta: it.uom_code ?? undefined,
+        value: it.id,
+        label: it.item_code,
+        sublabel: it.item_description,
+        meta: [it.uom_code, it.live_stock_qty != null ? `Stock: ${Number(it.live_stock_qty).toFixed(1)}` : null].filter(Boolean).join(' · ') || undefined,
       })),
     [data, excludeIds, value],
   );

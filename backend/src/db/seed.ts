@@ -248,8 +248,8 @@ const SHEET_MAPPINGS = [
       { field: 'uom', headers: ['UOM', 'Uom', 'Unit'], lookup: 'UOM' },
       { field: 'item_specification', headers: ['Item Specification'] },
       // Set B additions (docs/FINAL_GAP_AUDIT.md §4) — stock planning fields.
-      { field: 'min_stock', headers: ['Min Stock'], numeric: true },
-      { field: 'max_stock', headers: ['Max Stock'], numeric: true },
+      { field: 'min_stock', headers: ['Min', 'Min Stock'], numeric: true },
+      { field: 'max_stock', headers: ['Max', 'Max Stock'], numeric: true },
       { field: 'reorder_level', headers: ['Reorder Level'], numeric: true },
       { field: 'reorder_qty', headers: ['Reorder Qty'], numeric: true },
       { field: 'is_active', headers: ['Is Active'] },

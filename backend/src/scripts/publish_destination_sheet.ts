@@ -73,8 +73,8 @@ export async function publishDestinationSheet(targetTab?: string) {
   ): Promise<TabPublicationResult> {
     if (targetTab && tabName.toLowerCase() !== targetTab.toLowerCase()) {
       return {
-        tabName,
-        writtenRows: 0,
+        tab: tabName,
+        expectedRows: 0,
         columnsCount: headers.length,
         batchesSent: 0,
         cellsUpdated: 0,
@@ -172,13 +172,13 @@ export async function publishDestinationSheet(targetTab?: string) {
   }
 
   // =========================================================================
-  // 1. ITEM MASTER (15 columns)
+  // 1. ITEM MASTER (17 columns — including Col P: Min, Col Q: Max)
   // =========================================================================
   const itemHeaders = [
     'Item Code', 'Item Name', 'Item Description', 'Item Specification',
     'Main Group', 'Sub Main Group', 'Unit', 'Rack ID', 'HSN Code',
     'Live Stock (Qty)', 'Pending GRN QTY', 'Indent Type', 'QC Required',
-    'Department', 'Cost Centre'
+    'Department', 'Cost Centre', 'Min', 'Max'
   ];
   const itemDbRes = await db.query(`
     SELECT i.item_code,
@@ -192,7 +192,9 @@ export async function publishDestinationSheet(targetTab?: string) {
            COALESCE(it.name, '') as indent_type,
            CASE WHEN i.qc_required THEN 'YES' ELSE '' END as qc_required,
            COALESCE(dept.name, '') as department,
-           COALESCE(cc.name, '') as cost_centre
+           COALESCE(cc.name, '') as cost_centre,
+           COALESCE(i.min_stock::text, '') as min_stock,
+           COALESCE(i.max_stock::text, '') as max_stock
       FROM items i
       LEFT JOIN lookups mg ON mg.id = i.main_group_id
       LEFT JOIN lookups smg ON smg.id = i.sub_main_group_id
@@ -219,6 +221,8 @@ export async function publishDestinationSheet(targetTab?: string) {
     r.qc_required,
     r.department,
     r.cost_centre,
+    r.min_stock,
+    r.max_stock,
   ]);
   await publishTab('Item Master', itemHeaders, itemRows, 14152);
 

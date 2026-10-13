@@ -137,14 +137,16 @@ router.get(
   requirePermission('item.view'),
   validateQuery(z.object({
     q: z.string().trim().max(120).optional(),
-    limit: z.coerce.number().int().min(1).max(50).default(20),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
   })),
   asyncHandler(async (_req, res) => {
     const { q, limit } = parsedQuery<{ q?: string; limit: number }>(res);
     const term = `%${(q ?? '').toLowerCase()}%`;
     const rows = await query(
       `SELECT i.id, i.item_code, i.item_description, i.item_specification, i.standard_rate,
-              i.uom_id, u.code AS uom_code, u.name AS uom_name, i.hsn_code
+              i.uom_id, u.code AS uom_code, u.name AS uom_name, i.hsn_code,
+              COALESCE(i.live_stock_qty, 0)::numeric(18, 4) AS live_stock_qty,
+              i.department_id, i.cost_centre_id, i.min_stock, i.max_stock
          FROM items i
          LEFT JOIN lookups u ON u.id = i.uom_id
         WHERE i.deleted_at IS NULL AND i.is_active = TRUE
@@ -482,6 +484,14 @@ const itemSchema = z.object({
   gstRate: z.union([z.number(), z.string()]).nullable().optional(),
   isActive: z.boolean().default(true),
   qcRequired: z.boolean().default(false),
+}).refine((data) => {
+  if (data.minStock != null && data.minStock !== '' && data.maxStock != null && data.maxStock !== '') {
+    return Number(data.minStock) <= Number(data.maxStock);
+  }
+  return true;
+}, {
+  message: 'Minimum stock cannot exceed maximum stock.',
+  path: ['minStock'],
 });
 
 type ItemBody = z.infer<typeof itemSchema>;
@@ -555,6 +565,61 @@ router.put(
       await auditIn(tx, {
         actor: actorFrom(req), action: 'UPDATE', entity: 'item', entityId: id,
         entityLabel: `${body.itemCode} — ${body.itemDescription}`, before, after: body,
+      });
+    });
+
+    sendOk(res, await queryOne(`${ITEM_SELECT} WHERE i.id = $1`, [id]));
+  }),
+);
+
+/* ── PATCH /items/:id/planning — update planning thresholds ─────────────────── */
+
+const planningSchema = z.object({
+  minStock: z.union([z.number(), z.string()]).nullable().optional(),
+  maxStock: z.union([z.number(), z.string()]).nullable().optional(),
+  reorderLevel: z.union([z.number(), z.string()]).nullable().optional(),
+  reorderQty: z.union([z.number(), z.string()]).nullable().optional(),
+}).refine((data) => {
+  if (data.minStock != null && data.minStock !== '' && data.maxStock != null && data.maxStock !== '') {
+    return Number(data.minStock) <= Number(data.maxStock);
+  }
+  return true;
+}, {
+  message: 'Minimum stock cannot exceed maximum stock.',
+  path: ['minStock'],
+});
+
+router.patch(
+  '/:id/planning',
+  requirePermission('item.edit'),
+  validateBody(planningSchema),
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const body = req.body as z.infer<typeof planningSchema>;
+    const before = await queryOne<Record<string, unknown>>('SELECT * FROM items WHERE id = $1 AND deleted_at IS NULL', [id]);
+    if (!before) throw NotFoundError('Item');
+
+    await withTransaction(async (tx) => {
+      await tx.query(
+        `UPDATE items
+            SET min_stock = CASE WHEN $1::boolean THEN $2 ELSE min_stock END,
+                max_stock = CASE WHEN $3::boolean THEN $4 ELSE max_stock END,
+                reorder_level = CASE WHEN $5::boolean THEN $6 ELSE reorder_level END,
+                reorder_qty = CASE WHEN $7::boolean THEN $8 ELSE reorder_qty END,
+                updated_by = $9, updated_at = now()
+          WHERE id = $10`,
+        [
+          body.minStock !== undefined, numOrNull(body.minStock),
+          body.maxStock !== undefined, numOrNull(body.maxStock),
+          body.reorderLevel !== undefined, numOrNull(body.reorderLevel),
+          body.reorderQty !== undefined, numOrNull(body.reorderQty),
+          req.user!.id,
+          id,
+        ],
+      );
+      await auditIn(tx, {
+        actor: actorFrom(req), action: 'UPDATE', entity: 'item', entityId: id,
+        entityLabel: `${before.item_code} planning thresholds`, before, after: body,
       });
     });
 

@@ -92,6 +92,46 @@ export function DataTable<T>({
     return new Set(columns.filter((c) => c.optional).map((c) => c.key));
   });
 
+  const [colWidths, setColWidths] = useState<Record<string, number>>(() => {
+    if (!storageKey) return {};
+    const stored = localStorage.getItem(`zx.widths.${storageKey}`);
+    if (stored) {
+      try { return JSON.parse(stored) as Record<string, number>; } catch { /* ignore */ }
+    }
+    return {};
+  });
+
+  const [isResizing, setIsResizing] = useState(false);
+
+  const startResize = (e: React.MouseEvent, key: string, thEl: HTMLElement | null) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const currentWidth = thEl ? thEl.getBoundingClientRect().width : (colWidths[key] ?? 120);
+    const startX = e.clientX;
+    setIsResizing(true);
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const nextWidth = Math.max(60, Math.round(currentWidth + delta));
+      setColWidths((prev) => {
+        const next = { ...prev, [key]: nextWidth };
+        if (storageKey) {
+          try { localStorage.setItem(`zx.widths.${storageKey}`, JSON.stringify(next)); } catch { /* quota */ }
+        }
+        return next;
+      });
+    };
+
+    const handleMouseUp = () => {
+      setIsResizing(false);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  };
+
   const toggleColumn = (key: string) => {
     setHidden((prev) => {
       const next = new Set(prev);
@@ -228,18 +268,39 @@ export function DataTable<T>({
                     <th
                       key={c.key}
                       className={`${c.align === 'right' ? 'right' : c.align === 'center' ? 'center' : ''} ${c.sortKey && onSortChange ? 'sortable' : ''}`}
-                      style={{ width: c.width }}
+                      style={{
+                        width: colWidths[c.key] ? `${colWidths[c.key]}px` : c.width,
+                        minWidth: colWidths[c.key] ? `${colWidths[c.key]}px` : undefined,
+                        position: 'relative',
+                        userSelect: isResizing ? 'none' : undefined,
+                      }}
                       onClick={() => handleSort(c)}
                       aria-sort={isSorted ? (sortDir === 'asc' ? 'ascending' : 'descending') : undefined}
                     >
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, justifyContent: c.align === 'right' ? 'flex-end' : undefined }}>
-                        {c.header}
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, justifyContent: c.align === 'right' ? 'flex-end' : undefined, width: '100%' }}>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.header}</span>
                         {c.sortKey && onSortChange && (
                           isSorted
                             ? (sortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />)
-                            : <ChevronsUpDown size={11} style={{ opacity: 0.35 }} />
+                            : <ChevronsUpDown size={11} style={{ opacity: 0.35, flexShrink: 0 }} />
                         )}
                       </span>
+                      <div
+                        className="col-resizer"
+                        onClick={(e) => e.stopPropagation()}
+                        onMouseDown={(e) => startResize(e, c.key, e.currentTarget.parentElement)}
+                        title="Drag to resize column"
+                        style={{
+                          position: 'absolute',
+                          right: 0,
+                          top: 0,
+                          bottom: 0,
+                          width: '7px',
+                          cursor: 'col-resize',
+                          userSelect: 'none',
+                          zIndex: 2,
+                        }}
+                      />
                     </th>
                   );
                 })}
@@ -257,7 +318,11 @@ export function DataTable<T>({
                     onKeyDown={onRowClick ? (e) => { if (e.key === 'Enter') onRowClick(row); } : undefined}
                   >
                     {visible.map((c) => (
-                      <td key={c.key} className={c.align === 'right' ? 'right' : c.align === 'center' ? 'center' : ''}>
+                      <td
+                        key={c.key}
+                        className={c.align === 'right' ? 'right' : c.align === 'center' ? 'center' : ''}
+                        style={colWidths[c.key] ? { maxWidth: `${colWidths[c.key]}px` } : undefined}
+                      >
                         {c.render(row, i)}
                       </td>
                     ))}
