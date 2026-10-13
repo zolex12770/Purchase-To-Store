@@ -285,3 +285,47 @@ export async function reverseRequisitionIssueLine(
 
   return { newBalance };
 }
+
+/**
+ * Deducts one direct store issue line's quantity from live stock.
+ * Atomically locks item row with FOR UPDATE, checks available stock,
+ * decrements `items.live_stock_qty`, and inserts a `DIRECT_ISSUE` entry into `stock_ledger`.
+ */
+export async function issueDirectStoreLine(
+  tx: Queryable,
+  line: { item_id: number; uom_id: number | null },
+  issueQty: string,
+  ctx: {
+    directIssueId: number;
+    issueNo: string;
+    issueDate: string;
+    userId: number | null;
+  },
+): Promise<{ newBalance: string }> {
+  const item = await txQueryOne<{ id: number; item_code: string; live_stock_qty: string }>(
+    tx, 'SELECT id, item_code, live_stock_qty FROM items WHERE id = $1 FOR UPDATE', [line.item_id],
+  );
+  if (!item) throw new Error(`Item ${line.item_id} not found while issuing direct stock.`);
+
+  const qty = dec(issueQty);
+  const available = dec(item.live_stock_qty);
+  if (qty.greaterThan(available)) {
+    throw BusinessRuleError(
+      `Insufficient stock for ${item.item_code}. Available: ${toQty(available)}, requested direct issue: ${toQty(qty)}.`,
+      { itemCode: item.item_code, availableQty: toQty(available), issueQty: toQty(qty) },
+    );
+  }
+
+  const newBalance = toQty(available.minus(qty));
+  await tx.query('UPDATE items SET live_stock_qty = $2, updated_at = now() WHERE id = $1', [line.item_id, newBalance]);
+
+  await tx.query(
+    `INSERT INTO stock_ledger
+       (item_id, txn_type, reference_type, reference_id, reference_no,
+        inward_qty, outward_qty, balance_qty, uom_id, txn_date, created_by)
+     VALUES ($1,'DIRECT_ISSUE','DIRECT_ISSUE',$2,$3,0,$4,$5,$6,$7,$8)`,
+    [line.item_id, ctx.directIssueId, ctx.issueNo, toQty(qty), newBalance, line.uom_id, ctx.issueDate, ctx.userId],
+  );
+
+  return { newBalance };
+}

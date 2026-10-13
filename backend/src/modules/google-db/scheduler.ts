@@ -30,6 +30,7 @@ import { logger } from '../../core/logger.js';
 import { googleDbConfig, isTransient } from './client.js';
 import { drainOutbox } from './drain.js';
 import { runJobSlice, activeJob, failActiveJob } from './jobs.js';
+import { isSyncEnabled } from '../google-sync/engine.js';
 
 let timer: NodeJS.Timeout | null = null;
 
@@ -92,6 +93,8 @@ async function tick(): Promise<void> {
   }
   ticking = true;
   try {
+    const masterEnabled = await isSyncEnabled().catch(() => false);
+    if (!masterEnabled) return;
     const cfg = googleDbConfig();
     if (!cfg.configured || !cfg.enabled) return;
     if (!(await due())) return;

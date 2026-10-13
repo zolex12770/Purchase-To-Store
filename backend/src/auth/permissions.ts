@@ -156,6 +156,16 @@ const MODULES: ModuleDef[] = [
     },
   },
   {
+    module: 'direct_issue',
+    label: 'Direct Store Issue',
+    actions: {
+      view: 'View direct store issue register and slips',
+      create: 'Issue items directly from store with stock deduction',
+      print: 'Print direct store issue slips',
+      export: 'Export direct store issues register',
+    },
+  },
+  {
     module: 'system',
     label: 'System Administration',
     actions: { admin: 'Manage settings and system configuration' },
@@ -248,6 +258,7 @@ export const ROLES: RoleDef[] = [
       'auto_indent.view', 'auto_indent.approve',
       'requisition.view', 'requisition.create', 'requisition.edit', 'requisition.issue',
       'requisition.print', 'requisition.analyze',
+      'direct_issue.view', 'direct_issue.create', 'direct_issue.print', 'direct_issue.export',
     ],
   },
   {
@@ -256,10 +267,10 @@ export const ROLES: RoleDef[] = [
     description: 'Read-only analytical access with full drill-down to source transactions.',
     permissions: [
       'dashboard.view', 'dashboard.analyze', 'dashboard.export',
-      ...viewAll(['item', 'supplier', 'lookup', 'indent', 'po', 'grn', 'audit', 'sync', 'requisition', 'qc', 'auto_indent']),
+      ...viewAll(['item', 'supplier', 'lookup', 'indent', 'po', 'grn', 'audit', 'sync', 'requisition', 'qc', 'auto_indent', 'direct_issue']),
       'indent.analyze', 'po.analyze', 'grn.analyze', 'requisition.analyze',
-      'indent.export', 'po.export', 'grn.export', 'requisition.export',
-      'indent.print', 'po.print', 'grn.print', 'requisition.print',
+      'indent.export', 'po.export', 'grn.export', 'requisition.export', 'direct_issue.export',
+      'indent.print', 'po.print', 'grn.print', 'requisition.print', 'direct_issue.print',
     ],
   },
   {

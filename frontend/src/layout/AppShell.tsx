@@ -14,7 +14,7 @@ import {
   PanelLeftClose, PanelLeft, RefreshCw, Package, Building2, Tags, Users as UsersIcon,
   ScrollText, HardDriveDownload, ArrowLeftRight, Settings, CircleAlert, Zap, X,
   Sun, Moon, MonitorCog, Tag, ClipboardList, PackageSearch, PackageCheck, ListChecks, Home,
-  ShieldCheck, Boxes,
+  ShieldCheck, Boxes, PackageMinus,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth';
 import { useTheme, type ThemePreference } from '../lib/theme';
@@ -23,6 +23,7 @@ import { api } from '../lib/api';
 import { useSettings } from '../lib/masters';
 import { Badge, Button } from '../components/ui';
 import { initials, relativeTime } from '../lib/format';
+import { LiveDataVerifyModal } from '../components/LiveDataVerifyModal';
 
 /* ── Navigation model ────────────────────────────────────────────────────── */
 
@@ -116,6 +117,7 @@ const NAV: (NavItem | NavGroup)[] = [
     label: 'Inventory & Stock', icon: <Boxes size={17} />, base: '/inventory', permission: 'auto_indent.view', accent: 'var(--module-master)',
     items: [
       { to: '/inventory?tab=stock', label: 'Stock & Reorder Status', icon: <Package size={15} />, permission: 'auto_indent.view' },
+      { to: '/inventory/direct-issue', label: 'Direct Issue from Store', icon: <PackageMinus size={15} />, anyOf: ['direct_issue.view', 'auto_indent.view', 'requisition.issue'] },
       { to: '/inventory?tab=auto-indent', label: 'Auto Indent Queue', icon: <Zap size={15} />, permission: 'auto_indent.view' },
     ],
   },
@@ -454,6 +456,7 @@ function ThemeToggle() {
 function TopBar({ user, onSignOut }: { user: ReturnType<typeof useAuth>['user']; onSignOut: () => void }) {
   const { can } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [verifyOpen, setVerifyOpen] = useState(false);
   const navigate = useNavigate();
 
   return (
@@ -474,6 +477,31 @@ function TopBar({ user, onSignOut }: { user: ReturnType<typeof useAuth>['user'];
     >
       <GlobalSearch />
       <div className="spacer" />
+      {can('sync.view') && (
+        <button
+          type="button"
+          onClick={() => setVerifyOpen(true)}
+          className="row"
+          style={{
+            gap: 6,
+            padding: '5px 11px',
+            borderRadius: 'var(--radius-full)',
+            border: '1px solid var(--border-strong)',
+            background: 'var(--bg-surface)',
+            fontSize: '11px',
+            fontWeight: 600,
+            color: 'var(--ink-700)',
+            cursor: 'pointer',
+            transition: 'all var(--dur-fast) var(--ease)',
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--brand-500)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border-strong)'; }}
+          title="Verify live parity across Source Google Sheet, ERP DB, and Reference Sheet"
+        >
+          <ShieldCheck size={13} style={{ color: 'var(--brand-600)' }} />
+          <span>Live Data Verify</span>
+        </button>
+      )}
       {can('sync.view') && <SyncToggle />}
       <ThemeToggle />
       <NotificationBell />
@@ -548,6 +576,7 @@ function TopBar({ user, onSignOut }: { user: ReturnType<typeof useAuth>['user'];
           </>
         )}
       </div>
+      <LiveDataVerifyModal open={verifyOpen} onClose={() => setVerifyOpen(false)} />
     </header>
   );
 }

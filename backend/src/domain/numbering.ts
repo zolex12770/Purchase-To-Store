@@ -8,7 +8,7 @@
  */
 import { txQueryOne, type Queryable } from '../db/index.js';
 
-export type DocType = 'INDENT' | 'PO' | 'GRN' | 'REQUISITION' | 'ISSUE_SLIP';
+export type DocType = 'INDENT' | 'PO' | 'GRN' | 'REQUISITION' | 'ISSUE_SLIP' | 'DIRECT_ISSUE';
 
 interface SequenceRow {
   prefix: string;
@@ -22,6 +22,7 @@ const DEFAULTS: Record<DocType, { prefix: string; padding: number }> = {
   GRN: { prefix: 'GRN', padding: 4 },
   REQUISITION: { prefix: 'REQ', padding: 4 },
   ISSUE_SLIP: { prefix: 'ISS', padding: 4 },
+  DIRECT_ISSUE: { prefix: 'DIR', padding: 4 },
 };
 
 /** `YYYYMMDD` in local time — the period the counter resets on. */

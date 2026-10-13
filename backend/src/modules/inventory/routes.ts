@@ -24,8 +24,11 @@ import { actorFrom, auditIn } from '../../core/audit.js';
 import { nextDocumentNumber, dateStamp, timeStamp } from '../../domain/numbering.js';
 import { toQty, toRate } from '../../domain/money.js';
 import { toShortUom } from '../../domain/uom.js';
+import directIssueRoutes from './direct-issue.routes.js';
 
 const router = Router();
+router.use('/direct-issues', directIssueRoutes);
+
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 
 /* ── GET /inventory/stock ───────────────────────────────────────────────────── */
@@ -96,6 +99,12 @@ router.get(
          WHERE is_receivable = TRUE
          GROUP BY item_id
       ) po ON po.item_id = i.id
+      LEFT JOIN (
+        SELECT item_id, SUM(received_qty - accepted_qty - rejected_qty) AS qc_pending_qty
+          FROM qc_inspections
+         WHERE status IN ('PENDING_QC', 'QC_IN_PROGRESS')
+         GROUP BY item_id
+      ) qc ON qc.item_id = i.id
     `;
 
     // Filter by stockStatus in SQL wrapper
@@ -190,6 +199,7 @@ router.get(
                i.live_stock_qty,
                COALESCE(req.allocated_qty, 0) AS allocated_stock_qty,
                GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) AS available_stock_qty,
+               COALESCE(qc.qc_pending_qty, 0) AS qc_pending_stock_qty,
                COALESCE(i.min_stock, 0) AS min_stock,
                i.max_stock,
                COALESCE(i.reorder_level, 0) AS reorder_level,

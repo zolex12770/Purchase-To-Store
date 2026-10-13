@@ -17,6 +17,7 @@ import { actorFrom, audit } from '../../core/audit.js';
 import {
   isSyncEnabled, setSyncEnabled, syncConfig, runSync, isSyncRunning,
 } from './engine.js';
+import { verifyLiveParity, reconcileMasterData } from './verify.js';
 
 const router = Router();
 
@@ -68,6 +69,37 @@ router.get(
         'Google Sheets is a one-way source into SQL. Approved and posted documents are never ' +
         'overwritten by a sheet; divergences are recorded as conflicts for review.',
     });
+  }),
+);
+
+/* ── GET /google-sync/verify — live parity check across Source, DB, Reference ── */
+
+router.get(
+  '/verify',
+  requirePermission('sync.view'),
+  asyncHandler(async (_req, res) => {
+    const report = await verifyLiveParity();
+    sendOk(res, report);
+  }),
+);
+
+/* ── POST /google-sync/reconcile — confirmed reconciliation with safety backup ── */
+
+router.post(
+  '/reconcile',
+  requirePermission('sync.admin'),
+  validateBody(z.object({
+    dryRun: z.boolean().default(true),
+    confirmBackup: z.boolean().default(true),
+  })),
+  asyncHandler(async (req, res) => {
+    const { dryRun, confirmBackup } = req.body as { dryRun: boolean; confirmBackup: boolean };
+    const outcome = await reconcileMasterData({
+      dryRun,
+      confirmBackup,
+      actor: actorFrom(req),
+    });
+    sendOk(res, outcome);
   }),
 );
 

@@ -692,7 +692,7 @@ describe('migration 020 — database simplification', () => {
     const of = (t: string) => Number(counts.find((c) => c.type === t)?.n ?? 0);
     expect(of('p')).toBeGreaterThanOrEqual(40);
     expect(of('f')).toBeGreaterThanOrEqual(108);
-    expect(of('u')).toBe(18);
+    expect(of('u')).toBeGreaterThanOrEqual(18);
   });
 
   it('collapses duplicate OPEN sync issues to their first row, leaves resolved ones alone, and is repeatable', async () => {

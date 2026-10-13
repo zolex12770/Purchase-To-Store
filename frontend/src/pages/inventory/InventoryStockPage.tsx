@@ -48,6 +48,7 @@ interface StockRow {
   live_stock_qty: string;
   allocated_stock_qty: string;
   available_stock_qty: string;
+  qc_pending_stock_qty?: string;
   min_stock: string;
   max_stock: string | null;
   reorder_level: string;
@@ -292,20 +293,26 @@ export default function InventoryStockPage() {
     },
     {
       key: 'available_stock',
-      header: 'Usable Stock',
+      header: 'Usable / Physical Stock',
       align: 'right',
-      render: (r) => (
-        <div>
-          <div className="num cell-strong" style={{ color: Number(r.available_stock_qty) <= 0 ? 'var(--danger-600)' : 'inherit' }}>
-            {qty(r.available_stock_qty)}
-          </div>
-          {Number(r.allocated_stock_qty) > 0 && (
-            <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--warning-600)' }}>
-              {qty(r.allocated_stock_qty)} alloc
+      render: (r) => {
+        const physical = Number(r.live_stock_qty || 0);
+        const usable = Number(r.available_stock_qty || 0);
+        const allocated = Number(r.allocated_stock_qty || 0);
+        const qcPending = Number(r.qc_pending_stock_qty || 0);
+        return (
+          <div>
+            <div className="num cell-strong" style={{ color: usable <= 0 ? 'var(--danger-600)' : 'inherit' }}>
+              {qty(r.available_stock_qty)}
             </div>
-          )}
-        </div>
-      ),
+            <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-faint)' }}>
+              <span>{qty(physical)} phys</span>
+              {allocated > 0 && <span style={{ color: 'var(--warning-600)', marginLeft: 4 }}>• {qty(allocated)} rsvd</span>}
+              {qcPending > 0 && <span style={{ color: 'var(--brand-600)', marginLeft: 4 }}>• {qty(qcPending)} QC</span>}
+            </div>
+          </div>
+        );
+      },
     },
     {
       key: 'reorder_level',

@@ -43,6 +43,7 @@ const RequisitionForm     = lazy(() => import('./pages/requisition/RequisitionFo
 const RequisitionDetail   = lazy(() => import('./pages/requisition/RequisitionDetail'));
 const RequisitionAnalysis = lazy(() => import('./pages/requisition/RequisitionAnalysis'));
 const InventoryStockPage  = lazy(() => import('./pages/inventory/InventoryStockPage'));
+const DirectIssuePage     = lazy(() => import('./pages/inventory/DirectIssuePage'));
 const QcPage              = lazy(() => import('./pages/qc/QcPage'));
 const Users          = lazy(() => import('./pages/admin/Users'));
 const Roles          = lazy(() => import('./pages/admin/Roles'));
@@ -195,6 +196,7 @@ export default function App() {
 
                 <Route path="/inventory" element={guard('auto_indent.view', <InventoryStockPage />)} />
                 <Route path="/inventory/stock" element={guard('auto_indent.view', <InventoryStockPage />)} />
+                <Route path="/inventory/direct-issue" element={<RequirePermission permission="direct_issue.view" anyOf={['direct_issue.view', 'auto_indent.view', 'requisition.issue']}><DirectIssuePage /></RequirePermission>} />
                 <Route path="/inventory/auto-indent" element={guard('auto_indent.view', <InventoryStockPage />)} />
 
                 <Route path="/qc" element={guard('qc.view', <QcPage />)} />
