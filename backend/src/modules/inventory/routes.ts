@@ -370,7 +370,7 @@ router.get(
 /* ── POST /inventory/auto-indent/generate ───────────────────────────────────── */
 
 router.post(
-  '/auto-indent/generate',
+  ['/auto-indent/generate', '/auto-indents/generate'],
   requireAnyPermission('auto_indent.config', 'auto_indent.approve'),
   asyncHandler(async (req, res) => {
     const candidateSql = `
