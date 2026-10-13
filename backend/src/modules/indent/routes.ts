@@ -131,8 +131,35 @@ router.get(
       cb.params,
     );
 
+    // Dynamic totals across the active filter
+    const tb = buildIndentFilter(q);
+    const totals = await queryOne<{
+      indentCount: string;
+      lineCount: string;
+      totalIndentQty: string;
+      totalOrderedQty: string;
+      totalPendingQty: string;
+      totalEstimatedValue: string;
+    }>(
+      `SELECT COUNT(DISTINCT h.id)::int AS "indentCount",
+              COALESCE(SUM(b.line_count), 0)::int AS "lineCount",
+              COALESCE(SUM(b.total_indent_qty), 0) AS "totalIndentQty",
+              COALESCE(SUM(b.total_ordered_qty), 0) AS "totalOrderedQty",
+              COALESCE(SUM(b.total_pending_qty), 0) AS "totalPendingQty",
+              COALESCE(SUM(b.total_estimated_value), 0) AS "totalEstimatedValue"
+         FROM purchase_indent_headers h
+         JOIN v_indent_header_balance b ON b.indent_id = h.id
+         LEFT JOIN lookups it ON it.id = h.indent_type_id
+         LEFT JOIN lookups d  ON d.id  = h.department_id
+         LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
+         LEFT JOIN suppliers s ON s.id = h.suggested_supplier_id
+         ${tb.where()}`,
+      tb.params,
+    );
+
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(counts.map((c) => [c.status, Number(c.n)])),
+      totals,
     });
   }),
 );
@@ -146,6 +173,10 @@ const eligibleSchema = z.object({
   departmentId: csvIdArray,
   costCentreId: csvIdArray,
   indentTypeId: csvIdArray,
+  userId: csvIdArray,
+  hodId: csvIdArray,
+  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   search: z.string().trim().max(200).optional(),
   /** `true` restricts to indents whose suggested supplier matches `supplierId`. */
   matchSupplier: z.enum(['true', 'false']).default('false'),
@@ -167,6 +198,13 @@ router.get(
     b.addIn('v.department_id', q.departmentId);
     b.addIn('v.cost_centre_id', q.costCentreId);
     b.addIn('v.indent_type_id', q.indentTypeId);
+    b.addIn('v.requested_by_user_id', q.userId);
+    b.add('v.indent_date >= ?', q.dateFrom);
+    b.add('v.indent_date <= ?', q.dateTo);
+    if (q.hodId && q.hodId.length > 0) {
+      const p = b.push(q.hodId);
+      b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = v.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+    }
     // Supplier-wise consolidation: only lines whose indent suggests this supplier.
     if (q.matchSupplier === 'true' && q.supplierId) {
       b.add('v.suggested_supplier_id = ?', q.supplierId);
@@ -179,6 +217,15 @@ router.get(
     const totalRow = await queryOne<{ n: string }>(
       `SELECT COUNT(*) AS n FROM v_indent_line_balance v ${b.where()}`, b.params,
     );
+    const totalsRow = await queryOne<{ totalLines: string; distinctIndents: string; totalPendingQty: string }>(
+      `SELECT COUNT(*)::int AS "totalLines",
+              COUNT(DISTINCT v.indent_id)::int AS "distinctIndents",
+              COALESCE(SUM(v.pending_qty), 0) AS "totalPendingQty"
+         FROM v_indent_line_balance v
+        ${b.where()}`,
+      b.params,
+    );
+
     const limit = b.push(q.pageSize);
     const offset = b.push((q.page - 1) * q.pageSize);
 
@@ -204,7 +251,9 @@ router.get(
       b.params,
     );
 
-    sendPage(res, rows, Number(totalRow?.n ?? 0), q.page, q.pageSize);
+    sendPage(res, rows, Number(totalRow?.n ?? 0), q.page, q.pageSize, {
+      totals: totalsRow,
+    });
   }),
 );
 

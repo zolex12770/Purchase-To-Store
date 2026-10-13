@@ -143,7 +143,15 @@ export default function InventoryStockPage() {
     isLoading: stockLoading,
   } = useQuery({
     queryKey: ['inventory-stock', stockParams],
-    queryFn: () => api.getWithMeta<StockRow[], PageMeta>(`/inventory/stock${qs(stockParams)}`),
+    queryFn: () => api.getWithMeta<StockRow[], PageMeta & {
+      summary?: {
+        totalActive: number;
+        normalStock: number;
+        belowReorder: number;
+        criticalStock: number;
+        excessStock: number;
+      };
+    }>(`/inventory/stock${qs(stockParams)}`),
     enabled: currentTab === 'stock',
   });
 
@@ -152,6 +160,9 @@ export default function InventoryStockPage() {
     pageSize: filters.pageSize ?? indentPageSize,
     search: (filters.search as string) || indentSearch || undefined,
     status: indentStatusFilter || undefined,
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
+    userId: filters.userId,
     departmentId: filters.departmentId,
     costCentreId: filters.costCentreId,
     itemId: filters.itemId,
@@ -163,13 +174,23 @@ export default function InventoryStockPage() {
     isLoading: autoIndentLoading,
   } = useQuery({
     queryKey: ['auto-indents', indentParams],
-    queryFn: () => api.getWithMeta<AutoIndentRow[], PageMeta>(`/inventory/auto-indents${qs(indentParams)}`),
+    queryFn: () => api.getWithMeta<AutoIndentRow[], PageMeta & { totals?: { totalQty: number } }>(`/inventory/auto-indents${qs(indentParams)}`),
     enabled: currentTab === 'auto-indent',
   });
 
+  const statsParams = {
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
+    userId: filters.userId,
+    departmentId: filters.departmentId,
+    costCentreId: filters.costCentreId,
+    itemId: filters.itemId,
+    hodId: filters.hodId,
+  };
+
   const { data: autoIndentStats } = useQuery({
-    queryKey: ['auto-indents-stats'],
-    queryFn: () => api.get<AutoIndentStats>('/inventory/auto-indents/stats'),
+    queryKey: ['auto-indents-stats', statsParams],
+    queryFn: () => api.get<AutoIndentStats>(`/inventory/auto-indents/stats${qs(statsParams)}`),
   });
 
   /* ── Mutations ─────────────────────────────────────────────────────────── */
@@ -568,22 +589,30 @@ export default function InventoryStockPage() {
               marginBottom: 'var(--sp-4)',
             }}
           >
-            <StatTile label="Total Active Items" value={count(stockData?.meta?.total ?? 0)} />
+            <StatTile label="Total Active Items" value={count(stockData?.meta?.summary?.totalActive ?? stockData?.meta?.total ?? 0)} />
             <StatTile
               label="Below Reorder / Low"
               value={count(
-                stockRows.filter((r: StockRow) => r.stock_status === 'BELOW_REORDER' || r.stock_status === 'CRITICAL').length,
+                stockData?.meta?.summary
+                  ? stockData.meta.summary.belowReorder + stockData.meta.summary.criticalStock
+                  : stockRows.filter((r: StockRow) => r.stock_status === 'BELOW_REORDER' || r.stock_status === 'CRITICAL').length,
               )}
               tone="warning"
             />
             <StatTile
               label="Zero / Critical Stock"
-              value={count(stockRows.filter((r: StockRow) => r.stock_status === 'CRITICAL').length)}
+              value={count(
+                stockData?.meta?.summary?.criticalStock ??
+                stockRows.filter((r: StockRow) => r.stock_status === 'CRITICAL').length,
+              )}
               tone="danger"
             />
             <StatTile
               label="Excess Stock Items"
-              value={count(stockRows.filter((r: StockRow) => r.stock_status === 'EXCESS').length)}
+              value={count(
+                stockData?.meta?.summary?.excessStock ??
+                stockRows.filter((r: StockRow) => r.stock_status === 'EXCESS').length,
+              )}
               tone="info"
             />
           </div>
@@ -667,7 +696,7 @@ export default function InventoryStockPage() {
               setFilters={setFilters}
               clearFilters={clearFilters}
               activeCount={activeCount}
-              show={['department', 'costCentre', 'hod', 'item']}
+              show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'item']}
             />
           </div>
 

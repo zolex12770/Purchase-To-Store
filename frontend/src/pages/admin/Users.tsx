@@ -17,7 +17,8 @@ import {
   Button, Modal, Field, Input, Select, Checkbox, Badge, ConfirmDialog,
   Drawer, DetailItem, DetailGrid, SectionTitle, LoadingBlock, EmptyState,
 } from '../../components/ui';
-import { formatDateTime, relativeTime, text, initials } from '../../lib/format';
+import { StatTile } from '../../components/KpiCard';
+import { formatDateTime, relativeTime, text, initials, count } from '../../lib/format';
 
 interface Role { id: number; code: string; name: string }
 interface UserRow {
@@ -81,7 +82,13 @@ export default function Users() {
 
   const list = useQuery({
     queryKey: ['users', query],
-    queryFn: () => api.getWithMeta<UserRow[], PageMeta>(`/users${query}`),
+    queryFn: () => api.getWithMeta<UserRow[], PageMeta & {
+      totals?: {
+        totalUsers: number;
+        activeUsers: number;
+        inactiveUsers: number;
+      };
+    }>(`/users${query}`),
   });
 
   const roles = useQuery({
@@ -273,6 +280,14 @@ export default function Users() {
           </>
         }
       />
+
+      {list.data?.meta && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <StatTile label="Total Users" value={count(list.data.meta.totals?.totalUsers ?? list.data.meta.total ?? 0)} />
+          <StatTile label="Active Users" value={count(list.data.meta.totals?.activeUsers ?? 0)} tone="success" />
+          <StatTile label="Inactive Users" value={count(list.data.meta.totals?.inactiveUsers ?? 0)} tone="default" />
+        </div>
+      )}
 
       <DataTable
         columns={columns}

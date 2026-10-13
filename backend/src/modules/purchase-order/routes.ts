@@ -182,8 +182,23 @@ router.get(
     // `po_value_total` metric means (ADR-009 — one definition per KPI). Cancelled
     // value is reported separately so nothing is hidden from the user.
     const tb = buildPoFilter(q);
-    const totals = await queryOne<{ value: string; pending: string; received: string; cancelledValue: string }>(
-      `SELECT COALESCE(SUM(b.total_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS value,
+    const totals = await queryOne<{
+      poCount: string;
+      lineCount: string;
+      totalPoQty: string;
+      totalReceivedQty: string;
+      totalPendingQty: string;
+      value: string;
+      pending: string;
+      received: string;
+      cancelledValue: string;
+    }>(
+      `SELECT COUNT(DISTINCT h.id)::int AS "poCount",
+              COALESCE(SUM(b.line_count) FILTER (WHERE h.status <> 'CANCELLED'), 0)::int AS "lineCount",
+              COALESCE(SUM(b.total_po_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPoQty",
+              COALESCE(SUM(b.total_received_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalReceivedQty",
+              COALESCE(SUM(b.total_pending_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPendingQty",
+              COALESCE(SUM(b.total_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS value,
               COALESCE(SUM(b.pending_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS pending,
               COALESCE(SUM(b.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
               COALESCE(SUM(b.total_amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"

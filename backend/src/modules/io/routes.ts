@@ -46,6 +46,7 @@ const exportQuerySchema = z.object({
   poTypeId: csvIdArray,
   machineId: csvIdArray,
   hodId: csvIdArray,
+  userId: csvIdArray,
   requesterId: csvIdArray,
   hodStatus: csvArray,
   storeStatus: csvArray,

@@ -17,7 +17,8 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { Button, Tabs, StatusBadge, ConfirmDialog } from '../../components/ui';
 import { DocumentQuickViewModal } from '../../components/DocumentQuickViewModal';
-import { qty, formatDate, count, text } from '../../lib/format';
+import { StatTile } from '../../components/KpiCard';
+import { qty, formatDate, count, text, money } from '../../lib/format';
 
 interface IndentRow {
   id: number;
@@ -75,7 +76,17 @@ export default function IndentList() {
 
   const list = useQuery({
     queryKey: ['indents', query],
-    queryFn: () => api.getWithMeta<IndentRow[], PageMeta & { statusCounts: Record<string, number> }>(`/indents${query}`),
+    queryFn: () => api.getWithMeta<IndentRow[], PageMeta & {
+      statusCounts: Record<string, number>;
+      totals?: {
+        indentCount: number;
+        lineCount: number;
+        totalIndentQty: number;
+        totalOrderedQty: number;
+        totalPendingQty: number;
+        totalEstimatedValue: number;
+      };
+    }>(`/indents${query}`),
   });
 
   const decide = useMutation({
@@ -91,6 +102,7 @@ export default function IndentList() {
 
   const counts = list.data?.meta.statusCounts ?? {};
   const totalAll = Object.values(counts).reduce((a, b) => a + b, 0);
+  const totals = list.data?.meta.totals;
 
   const columns: Column<IndentRow>[] = [
     {
@@ -195,6 +207,16 @@ export default function IndentList() {
           </>
         }
       />
+
+      {totals && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <StatTile label="Total Indents" value={count(totals.indentCount)} sub={`${count(totals.lineCount)} line item(s)`} />
+          <StatTile label="Total Indent Qty" value={qty(totals.totalIndentQty)} />
+          <StatTile label="Ordered Qty" value={qty(totals.totalOrderedQty)} tone="success" />
+          <StatTile label="Pending Qty" value={qty(totals.totalPendingQty)} tone={totals.totalPendingQty > 0 ? 'warning' : 'default'} />
+          <StatTile label="Estimated Value" value={money(totals.totalEstimatedValue)} />
+        </div>
+      )}
 
       <div style={{ marginBottom: 'var(--sp-4)' }}>
         <Tabs

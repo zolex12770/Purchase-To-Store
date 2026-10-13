@@ -102,6 +102,14 @@ router.get(
     );
     const total = Number(totalRow?.n ?? 0);
 
+    const counts = await queryOne<{ active_count: string; inactive_count: string; qc_count: string }>(
+      `SELECT COUNT(CASE WHEN i.is_active = TRUE THEN 1 END) AS active_count,
+              COUNT(CASE WHEN i.is_active = FALSE THEN 1 END) AS inactive_count,
+              COUNT(CASE WHEN i.qc_required = TRUE THEN 1 END) AS qc_count
+         FROM items i ${b.where()}`,
+      b.params,
+    );
+
     const order = resolveSort(q, SORTABLE, 'itemCode');
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
@@ -111,7 +119,14 @@ router.get(
       b.params,
     );
 
-    sendPage(res, rows, total, q.page, q.pageSize);
+    sendPage(res, rows, total, q.page, q.pageSize, {
+      totals: {
+        totalItems: total,
+        activeItems: Number(counts?.active_count ?? 0),
+        inactiveItems: Number(counts?.inactive_count ?? 0),
+        qcRequiredItems: Number(counts?.qc_count ?? 0),
+      },
+    });
   }),
 );
 

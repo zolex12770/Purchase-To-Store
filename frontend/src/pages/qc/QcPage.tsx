@@ -94,6 +94,9 @@ export default function QcPage() {
     itemId: filters.itemId,
     userId: filters.userId,
     inspectorId: filters.userId,
+    departmentId: filters.departmentId,
+    costCentreId: filters.costCentreId,
+    hodId: filters.hodId,
   };
 
   const statsParams = {
@@ -103,11 +106,22 @@ export default function QcPage() {
     itemId: filters.itemId,
     userId: filters.userId,
     inspectorId: filters.userId,
+    departmentId: filters.departmentId,
+    costCentreId: filters.costCentreId,
+    hodId: filters.hodId,
   };
 
   const { data, isLoading } = useQuery({
     queryKey: ['qc-inspections', params],
-    queryFn: () => api.getWithMeta<InspectionRow[], PageMeta>(`/qc/inspections${qs(params)}`),
+    queryFn: () => api.getWithMeta<InspectionRow[], PageMeta & {
+      totals?: {
+        totalInspections: number;
+        lineCount: number;
+        totalReceivedQty: number;
+        totalAcceptedQty: number;
+        totalRejectedQty: number;
+      };
+    }>(`/qc/inspections${qs(params)}`),
   });
 
   const { data: stats } = useQuery({
@@ -337,7 +351,7 @@ export default function QcPage() {
           setFilters={setFilters}
           clearFilters={clearFilters}
           activeCount={activeCount}
-          show={['dateRange', 'user', 'supplier', 'item']}
+          show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'item']}
         />
       </div>
 

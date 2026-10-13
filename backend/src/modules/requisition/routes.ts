@@ -217,16 +217,44 @@ router.get(
     );
 
     const cb = buildFilter({ ...q, status: undefined, hodStatus: undefined, storeStatus: undefined }, req.user!.id);
-    const [statusCounts, hodStatusCounts, storeStatusCounts] = await Promise.all([
+    const tb = buildFilter(q, req.user!.id);
+    const [statusCounts, hodStatusCounts, storeStatusCounts, totalsRow] = await Promise.all([
       query<{ status: string; n: string }>(`SELECT h.status, COUNT(*) AS n ${LIST_FROM} ${cb.where()} GROUP BY h.status`, cb.params),
       query<{ hod_status: string; n: string }>(`SELECT b.hod_status, COUNT(*) AS n ${LIST_FROM} ${cb.where()} GROUP BY b.hod_status`, cb.params),
       query<{ store_status: string; n: string }>(`SELECT b.store_status, COUNT(*) AS n ${LIST_FROM} ${cb.where()} GROUP BY b.store_status`, cb.params),
+      queryOne<{
+        requisition_count: string;
+        line_count: string;
+        total_requested_qty: string;
+        total_issued_qty: string;
+        total_pending_qty: string;
+        total_excess_qty: string;
+      }>(
+        `SELECT
+           COUNT(DISTINCT h.id) AS requisition_count,
+           COALESCE(SUM(b.line_count), 0) AS line_count,
+           COALESCE(SUM(b.total_requested_qty), 0) AS total_requested_qty,
+           COALESCE(SUM(b.total_issued_qty), 0) AS total_issued_qty,
+           COALESCE(SUM(b.total_pending_qty), 0) AS total_pending_qty,
+           COALESCE(SUM(b.total_excess_qty), 0) AS total_excess_qty
+         ${LIST_FROM}
+         ${tb.where()}`,
+        tb.params,
+      ),
     ]);
 
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(statusCounts.map((c) => [c.status, Number(c.n)])),
       hodStatusCounts: Object.fromEntries(hodStatusCounts.map((c) => [c.hod_status, Number(c.n)])),
       storeStatusCounts: Object.fromEntries(storeStatusCounts.map((c) => [c.store_status, Number(c.n)])),
+      totals: {
+        requisitionCount: Number(totalsRow?.requisition_count ?? total),
+        lineCount: Number(totalsRow?.line_count ?? 0),
+        totalRequestedQty: Number(totalsRow?.total_requested_qty ?? 0),
+        totalIssuedQty: Number(totalsRow?.total_issued_qty ?? 0),
+        totalPendingQty: Number(totalsRow?.total_pending_qty ?? 0),
+        totalExcessQty: Number(totalsRow?.total_excess_qty ?? 0),
+      },
     });
   }),
 );

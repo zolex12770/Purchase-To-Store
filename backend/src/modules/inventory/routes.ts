@@ -16,7 +16,7 @@ import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendPage, validateBody, validateQuery, parsedQuery,
-  listQuerySchema, offsetOf, idParam, csvIdArray,
+  listQuerySchema, offsetOf, idParam, csvIdArray, toKolkataStartOfDay, toKolkataEndOfDay,
 } from '../../core/http.js';
 import { NotFoundError, ValidationError, BusinessRuleError } from '../../core/errors.js';
 import { requirePermission, requireAnyPermission } from '../../auth/middleware.js';
@@ -133,6 +133,39 @@ router.get(
     const totalRow = await queryOne<{ n: string }>(countSql, b.params);
     const total = Number(totalRow?.n ?? 0);
 
+    const summaryRow = await queryOne<{
+      total_active: string;
+      normal_stock: string;
+      below_reorder: string;
+      critical_stock: string;
+      excess_stock: string;
+    }>(
+      `SELECT
+         COUNT(*) AS total_active,
+         COUNT(CASE WHEN t.stock_status = 'NORMAL' THEN 1 END) AS normal_stock,
+         COUNT(CASE WHEN t.stock_status = 'BELOW_REORDER' THEN 1 END) AS below_reorder,
+         COUNT(CASE WHEN t.stock_status = 'CRITICAL' THEN 1 END) AS critical_stock,
+         COUNT(CASE WHEN t.stock_status = 'EXCESS' THEN 1 END) AS excess_stock
+       FROM (
+         SELECT i.id,
+                CASE
+                  WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
+                       OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
+                    THEN 'CRITICAL'
+                  WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
+                       AND COALESCE(i.reorder_level, 0) > 0
+                    THEN 'BELOW_REORDER'
+                  WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
+                       AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock
+                    THEN 'EXCESS'
+                  ELSE 'NORMAL'
+                END AS stock_status
+         ${baseFrom}
+         ${b.where()}
+       ) t`,
+      b.params,
+    );
+
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
 
@@ -200,7 +233,15 @@ router.get(
       uom_code: toShortUom(r.uom_code as string),
     }));
 
-    sendPage(res, formatted, total, q.page, q.pageSize);
+    sendPage(res, formatted, total, q.page, q.pageSize, {
+      summary: {
+        totalActive: Number(summaryRow?.total_active ?? total),
+        normalStock: Number(summaryRow?.normal_stock ?? 0),
+        belowReorder: Number(summaryRow?.below_reorder ?? 0),
+        criticalStock: Number(summaryRow?.critical_stock ?? 0),
+        excessStock: Number(summaryRow?.excess_stock ?? 0),
+      },
+    });
   }),
 );
 
@@ -459,7 +500,36 @@ const autoIndentListSchema = listQuerySchema.extend({
   costCentreId: csvIdArray,
   itemId: csvIdArray,
   hodId: csvIdArray,
+  userId: csvIdArray,
+  dateFrom: dateStr.optional(),
+  dateTo: dateStr.optional(),
 });
+
+function buildAutoIndentFilter(q: z.infer<typeof autoIndentListSchema>): SqlBuilder {
+  const b = new SqlBuilder();
+  if (q.status) {
+    const statuses = q.status.split(',').map((s) => s.trim()).filter(Boolean);
+    if (statuses.length > 0) b.addIn('ai.status', statuses);
+  }
+  b.addIn('ai.department_id', q.departmentId);
+  b.addIn('ai.cost_centre_id', q.costCentreId);
+  b.addIn('ai.item_id', q.itemId);
+  b.addIn('ai.approved_by_user_id', q.userId);
+  if (q.hodId && q.hodId.length > 0) {
+    const p = b.push(q.hodId);
+    b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = ai.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+  }
+  if (q.dateFrom) b.add('ai.created_at >= ?::timestamptz', toKolkataStartOfDay(q.dateFrom));
+  if (q.dateTo) b.add('ai.created_at <= ?::timestamptz', toKolkataEndOfDay(q.dateTo));
+
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(
+      `(lower(ai.item_code) LIKE ${p} OR lower(ai.item_name) LIKE ${p} OR lower(ai.department_name) LIKE ${p})`,
+    );
+  }
+  return b;
+}
 
 router.get(
   '/auto-indents',
@@ -467,32 +537,29 @@ router.get(
   validateQuery(autoIndentListSchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof autoIndentListSchema>>(res);
-    const b = new SqlBuilder();
-
-    if (q.status) {
-      const statuses = q.status.split(',').map((s) => s.trim()).filter(Boolean);
-      if (statuses.length > 0) b.addIn('ai.status', statuses);
-    }
-    b.addIn('ai.department_id', q.departmentId);
-    b.addIn('ai.cost_centre_id', q.costCentreId);
-    b.addIn('ai.item_id', q.itemId);
-    if (q.hodId && q.hodId.length > 0) {
-      const p = b.push(q.hodId);
-      b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = ai.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-    }
-
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(ai.item_code) LIKE ${p} OR lower(ai.item_name) LIKE ${p} OR lower(ai.department_name) LIKE ${p})`,
-      );
-    }
+    const b = buildAutoIndentFilter(q);
 
     const totalRow = await queryOne<{ n: string }>(
       `SELECT COUNT(*) AS n FROM auto_indents ai ${b.where()}`,
       b.params,
     );
     const total = Number(totalRow?.n ?? 0);
+
+    const totalsRow = await queryOne<{
+      total_qty: string;
+      pending_count: string;
+      approved_count: string;
+      converted_count: string;
+    }>(
+      `SELECT
+         COALESCE(SUM(ai.suggested_qty), 0) AS total_qty,
+         COUNT(CASE WHEN ai.status = 'PENDING_APPROVAL' THEN 1 END) AS pending_count,
+         COUNT(CASE WHEN ai.status IN ('STORE_APPROVED','PURCHASE_APPROVED','APPROVED') THEN 1 END) AS approved_count,
+         COUNT(CASE WHEN ai.status = 'CONVERTED' THEN 1 END) AS converted_count
+       FROM auto_indents ai
+       ${b.where()}`,
+      b.params,
+    );
 
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
@@ -502,19 +569,27 @@ router.get(
        ${b.where()}
        ORDER BY
          CASE ai.status
-           WHEN 'PENDING_APPROVAL' THEN 1
-           WHEN 'STORE_APPROVED' THEN 2
-           WHEN 'PURCHASE_APPROVED' THEN 3
-           WHEN 'APPROVED' THEN 4
-           WHEN 'CONVERTED' THEN 5
-           ELSE 6
-         END,
-         ai.created_at DESC
-       LIMIT ${limit} OFFSET ${offset}`,
+            WHEN 'PENDING_APPROVAL' THEN 1
+            WHEN 'STORE_APPROVED' THEN 2
+            WHEN 'PURCHASE_APPROVED' THEN 3
+            WHEN 'APPROVED' THEN 4
+            WHEN 'CONVERTED' THEN 5
+            ELSE 6
+          END,
+          ai.created_at DESC
+        LIMIT ${limit} OFFSET ${offset}`,
       b.params,
     );
 
-    sendPage(res, rows, total, q.page, q.pageSize);
+    sendPage(res, rows, total, q.page, q.pageSize, {
+      totals: {
+        totalSuggestions: total,
+        totalSuggestedQty: Number(totalsRow?.total_qty ?? 0),
+        pendingCount: Number(totalsRow?.pending_count ?? 0),
+        approvedCount: Number(totalsRow?.approved_count ?? 0),
+        convertedCount: Number(totalsRow?.converted_count ?? 0),
+      },
+    });
   }),
 );
 
@@ -523,9 +598,13 @@ router.get(
 router.get(
   '/auto-indents/stats',
   requirePermission('auto_indent.view'),
+  validateQuery(autoIndentListSchema),
   asyncHandler(async (_req, res) => {
+    const q = parsedQuery<z.infer<typeof autoIndentListSchema>>(res);
+    const b = buildAutoIndentFilter(q);
     const counts = await query<{ status: string; n: string }>(
-      `SELECT status, COUNT(*)::int AS n FROM auto_indents GROUP BY status`,
+      `SELECT ai.status, COUNT(*)::int AS n FROM auto_indents ai ${b.where()} GROUP BY ai.status`,
+      b.params,
     );
     const byStatus = Object.fromEntries(counts.map((c) => [c.status, Number(c.n)]));
 

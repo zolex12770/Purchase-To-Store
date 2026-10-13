@@ -109,7 +109,14 @@ export default function Items() {
 
   const list = useQuery({
     queryKey: ['items', query],
-    queryFn: () => api.getWithMeta<Item[], PageMeta>(`/items${query}`),
+    queryFn: () => api.getWithMeta<Item[], PageMeta & {
+      totals?: {
+        totalItems: number;
+        activeItems: number;
+        inactiveItems: number;
+        qcRequiredItems: number;
+      };
+    }>(`/items${query}`),
   });
 
   const detail = useQuery({
@@ -222,6 +229,15 @@ export default function Items() {
           </>
         }
       />
+
+      {list.data?.meta && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <StatTile label="Total Items" value={count(list.data.meta.totals?.totalItems ?? list.data.meta.total ?? 0)} />
+          <StatTile label="Active Items" value={count(list.data.meta.totals?.activeItems ?? 0)} tone="success" />
+          <StatTile label="Inactive Items" value={count(list.data.meta.totals?.inactiveItems ?? 0)} tone="default" />
+          <StatTile label="QC Required Items" value={count(list.data.meta.totals?.qcRequiredItems ?? 0)} tone="info" />
+        </div>
+      )}
 
       <div style={{ marginBottom: 'var(--sp-4)' }}>
         <FilterBar

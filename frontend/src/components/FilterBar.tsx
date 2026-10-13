@@ -428,6 +428,27 @@ function DateRangeFilter({
             animation: 'zx-scale-in var(--dur-fast) var(--ease-out)',
           }}
         >
+          <div style={{ marginBottom: 10, paddingBottom: 8, borderBottom: '1px solid var(--border)' }}>
+            <div style={{ fontWeight: 600, fontSize: 'var(--text-xs)', marginBottom: 6, color: 'var(--text-muted)' }}>
+              EXACT SINGLE DATE
+            </div>
+            <input
+              type="date"
+              className="input input-sm"
+              style={{ width: '100%', height: 28 }}
+              value={fromVal === toVal ? fromVal : ''}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val) {
+                  setFromVal(val);
+                  setToVal(val);
+                  onApply(val, val);
+                  setOpen(false);
+                }
+              }}
+            />
+          </div>
+
           <div style={{ fontWeight: 600, fontSize: 'var(--text-xs)', marginBottom: 8, color: 'var(--text-muted)' }}>
             QUICK PRESETS
           </div>

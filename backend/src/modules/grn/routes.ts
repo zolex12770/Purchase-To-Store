@@ -206,8 +206,41 @@ router.get(
       cb.params,
     );
 
+    const tb = buildGrnFilter(q);
+    const totalsRow = await queryOne<{
+      grn_count: string;
+      line_count: string;
+      total_qty: string;
+      total_amount: string;
+      pending_qc_count: string;
+      qc_passed_count: string;
+      qc_failed_count: string;
+    }>(
+      `SELECT
+         COUNT(DISTINCT g.id) AS grn_count,
+         COALESCE(COUNT(gl.id), 0) AS line_count,
+         COALESCE(SUM(gl.grn_qty), 0) AS total_qty,
+         COALESCE(SUM(gl.amount), 0) AS total_amount,
+         COUNT(DISTINCT CASE WHEN g.qc_status = 'PENDING' THEN g.id END) AS pending_qc_count,
+         COUNT(DISTINCT CASE WHEN g.qc_status = 'PASSED' THEN g.id END) AS qc_passed_count,
+         COUNT(DISTINCT CASE WHEN g.qc_status = 'FAILED' THEN g.id END) AS qc_failed_count
+       ${GRN_FROM}
+       LEFT JOIN grn_lines gl ON gl.grn_id = g.id
+       ${tb.where()}`,
+      tb.params,
+    );
+
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(counts.map((c) => [c.status, Number(c.n)])),
+      totals: {
+        grnCount: Number(totalsRow?.grn_count ?? total),
+        lineCount: Number(totalsRow?.line_count ?? 0),
+        totalQty: Number(totalsRow?.total_qty ?? 0),
+        totalAmount: Number(totalsRow?.total_amount ?? 0),
+        pendingQcCount: Number(totalsRow?.pending_qc_count ?? 0),
+        qcPassedCount: Number(totalsRow?.qc_passed_count ?? 0),
+        qcFailedCount: Number(totalsRow?.qc_failed_count ?? 0),
+      },
     });
   }),
 );
@@ -219,6 +252,11 @@ const poItemsQuerySchema = z.object({
   supplierId: csvIdArray,
   poId: csvIdArray,
   poTypeId: csvIdArray,
+  itemId: csvIdArray,
+  userId: csvIdArray,
+  departmentId: csvIdArray,
+  costCentreId: csvIdArray,
+  hodId: csvIdArray,
   dateFrom: dateStr.optional(),
   dateTo: dateStr.optional(),
   view: z.enum(['pending', 'all']).default('pending'),
@@ -240,8 +278,27 @@ router.get(
     b.addIn('v.supplier_id', f.supplierId);
     b.addIn('v.po_id', f.poId);
     b.addIn('v.po_type_id', f.poTypeId);
+    b.addIn('v.item_id', f.itemId);
     b.add('v.po_date >= ?', f.dateFrom);
     b.add('v.po_date <= ?', f.dateTo);
+
+    if (f.userId && f.userId.length > 0) {
+      const p = b.push(f.userId);
+      b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_headers poh WHERE poh.id = v.po_id AND poh.created_by = ANY(${p}))`);
+    }
+    if (f.departmentId && f.departmentId.length > 0) {
+      const p = b.push(f.departmentId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = v.item_id AND i.department_id = ANY(${p}))`);
+    }
+    if (f.costCentreId && f.costCentreId.length > 0) {
+      const p = b.push(f.costCentreId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = v.item_id AND i.cost_centre_id = ANY(${p}))`);
+    }
+    if (f.hodId && f.hodId.length > 0) {
+      const p = b.push(f.hodId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i JOIN lookups d ON d.id = i.department_id WHERE i.id = v.item_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+    }
+
     if (f.search) {
       const p = b.push(`%${f.search.toLowerCase()}%`);
       b.addRaw(

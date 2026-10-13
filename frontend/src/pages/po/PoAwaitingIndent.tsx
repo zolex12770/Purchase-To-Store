@@ -12,20 +12,20 @@
  * consumed by a PO — the source indent itself stays visible in Purchase Indent
  * history either way.
  */
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { ClipboardList, ShoppingCart, Search, ExternalLink } from 'lucide-react';
+import { ClipboardList, ShoppingCart, ExternalLink } from 'lucide-react';
 import { api, qs, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
-import { useLookupOptions } from '../../lib/masters';
 import { PageHeader } from '../../layout/AppShell';
+import { FilterBar } from '../../components/FilterBar';
 import {
-  Button, Card, Field, Input, SearchSelect, LoadingBlock, EmptyState, ErrorState, Badge,
+  Button, Card, LoadingBlock, EmptyState, ErrorState, Badge,
 } from '../../components/ui';
 import { StatTile } from '../../components/KpiCard';
-import { HelpStrip, useDebounced } from '../../components/simple';
+import { HelpStrip } from '../../components/simple';
 import { groupRows } from '../../lib/pickSelection';
 import { qty, formatDate, text } from '../../lib/format';
 
@@ -53,34 +53,32 @@ export default function PoAwaitingIndent() {
   const { can } = useAuth();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
 
-  const indentTypeOptions = useLookupOptions('INDENT_TYPE');
-
-  const search = (filters.search as string) ?? '';
-  const [typed, setTyped] = useState(search);
-  const settled = useDebounced(typed.trim());
-  const departmentId = (filters.departmentId as string[] | undefined)?.[0];
-  const costCentreId = (filters.costCentreId as string[] | undefined)?.[0];
-  const indentTypeId = (filters.indentTypeId as string[] | undefined)?.[0];
-
   const query = qs({
-    search: settled || undefined,
-    departmentId: departmentId ? [departmentId] : undefined,
-    costCentreId: costCentreId ? [costCentreId] : undefined,
-    indentTypeId: indentTypeId ? [indentTypeId] : undefined,
+    search: filters.search,
+    departmentId: filters.departmentId,
+    costCentreId: filters.costCentreId,
+    indentTypeId: filters.indentTypeId,
+    supplierId: filters.supplierId,
+    itemId: filters.itemId,
+    userId: filters.userId,
+    hodId: filters.hodId,
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
     page: filters.page ?? 1,
     pageSize: 100,
   });
 
   const list = useQuery({
     queryKey: ['indents-eligible-lines', query],
-    queryFn: () => api.getWithMeta<EligibleLine[], PageMeta>(`/indents/eligible-lines${query}`),
+    queryFn: () => api.getWithMeta<EligibleLine[], PageMeta & {
+      totals?: { totalLines: number; distinctIndents: number; totalPendingQty: number };
+    }>(`/indents/eligible-lines${query}`),
     staleTime: 0,
   });
 
   const rows = list.data?.data ?? [];
   const groups = useMemo(() => groupRows(rows, (r) => r.indent_id), [rows]);
   const totalPendingQty = rows.reduce((s, r) => s + Number(r.pending_qty), 0);
-  const filtering = Boolean(settled) || Boolean(indentTypeId);
 
   return (
     <>
@@ -103,36 +101,17 @@ export default function PoAwaitingIndent() {
       </HelpStrip>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
-        <StatTile label="Items waiting for PO" value={String(list.data?.meta.total ?? rows.length)} tone={rows.length > 0 ? 'warning' : undefined} />
-        <StatTile label="Indents (this page)" value={String(groups.length)} />
-        <StatTile label="Waiting quantity (this page)" value={qty(totalPendingQty)} />
+        <StatTile label="Items waiting for PO" value={String(list.data?.meta.totals?.totalLines ?? list.data?.meta.total ?? rows.length)} tone={rows.length > 0 ? 'warning' : undefined} />
+        <StatTile label="Distinct Indents" value={String(list.data?.meta.totals?.distinctIndents ?? groups.length)} />
+        <StatTile label="Waiting quantity" value={qty(list.data?.meta.totals?.totalPendingQty ?? totalPendingQty)} />
       </div>
 
-      <Card>
-        <div className="row" style={{ padding: 'var(--sp-3) var(--sp-4)', gap: 'var(--sp-3)', flexWrap: 'wrap', alignItems: 'flex-end' }}>
-          <div style={{ position: 'relative', flex: '1 1 280px', maxWidth: 460 }}>
-            <Search size={15} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--ink-400)' }} aria-hidden />
-            <Input
-              value={typed} placeholder="Search by indent no. or item…"
-              style={{ paddingLeft: 36, height: 42, fontSize: 'var(--text-md)' }}
-              aria-label="Search indents ready for PO"
-              onChange={(e) => { setTyped(e.target.value); setFilters({ search: e.target.value || undefined }); }}
-            />
-          </div>
-          <div style={{ width: 240 }}>
-            <Field label="Indent type">
-              <SearchSelect
-                value={indentTypeId ? Number(indentTypeId) : null}
-                onChange={(v) => setFilters({ indentTypeId: v == null ? undefined : [String(v)] })}
-                options={indentTypeOptions.options} placeholder="Any type"
-              />
-            </Field>
-          </div>
-          {activeCount > 0 && (
-            <Button variant="ghost" size="sm" onClick={() => { clearFilters(); setTyped(''); }}>Clear all</Button>
-          )}
-        </div>
+      <FilterBar
+        filters={filters} setFilters={setFilters} clearFilters={clearFilters} activeCount={activeCount}
+        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'indentType', 'item']}
+      />
 
+      <Card>
         {list.isLoading ? (
           <LoadingBlock height={260} label="Loading indents…" />
         ) : list.error ? (
@@ -140,8 +119,8 @@ export default function PoAwaitingIndent() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={<ClipboardList />}
-            title={filtering ? 'Nothing matches' : 'No indent is waiting for a purchase order'}
-            message={filtering
+            title={activeCount > 0 ? 'Nothing matches' : 'No indent is waiting for a purchase order'}
+            message={activeCount > 0
               ? 'Try a different indent number or item, or clear the filters.'
               : 'Every approved indent already has its purchase order. A new indent appears here once it is approved.'}
           />

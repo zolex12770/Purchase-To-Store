@@ -85,7 +85,17 @@ export default function PoList() {
     queryKey: ['purchase-orders', query],
     queryFn: () => api.getWithMeta<PoRow[], PageMeta & {
       statusCounts: Record<string, number>;
-      totals: { value: string; pending: string; received: string; cancelledValue: string };
+      totals: {
+        poCount?: number | string;
+        lineCount?: number | string;
+        totalPoQty?: number | string;
+        totalReceivedQty?: number | string;
+        totalPendingQty?: number | string;
+        value: string;
+        pending: string;
+        received: string;
+        cancelledValue: string;
+      };
     }>(`/purchase-orders${query}`),
   });
 
@@ -187,15 +197,17 @@ export default function PoList() {
       />
 
       {totals && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
-          <StatTile label="Total PO value" value={money(totals.value)}
-                    sub={`${list.data?.meta.total ?? 0} order(s) in view · excludes cancelled`} />
-          <StatTile label="Received value" value={money(totals.received)} tone="success" />
-          <StatTile label="Pending value" value={money(totals.pending)} tone={Number(totals.pending) > 0 ? 'warning' : 'default'}
-                    sub="Committed but not yet received" />
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <StatTile label="Purchase Orders" value={count(totals.poCount ?? list.data?.meta.total ?? 0)} />
+          <StatTile label="Line Items" value={count(totals.lineCount ?? 0)} />
+          <StatTile label="Ordered Qty" value={qty(totals.totalPoQty ?? 0)} />
+          <StatTile label="Received Qty" value={qty(totals.totalReceivedQty ?? 0)} tone="success" />
+          <StatTile label="Pending Qty" value={qty(totals.totalPendingQty ?? 0)} tone={Number(totals.totalPendingQty) > 0 ? 'warning' : 'default'} />
+          <StatTile label="Total PO Value" value={money(totals.value)} sub="Excludes cancelled" />
+          <StatTile label="Received Value" value={money(totals.received)} tone="success" />
+          <StatTile label="Pending Value" value={money(totals.pending)} tone={Number(totals.pending) > 0 ? 'warning' : 'default'} sub="Committed pending receipt" />
           {Number(totals.cancelledValue) > 0 && (
-            <StatTile label="Cancelled value" value={money(totals.cancelledValue)} tone="danger"
-                      sub="Excluded from the totals above" />
+            <StatTile label="Cancelled Value" value={money(totals.cancelledValue)} tone="danger" sub="Excluded from totals" />
           )}
         </div>
       )}

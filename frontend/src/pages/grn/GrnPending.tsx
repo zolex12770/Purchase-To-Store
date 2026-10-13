@@ -9,21 +9,20 @@
  * ticked. The supplier-consistency and quantity rules are enforced there and on
  * the server; this page only decides where the user starts.
  */
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { PackageSearch, Truck, Search, SlidersHorizontal, ExternalLink } from 'lucide-react';
+import { PackageSearch, Truck, ExternalLink } from 'lucide-react';
 import { api, qs } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
-import { useLookupOptions } from '../../lib/masters';
 import { PageHeader } from '../../layout/AppShell';
+import { FilterBar } from '../../components/FilterBar';
 import {
-  Button, Card, Field, Input, SearchSelect, LoadingBlock, EmptyState, ErrorState,
+  Button, Card, LoadingBlock, EmptyState, ErrorState,
 } from '../../components/ui';
 import { StatTile } from '../../components/KpiCard';
-import { HelpStrip, ReceiptBadge, useDebounced } from '../../components/simple';
-import { SupplierSelect } from '../../components/MasterSelect';
+import { HelpStrip, ReceiptBadge } from '../../components/simple';
 import { groupRows } from '../../lib/pickSelection';
 import { qty, money, formatDate, text, count } from '../../lib/format';
 
@@ -53,27 +52,17 @@ export default function GrnPending() {
   const { can } = useAuth();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
 
-  const poTypeList = useLookupOptions('PO_TYPE');
-  const indentTypeList = useLookupOptions('INDENT_TYPE');
-  const poTypeOptions = poTypeList.options.length > 0 ? poTypeList.options : indentTypeList.options;
-
-  const search = (filters.search as string) ?? '';
-  const [typed, setTyped] = useState(search);
-  const settled = useDebounced(typed.trim());
-  const supplierId = (filters.supplierId as string[] | undefined)?.[0];
-  const poTypeId = (filters.poTypeId as string[] | undefined)?.[0];
-  const dateFrom = (filters.dateFrom as string) ?? '';
-  const dateTo = (filters.dateTo as string) ?? '';
-  const extraFilters = [supplierId, poTypeId, dateFrom, dateTo].filter(Boolean).length;
-  const [moreFilters, setMoreFilters] = useState(extraFilters > 0);
-  const [supplierName, setSupplierName] = useState('');
-
   const query = qs({
-    search: settled || undefined,
-    supplierId: supplierId ? [supplierId] : undefined,
-    poTypeId: poTypeId ? [poTypeId] : undefined,
-    dateFrom: dateFrom || undefined,
-    dateTo: dateTo || undefined,
+    search: filters.search,
+    supplierId: filters.supplierId,
+    poTypeId: filters.poTypeId,
+    departmentId: filters.departmentId,
+    costCentreId: filters.costCentreId,
+    itemId: filters.itemId,
+    userId: filters.userId,
+    hodId: filters.hodId,
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
     view: 'pending',
     limit: 500,
   });
@@ -89,7 +78,6 @@ export default function GrnPending() {
   const totalPendingQty = rows.reduce((s, r) => s + Number(r.pending_grn_qty), 0);
   const totalPendingValue = rows.reduce((s, r) => s + (Number(r.pending_grn_qty) * (Number(r.amount) / Number(r.po_qty || 1))), 0);
   const distinctSuppliers = new Set(rows.map((r) => r.supplier_id)).size;
-  const filtering = Boolean(settled) || extraFilters > 0;
 
   const receive = (poId: number) => navigate(`/grn/new?poId=${poId}`);
 
@@ -121,51 +109,12 @@ export default function GrnPending() {
         <StatTile label="Suppliers" value={String(distinctSuppliers)} />
       </div>
 
+      <FilterBar
+        filters={filters} setFilters={setFilters} clearFilters={clearFilters} activeCount={activeCount}
+        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'poType', 'item']}
+      />
+
       <Card>
-        <div className="row" style={{ padding: 'var(--sp-3) var(--sp-4)', gap: 'var(--sp-3)', flexWrap: 'wrap' }}>
-          <div style={{ position: 'relative', flex: '1 1 280px', maxWidth: 460 }}>
-            <Search size={15} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--ink-400)' }} aria-hidden />
-            <Input
-              value={typed}
-              placeholder="Search by PO no., supplier or item…"
-              style={{ paddingLeft: 36, height: 42, fontSize: 'var(--text-md)' }}
-              aria-label="Search pending purchase orders"
-              onChange={(e) => { setTyped(e.target.value); setFilters({ search: e.target.value || undefined }); }}
-            />
-          </div>
-          <Button variant={extraFilters > 0 ? 'secondary' : 'ghost'} icon={<SlidersHorizontal size={14} />}
-                  onClick={() => setMoreFilters((v) => !v)}>
-            More filters{extraFilters > 0 ? ` (${extraFilters})` : ''}
-          </Button>
-          {activeCount > 0 && (
-            <Button variant="ghost" size="sm" onClick={() => { clearFilters(); setTyped(''); setSupplierName(''); }}>Clear all</Button>
-          )}
-        </div>
-
-        {moreFilters && (
-          <div className="form-grid" style={{ padding: '0 var(--sp-4) var(--sp-3)' }}>
-            <Field label="Supplier">
-              <SupplierSelect
-                value={supplierId ? Number(supplierId) : null} selectedName={supplierName} placeholder="Any supplier"
-                onChange={(sid, s) => { setSupplierName(s?.supplier_name ?? ''); setFilters({ supplierId: sid == null ? undefined : [String(sid)] }); }}
-              />
-            </Field>
-            <Field label="PO type">
-              <SearchSelect
-                value={poTypeId ? Number(poTypeId) : null}
-                onChange={(v) => setFilters({ poTypeId: v == null ? undefined : [String(v)] })}
-                options={poTypeOptions} placeholder="Any type"
-              />
-            </Field>
-            <Field label="PO date from">
-              <Input type="date" value={dateFrom} onChange={(e) => setFilters({ dateFrom: e.target.value || undefined })} />
-            </Field>
-            <Field label="PO date to">
-              <Input type="date" value={dateTo} onChange={(e) => setFilters({ dateTo: e.target.value || undefined })} />
-            </Field>
-          </div>
-        )}
-
         {list.isLoading ? (
           <LoadingBlock height={260} label="Loading pending purchase orders…" />
         ) : list.error ? (
@@ -173,8 +122,8 @@ export default function GrnPending() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={<PackageSearch />}
-            title={filtering ? 'Nothing matches' : 'Nothing is pending'}
-            message={filtering
+            title={activeCount > 0 ? 'Nothing matches' : 'Nothing is pending'}
+            message={activeCount > 0
               ? 'Try a different PO number, supplier or item, or clear the filters.'
               : 'Every issued purchase order has been fully received.'}
           />

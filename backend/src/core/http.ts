@@ -183,4 +183,17 @@ export const universalFilterSchema = z.object({
 
 export type UniversalFilter = z.infer<typeof universalFilterSchema>;
 
+/**
+ * Converts a YYYY-MM-DD date string into an Asia/Kolkata boundary ISO timestamp string:
+ * startOfDay: YYYY-MM-DDT00:00:00.000+05:30
+ * endOfDay: YYYY-MM-DDT23:59:59.999+05:30
+ */
+export function toKolkataStartOfDay(dateStr: string): string {
+  return `${dateStr}T00:00:00.000+05:30`;
+}
+
+export function toKolkataEndOfDay(dateStr: string): string {
+  return `${dateStr}T23:59:59.999+05:30`;
+}
+
 export { AppError };

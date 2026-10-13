@@ -13,6 +13,7 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { Button, Tabs, StatusBadge } from '../../components/ui';
 import { DocumentQuickViewModal } from '../../components/DocumentQuickViewModal';
+import { StatTile } from '../../components/KpiCard';
 import { money, qty, formatDate, count, text } from '../../lib/format';
 
 interface GrnRow {
@@ -67,11 +68,23 @@ export default function GrnList() {
 
   const list = useQuery({
     queryKey: ['grn', query],
-    queryFn: () => api.getWithMeta<GrnRow[], PageMeta & { statusCounts: Record<string, number> }>(`/grn${query}`),
+    queryFn: () => api.getWithMeta<GrnRow[], PageMeta & {
+      statusCounts: Record<string, number>;
+      totals?: {
+        grnCount: number;
+        lineCount: number;
+        totalQty: number;
+        totalAmount: number;
+        pendingQcCount: number;
+        qcPassedCount: number;
+        qcFailedCount: number;
+      };
+    }>(`/grn${query}`),
   });
 
   const counts = list.data?.meta.statusCounts ?? {};
   const totalAll = Object.values(counts).reduce((a, b) => a + b, 0);
+  const totals = list.data?.meta.totals;
 
   const columns: Column<GrnRow>[] = [
     {
@@ -148,6 +161,19 @@ export default function GrnList() {
           </>
         }
       />
+
+      {totals && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <StatTile label="Total GRNs" value={count(totals.grnCount)} sub={`${count(totals.lineCount)} line item(s)`} />
+          <StatTile label="Total Received Qty" value={qty(totals.totalQty)} />
+          <StatTile label="Total Value" value={money(totals.totalAmount)} />
+          <StatTile label="Pending QC" value={count(totals.pendingQcCount)} tone={totals.pendingQcCount > 0 ? 'warning' : 'default'} />
+          <StatTile label="QC Passed" value={count(totals.qcPassedCount)} tone="success" />
+          {totals.qcFailedCount > 0 && (
+            <StatTile label="QC Failed" value={count(totals.qcFailedCount)} tone="danger" />
+          )}
+        </div>
+      )}
 
       <div style={{ marginBottom: 'var(--sp-4)' }}>
         <Tabs

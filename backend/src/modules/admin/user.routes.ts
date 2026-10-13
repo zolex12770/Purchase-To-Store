@@ -66,12 +66,26 @@ router.get(
     }
 
     const totalRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM users u ${b.where()}`, b.params);
+
+    const counts = await queryOne<{ active_count: string; inactive_count: string }>(
+      `SELECT COUNT(CASE WHEN u.is_active = TRUE THEN 1 END) AS active_count,
+              COUNT(CASE WHEN u.is_active = FALSE THEN 1 END) AS inactive_count
+         FROM users u ${b.where()}`,
+      b.params,
+    );
+
     const order = resolveSort(q, SORTABLE, 'employeeName');
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
 
     const rows = await query(`${USER_SELECT} ${b.where()} ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`, b.params);
-    sendPage(res, rows, Number(totalRow?.n ?? 0), q.page, q.pageSize);
+    sendPage(res, rows, Number(totalRow?.n ?? 0), q.page, q.pageSize, {
+      totals: {
+        totalUsers: Number(totalRow?.n ?? 0),
+        activeUsers: Number(counts?.active_count ?? 0),
+        inactiveUsers: Number(counts?.inactive_count ?? 0),
+      },
+    });
   }),
 );
 

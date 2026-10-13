@@ -100,7 +100,13 @@ export default function Suppliers() {
 
   const list = useQuery({
     queryKey: ['suppliers', query],
-    queryFn: () => api.getWithMeta<Supplier[], PageMeta>(`/suppliers${query}`),
+    queryFn: () => api.getWithMeta<Supplier[], PageMeta & {
+      totals?: {
+        totalSuppliers: number;
+        activeSuppliers: number;
+        inactiveSuppliers: number;
+      };
+    }>(`/suppliers${query}`),
   });
 
   const detail = useQuery({
@@ -219,6 +225,14 @@ export default function Suppliers() {
           </>
         }
       />
+
+      {list.data?.meta && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <StatTile label="Total Suppliers" value={count(list.data.meta.totals?.totalSuppliers ?? list.data.meta.total ?? 0)} />
+          <StatTile label="Active Suppliers" value={count(list.data.meta.totals?.activeSuppliers ?? 0)} tone="success" />
+          <StatTile label="Inactive Suppliers" value={count(list.data.meta.totals?.inactiveSuppliers ?? 0)} tone="default" />
+        </div>
+      )}
 
       <DataTable
         columns={columns}

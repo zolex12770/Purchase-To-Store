@@ -78,3 +78,6 @@ deploy/backups/
 deploy/certs/
 # ...but the TEMPLATE must ship: `.env.*` above would otherwise swallow it.
 !deploy/.env.deploy.example
+
+# Sample sheets
+Inventory Sheet For Sample/

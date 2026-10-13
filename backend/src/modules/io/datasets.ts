@@ -30,6 +30,7 @@ export interface DatasetFilters {
   poTypeId?: number[];
   machineId?: number[];
   hodId?: number[];
+  userId?: number[];
   requesterId?: number[];
   hodStatus?: string[];
   storeStatus?: string[];
@@ -214,8 +215,13 @@ export const DATASETS: Record<string, DatasetDef> = {
       b.addIn('v.department_id', f.departmentId);
       b.addIn('v.cost_centre_id', f.costCentreId);
       b.addIn('v.indent_type_id', f.indentTypeId);
+      b.addIn('v.requested_by_user_id', f.userId || f.requesterId);
       b.add('v.indent_date >= ?', f.dateFrom);
       b.add('v.indent_date <= ?', f.dateTo);
+      if (f.hodId && f.hodId.length > 0) {
+        const p = b.push(f.hodId);
+        b.addRaw(`EXISTS (SELECT 1 FROM items i JOIN lookups d ON d.id = i.department_id WHERE i.id = v.item_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+      }
       if (f.search) like(b, f.search, ['v.indent_no', 'v.item_code', 'v.item_description']);
       return {
         sql: `SELECT v.indent_no, v.indent_date, v.indent_status, v.line_no, v.item_code,
@@ -263,8 +269,21 @@ export const DATASETS: Record<string, DatasetDef> = {
       b.addIn('h.status', f.status);
       b.addIn('h.supplier_id', f.supplierId);
       b.addIn('h.po_type_id', f.poTypeId);
+      b.addIn('h.created_by', f.userId);
       b.add('h.po_date >= ?', f.dateFrom);
       b.add('h.po_date <= ?', f.dateTo);
+      if (f.departmentId && f.departmentId.length > 0) {
+        const p = b.push(f.departmentId);
+        b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.department_id = ANY(${p}))`);
+      }
+      if (f.costCentreId && f.costCentreId.length > 0) {
+        const p = b.push(f.costCentreId);
+        b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.cost_centre_id = ANY(${p}))`);
+      }
+      if (f.hodId && f.hodId.length > 0) {
+        const p = b.push(f.hodId);
+        b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id JOIN lookups d ON d.id = i.department_id WHERE pol.po_id = h.id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+      }
       if (f.search) like(b, f.search, ['h.po_no', 's.supplier_name', 'h.remarks']);
       return {
         sql: `SELECT h.po_no, h.po_date, h.po_time, pt.name AS po_type_name, s.supplier_name,
@@ -361,8 +380,25 @@ export const DATASETS: Record<string, DatasetDef> = {
       b.addIn('g.id', f.ids);
       b.addIn('g.status', f.status);
       b.addIn('g.supplier_id', f.supplierId);
+      b.addIn('g.received_by_user_id', f.userId);
       b.add('g.grn_date >= ?', f.dateFrom);
       b.add('g.grn_date <= ?', f.dateTo);
+      if (f.itemId && f.itemId.length > 0) {
+        const p = b.push(f.itemId);
+        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l WHERE l.grn_id = g.id AND l.item_id = ANY(${p}))`);
+      }
+      if (f.departmentId && f.departmentId.length > 0) {
+        const p = b.push(f.departmentId);
+        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id WHERE l.grn_id = g.id AND i.department_id = ANY(${p}))`);
+      }
+      if (f.costCentreId && f.costCentreId.length > 0) {
+        const p = b.push(f.costCentreId);
+        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id WHERE l.grn_id = g.id AND i.cost_centre_id = ANY(${p}))`);
+      }
+      if (f.hodId && f.hodId.length > 0) {
+        const p = b.push(f.hodId);
+        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id JOIN lookups d ON d.id = i.department_id WHERE l.grn_id = g.id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+      }
       if (f.search) like(b, f.search, ['g.grn_no', 'p.po_no', 's.supplier_name', 'g.challan_no']);
       return {
         sql: `SELECT g.grn_no, g.grn_date, g.grn_time, p.po_no, pt.name AS po_type_name,
@@ -411,8 +447,21 @@ export const DATASETS: Record<string, DatasetDef> = {
       b.addIn('g.status', f.status);
       b.addIn('g.supplier_id', f.supplierId);
       b.addIn('gl.item_id', f.itemId);
+      b.addIn('g.received_by_user_id', f.userId);
       b.add('g.grn_date >= ?', f.dateFrom);
       b.add('g.grn_date <= ?', f.dateTo);
+      if (f.departmentId && f.departmentId.length > 0) {
+        const p = b.push(f.departmentId);
+        b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = gl.item_id AND i.department_id = ANY(${p}))`);
+      }
+      if (f.costCentreId && f.costCentreId.length > 0) {
+        const p = b.push(f.costCentreId);
+        b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = gl.item_id AND i.cost_centre_id = ANY(${p}))`);
+      }
+      if (f.hodId && f.hodId.length > 0) {
+        const p = b.push(f.hodId);
+        b.addRaw(`EXISTS (SELECT 1 FROM items i JOIN lookups d ON d.id = i.department_id WHERE i.id = gl.item_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+      }
       if (f.search) like(b, f.search, ['g.grn_no', 'p.po_no', 'gl.item_code', 'gl.item_description']);
       return {
         // po_no is joined through the LINE's own po_line_id, not the header's
@@ -467,7 +516,7 @@ export const DATASETS: Record<string, DatasetDef> = {
       b.addIn('h.cost_centre_id', f.costCentreId);
       b.addIn('h.machine_id', f.machineId);
       b.addIn('h.hod_user_id', f.hodId);
-      b.addIn('h.requester_user_id', f.requesterId);
+      b.addIn('h.requester_user_id', f.userId || f.requesterId);
       b.add('h.requisition_date >= ?', f.dateFrom);
       b.add('h.requisition_date <= ?', f.dateTo);
       if (f.search) like(b, f.search, ['h.requisition_no', 'h.employee_name', 'h.remarks']);
@@ -524,6 +573,8 @@ export const DATASETS: Record<string, DatasetDef> = {
       b.addIn('h.department_id', f.departmentId);
       b.addIn('h.cost_centre_id', f.costCentreId);
       b.addIn('h.machine_id', f.machineId);
+      b.addIn('h.hod_user_id', f.hodId);
+      b.addIn('h.requester_user_id', f.userId || f.requesterId);
       b.addIn('l.item_id', f.itemId);
       b.add('h.requisition_date >= ?', f.dateFrom);
       b.add('h.requisition_date <= ?', f.dateTo);

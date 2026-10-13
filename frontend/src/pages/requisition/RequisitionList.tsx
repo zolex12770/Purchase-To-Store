@@ -141,6 +141,14 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
     queryKey: ['requisitions', scope, query],
     queryFn: () => api.getWithMeta<RequisitionRow[], PageMeta & {
       statusCounts: Record<string, number>; hodStatusCounts: Record<string, number>; storeStatusCounts: Record<string, number>;
+      totals?: {
+        requisitionCount: number;
+        lineCount: number;
+        totalRequestedQty: number;
+        totalIssuedQty: number;
+        totalPendingQty: number;
+        totalExcessQty: number;
+      };
     }>(`/requisitions${query}`),
   });
 
@@ -279,7 +287,7 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
         }
       />
 
-      {showDashboard && dashboard.data && (
+      {showDashboard && dashboard.data ? (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
           <StatTile label="My Requisitions" value={String(dashboard.data.myRequisitions)} onClick={() => navigate('/requisitions/mine')} />
           <StatTile label="Waiting for Approval" value={String(dashboard.data.pendingHodApproval)} tone="warning" onClick={() => goFiltered({ status: ['PENDING_APPROVAL'] })} />
@@ -294,7 +302,16 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
           <StatTile label="Current Pending Qty" value={qty(dashboard.data.totalPendingQty)} tone={Number(dashboard.data.totalPendingQty) > 0 ? 'warning' : 'default'} />
           <StatTile label="Over-Issued Qty" value={qty(dashboard.data.totalExcessQty)} tone={Number(dashboard.data.totalExcessQty) > 0 ? 'warning' : 'default'} />
         </div>
-      )}
+      ) : list.data?.meta.totals ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+          <StatTile label="Requisitions" value={count(list.data.meta.totals.requisitionCount)} />
+          <StatTile label="Line Items" value={count(list.data.meta.totals.lineCount)} />
+          <StatTile label="Requested Qty" value={qty(list.data.meta.totals.totalRequestedQty)} />
+          <StatTile label="Issued Qty" value={qty(list.data.meta.totals.totalIssuedQty)} tone="success" />
+          <StatTile label="Pending Qty" value={qty(list.data.meta.totals.totalPendingQty)} tone={list.data.meta.totals.totalPendingQty > 0 ? 'warning' : 'default'} />
+          <StatTile label="Over-Issued Qty" value={qty(list.data.meta.totals.totalExcessQty)} tone={list.data.meta.totals.totalExcessQty > 0 ? 'warning' : 'default'} />
+        </div>
+      ) : null}
 
       {showStatusTabs && (
         <div style={{ marginBottom: 'var(--sp-4)' }}>

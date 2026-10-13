@@ -61,6 +61,13 @@ router.get(
     );
     const total = Number(totalRow?.n ?? 0);
 
+    const counts = await queryOne<{ active_count: string; inactive_count: string }>(
+      `SELECT COUNT(CASE WHEN s.is_active = TRUE THEN 1 END) AS active_count,
+              COUNT(CASE WHEN s.is_active = FALSE THEN 1 END) AS inactive_count
+         FROM suppliers s ${b.where()}`,
+      b.params,
+    );
+
     const order = resolveSort(q, SORTABLE, 'supplierName');
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
@@ -89,7 +96,13 @@ router.get(
       b.params,
     );
 
-    sendPage(res, rows, total, q.page, q.pageSize);
+    sendPage(res, rows, total, q.page, q.pageSize, {
+      totals: {
+        totalSuppliers: total,
+        activeSuppliers: Number(counts?.active_count ?? 0),
+        inactiveSuppliers: Number(counts?.inactive_count ?? 0),
+      },
+    });
   }),
 );
 

@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendPage, validateBody, validateQuery, parsedQuery,
-  listQuerySchema, offsetOf, idParam,
+  listQuerySchema, offsetOf, idParam, csvIdArray, toKolkataStartOfDay, toKolkataEndOfDay,
 } from '../../core/http.js';
 import { NotFoundError, ValidationError, BusinessRuleError } from '../../core/errors.js';
 import { requirePermission, requireAnyPermission } from '../../auth/middleware.js';
@@ -30,6 +30,9 @@ const statsSchema = z.object({
   itemId: z.coerce.number().int().positive().optional(),
   inspectorId: z.coerce.number().int().positive().optional(),
   userId: z.coerce.number().int().positive().optional(),
+  departmentId: csvIdArray,
+  costCentreId: csvIdArray,
+  hodId: csvIdArray,
   dateFrom: dateStr.optional(),
   dateTo: dateStr.optional(),
 });
@@ -45,8 +48,20 @@ router.get(
     if (q.itemId) b.add('item_id = ?', q.itemId);
     const inspector = q.inspectorId || q.userId;
     if (inspector) b.add('inspector_id = ?', inspector);
-    if (q.dateFrom) b.add('created_at >= ?::timestamptz', `${q.dateFrom} 00:00:00Z`);
-    if (q.dateTo) b.add('created_at <= ?::timestamptz', `${q.dateTo} 23:59:59Z`);
+    if (q.departmentId && q.departmentId.length > 0) {
+      const p = b.push(q.departmentId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = qc_inspections.item_id AND i.department_id = ANY(${p}))`);
+    }
+    if (q.costCentreId && q.costCentreId.length > 0) {
+      const p = b.push(q.costCentreId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = qc_inspections.item_id AND i.cost_centre_id = ANY(${p}))`);
+    }
+    if (q.hodId && q.hodId.length > 0) {
+      const p = b.push(q.hodId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i JOIN lookups d ON d.id = i.department_id WHERE i.id = qc_inspections.item_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+    }
+    if (q.dateFrom) b.add('created_at >= ?::timestamptz', toKolkataStartOfDay(q.dateFrom));
+    if (q.dateTo) b.add('created_at <= ?::timestamptz', toKolkataEndOfDay(q.dateTo));
 
     const counts = await query<{ status: string; n: string }>(
       `SELECT status, COUNT(*)::int AS n FROM qc_inspections ${b.where()} GROUP BY status`,
@@ -80,6 +95,9 @@ const listSchema = listQuerySchema.extend({
   supplierId: z.coerce.number().int().positive().optional(),
   inspectorId: z.coerce.number().int().positive().optional(),
   userId: z.coerce.number().int().positive().optional(),
+  departmentId: csvIdArray,
+  costCentreId: csvIdArray,
+  hodId: csvIdArray,
   dateFrom: dateStr.optional(),
   dateTo: dateStr.optional(),
 });
@@ -108,8 +126,20 @@ router.get(
     if (q.supplierId) b.add('qi.supplier_id = ?', q.supplierId);
     const inspector = q.inspectorId || q.userId;
     if (inspector) b.add('qi.inspector_id = ?', inspector);
-    if (q.dateFrom) b.add('qi.created_at >= ?::timestamptz', `${q.dateFrom} 00:00:00Z`);
-    if (q.dateTo) b.add('qi.created_at <= ?::timestamptz', `${q.dateTo} 23:59:59Z`);
+    if (q.departmentId && q.departmentId.length > 0) {
+      const p = b.push(q.departmentId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = qi.item_id AND i.department_id = ANY(${p}))`);
+    }
+    if (q.costCentreId && q.costCentreId.length > 0) {
+      const p = b.push(q.costCentreId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = qi.item_id AND i.cost_centre_id = ANY(${p}))`);
+    }
+    if (q.hodId && q.hodId.length > 0) {
+      const p = b.push(q.hodId);
+      b.addRaw(`EXISTS (SELECT 1 FROM items i JOIN lookups d ON d.id = i.department_id WHERE i.id = qi.item_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+    }
+    if (q.dateFrom) b.add('qi.created_at >= ?::timestamptz', toKolkataStartOfDay(q.dateFrom));
+    if (q.dateTo) b.add('qi.created_at <= ?::timestamptz', toKolkataEndOfDay(q.dateTo));
 
     if (q.search) {
       const p = b.push(`%${q.search.toLowerCase()}%`);
@@ -124,6 +154,19 @@ router.get(
       b.params,
     );
     const total = Number(totalRow?.n ?? 0);
+
+    const totalsRow = await queryOne<{
+      total_received: string;
+      total_accepted: string;
+      total_rejected: string;
+    }>(
+      `SELECT
+         COALESCE(SUM(qi.received_qty), 0) AS total_received,
+         COALESCE(SUM(qi.accepted_qty), 0) AS total_accepted,
+         COALESCE(SUM(qi.rejected_qty), 0) AS total_rejected
+       FROM qc_inspections qi ${b.where()}`,
+      b.params,
+    );
 
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
@@ -141,7 +184,14 @@ router.get(
       b.params,
     );
 
-    sendPage(res, rows, total, q.page, q.pageSize);
+    sendPage(res, rows, total, q.page, q.pageSize, {
+      totals: {
+        totalInspections: total,
+        totalReceivedQty: Number(totalsRow?.total_received ?? 0),
+        totalAcceptedQty: Number(totalsRow?.total_accepted ?? 0),
+        totalRejectedQty: Number(totalsRow?.total_rejected ?? 0),
+      },
+    });
   }),
 );
 
