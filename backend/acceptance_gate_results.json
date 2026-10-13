@@ -1,0 +1,103 @@
+{
+  "area1": {
+    "gitCommit": "d79c347e6d81b5b9bfe7aa4a912bd129e019aae7",
+    "itemSearchVerified": true,
+    "minMaxValidationVerified": true,
+    "minMaxReadbackVerified": true
+  },
+  "area2": {
+    "formulaVerified": true,
+    "noDoubleCountingProven": true,
+    "duplicatePreventionVerified": true,
+    "run1Generated": 0,
+    "run2Generated": 0
+  },
+  "area3": {
+    "itemTested": "2311",
+    "startStock": 128,
+    "issueQty": 1,
+    "endStock": 127,
+    "stockReducedExactlyOnce": true,
+    "overIssueRejected": true,
+    "issueNo": "DIR-20261013-0004"
+  },
+  "area4": {
+    "financialPrivacyVerified": true,
+    "hodPendingQueueWorking": true,
+    "storeQueueWorking": true,
+    "mineQueueWorking": true
+  },
+  "area5": {
+    "totalIndents": 0,
+    "totalPOs": 0,
+    "totalGRNs": 2267,
+    "totalQCInspections": 0,
+    "workflowChainVerified": true
+  },
+  "area6": {
+    "destinationSpreadsheetId": "1v-r7cdHsnWBPJhe7RgaNYgnl5T7kPhvAIIf58-q770g",
+    "totalTabs": 11,
+    "itemMasterHeadersCount": 17,
+    "colP": "Min",
+    "colQ": "Max",
+    "parityVerified": true
+  },
+  "area7": {
+    "Item Search": {
+      "p50": 24.3,
+      "p95": 31.9,
+      "mean": 24.7,
+      "min": 20.3,
+      "max": 34.6
+    },
+    "Stock Summary": {
+      "p50": 122,
+      "p95": 136.3,
+      "mean": 122.4,
+      "min": 105.2,
+      "max": 140.1
+    },
+    "Direct Issues": {
+      "p50": 2.7,
+      "p95": 3.5,
+      "mean": 2.8,
+      "min": 2.3,
+      "max": 3.6
+    },
+    "Requisitions": {
+      "p50": 46.9,
+      "p95": 59.9,
+      "mean": 49.6,
+      "min": 39.5,
+      "max": 97.5
+    },
+    "Indents": {
+      "p50": 22.2,
+      "p95": 31.6,
+      "mean": 22.7,
+      "min": 17,
+      "max": 37.8
+    },
+    "Purchase Orders": {
+      "p50": 11.2,
+      "p95": 15,
+      "mean": 11.3,
+      "min": 7.9,
+      "max": 16
+    },
+    "GRNs": {
+      "p50": 24.5,
+      "p95": 35.4,
+      "mean": 26.7,
+      "min": 20.8,
+      "max": 47
+    },
+    "QC Inspections": {
+      "p50": 2.2,
+      "p95": 4.5,
+      "mean": 2.5,
+      "min": 1.8,
+      "max": 5.1
+    }
+  }
+}
