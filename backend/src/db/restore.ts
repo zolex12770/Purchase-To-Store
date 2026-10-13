@@ -24,6 +24,7 @@ export const BACKUP_TABLES = [
   'grn_headers', 'grn_lines', 'grn_line_mlns', 'qc_inspections', 'stock_ledger',
   'requisition_headers', 'requisition_lines', 'requisition_approvals',
   'requisition_issues', 'requisition_issue_lines',
+  'direct_issue_headers', 'direct_issue_lines',
   'document_sequences', 'app_settings', 'google_sheet_mappings',
   'google_sync_jobs', 'google_sync_errors',
   'import_jobs', 'import_rows',
