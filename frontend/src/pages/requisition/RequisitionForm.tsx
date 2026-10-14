@@ -16,7 +16,7 @@ import { Plus, Trash2, Save, Send, ArrowLeft, Info, Package } from 'lucide-react
 import { api, ApiError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
-import { useLookupOptions, fetchItemProfile, type ItemProfile } from '../../lib/masters';
+import { useLookupOptions, useUserOptions, fetchItemProfile, type ItemProfile } from '../../lib/masters';
 import { ItemSelect } from '../../components/MasterSelect';
 import { matchCostCentre } from '../../lib/costCentreMatch';
 import { PageHeader } from '../../layout/AppShell';
@@ -55,6 +55,10 @@ export default function RequisitionForm() {
   const qc = useQueryClient();
   const { user, can, isSuperAdmin } = useAuth();
   const canSeeFinancials = can('requisition.approve') || isSuperAdmin;
+  const canCreateOnBehalf = can('user.admin') || user?.roles.includes('ADMIN') || user?.roles.includes('STORE') || isSuperAdmin;
+
+  const { data: userOptions } = useUserOptions();
+  const [selectedUserId, setSelectedUserId] = useState<number | null>(user?.id ?? null);
 
   const [requisitionDate, setRequisitionDate] = useState(today());
   const [machineId, setMachineId] = useState<number | null>(null);
@@ -70,11 +74,15 @@ export default function RequisitionForm() {
   const { raw: allDepartments } = useLookupOptions('DEPARTMENT');
   const { raw: allMachines } = useLookupOptions('MACHINE');
 
-  const userDept = allDepartments.find((d) => d.id === user?.departmentId || d.name === user?.department);
+  const effectiveUser = userOptions?.find((u) => u.id === selectedUserId) ?? user;
+  const effectiveDepartmentId = effectiveUser?.departmentId;
+  const effectiveDepartmentName = (effectiveUser as { departmentName?: string | null })?.departmentName ?? (effectiveUser as { department?: string })?.department;
+
+  const userDept = allDepartments.find((d) => d.id === effectiveDepartmentId || d.name === effectiveDepartmentName);
   const hodName = ((userDept?.extra as { hodName?: string } | undefined)?.hodName) || '';
 
   const machines = allMachines
-    .filter((m) => !user?.departmentId || m.parentId === user.departmentId)
+    .filter((m) => !effectiveDepartmentId || m.parentId === effectiveDepartmentId)
     .map((m) => ({ value: m.id, label: m.name }));
 
   const existing = useQuery({
@@ -92,9 +100,10 @@ export default function RequisitionForm() {
     setRequisitionDate(String(d.requisition_date).slice(0, 10));
     setMachineId(d.machine_id);
     setCostCentreId(d.cost_centre_id);
-    // An existing requisition already carries its own saved Cost Centre —
-    // never let the auto-match effect below overwrite it on load.
-    costCentreManualRef.current = true;
+    if (d.cost_centre_id) costCentreManualRef.current = true;
+    if ((d as { requester_user_id?: number }).requester_user_id) {
+      setSelectedUserId(Number((d as { requester_user_id?: number }).requester_user_id));
+    }
     setRemarks(d.remarks ?? '');
     const loaded: LineDraft[] = (d.lines ?? []).map((l, i) => ({
       uid: `E${i}`,
@@ -123,17 +132,13 @@ export default function RequisitionForm() {
     }));
   }, [existing.data]);
 
-  // Department -> Cost Centre auto-match (reuses Purchase Indent's exact
-  // utility — lib/costCentreMatch.ts — rather than a second mapping).
-  // Requisition's Department never changes here (it's the signed-in user's
-  // own), so this simply fills the field once real Cost Centre data has
-  // loaded, and backs off the moment the user picks one themselves.
+  // Department -> Cost Centre auto-match
   useEffect(() => {
     if (costCentreManualRef.current) return;
-    if (!user?.department || costCentres.length === 0) return;
-    const matched = matchCostCentre(user.department, costCentres);
+    if (!effectiveDepartmentName || costCentres.length === 0) return;
+    const matched = matchCostCentre(effectiveDepartmentName, costCentres);
     if (matched != null) setCostCentreId(matched);
-  }, [user?.department, costCentres]);
+  }, [effectiveDepartmentName, costCentres]);
 
   async function selectItem(uid: string, itemId: number | null) {
     if (itemId === null) {
@@ -182,6 +187,7 @@ export default function RequisitionForm() {
   const save = useMutation({
     mutationFn: ({ submit }: { submit: boolean }) => {
       const payload = {
+        requesterUserId: selectedUserId,
         requisitionDate, machineId, costCentreId, remarks, submit,
         lines: validLines.map((l) => ({ itemId: l.itemId, requestedQty: l.requestedQty, remarks: l.remarks })),
       };
@@ -253,14 +259,39 @@ export default function RequisitionForm() {
             <Field label="Requisition no.">
               <Input value={isEdit ? String((existing.data as { requisition_no?: string })?.requisition_no ?? '') : 'Auto-generated'} disabled />
             </Field>
-            <Field label="Requested by" hint="From your signed-in session — not editable">
-              <Input value={user ? `${user.employeeName} (${user.employeeId})` : ''} disabled />
+            <Field
+              label="Requested by"
+              hint={canCreateOnBehalf ? 'Select employee requesting material' : 'From your signed-in session — not editable'}
+            >
+              {canCreateOnBehalf && !isEdit ? (
+                <Select
+                  value={selectedUserId ?? ''}
+                  placeholder="Select employee"
+                  onChange={(e) => {
+                    costCentreManualRef.current = false;
+                    setSelectedUserId(e.target.value ? Number(e.target.value) : null);
+                  }}
+                  options={(userOptions ?? []).map((u) => ({
+                    value: u.id,
+                    label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}`,
+                  }))}
+                />
+              ) : (
+                <Input value={effectiveUser ? `${effectiveUser.employeeName} (${effectiveUser.employeeId})` : ''} disabled />
+              )}
             </Field>
-            <Field label="Department" hint="From your user profile — not editable here">
-              <Input value={user?.department ?? '—'} disabled />
+            <Field label="Department" hint="Auto-resolved from user profile">
+              <Input value={effectiveDepartmentName ?? '—'} disabled />
             </Field>
-            <Field label="Approving HOD" hint="Auto-resolved from your department">
-              <Input value={hodName || '—'} disabled />
+            <Field
+              label="Approving HOD"
+              hint={!hodName ? '⚠️ No HOD is currently configured for this department' : 'Auto-resolved from department master'}
+            >
+              <Input
+                value={hodName || '— (No HOD configured)'}
+                disabled
+                style={!hodName ? { borderColor: 'var(--warning-400)', color: 'var(--warning-700)' } : undefined}
+              />
             </Field>
             <Field label="Date" required>
               <Input type="date" value={requisitionDate} onChange={(e) => setRequisitionDate(e.target.value)} />

@@ -206,10 +206,16 @@ export function FilterBar({
           <FilterPill label="Employee" count={((filters.userId as string[]) ?? []).length}>
             <MultiPicker
               label="Employee"
-              options={(users ?? []).map((u) => ({
-                value: String(u.id),
-                label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}`,
-              }))}
+              options={(users ?? [])
+                .filter((u) => {
+                  const deptIds = (filters.departmentId as string[]) ?? [];
+                  if (deptIds.length === 0) return true;
+                  return u.departmentId != null && deptIds.includes(String(u.departmentId));
+                })
+                .map((u) => ({
+                  value: String(u.id),
+                  label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}`,
+                }))}
               selected={(filters.userId as string[]) ?? []}
               onToggle={(v) => toggleValue('userId', v)}
             />
@@ -222,10 +228,15 @@ export function FilterBar({
             <MultiPicker
               label="HOD"
               options={(users ?? [])
-                .filter((u) => u.isHod || true)
+                .filter((u) => {
+                  if (!u.isHod) return false;
+                  const deptIds = (filters.departmentId as string[]) ?? [];
+                  if (deptIds.length === 0) return true;
+                  return u.departmentId != null && deptIds.includes(String(u.departmentId));
+                })
                 .map((u) => ({
                   value: String(u.id),
-                  label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}${u.isHod ? ' [HOD]' : ''}`,
+                  label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}`,
                 }))}
               selected={(filters.hodId as string[]) ?? []}
               onToggle={(v) => toggleValue('hodId', v)}

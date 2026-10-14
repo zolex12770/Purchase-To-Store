@@ -487,9 +487,9 @@ export async function reconcileMasterData(options: {
     const checksum = crypto.createHash('sha256').update(json).digest('hex');
     await query(
       `INSERT INTO backup_metadata
-         (filename, kind, status, size_bytes, checksum_sha256, table_counts, schema_version, notes, created_by, verified_at)
-       VALUES ($1, 'MANUAL', 'VERIFIED', $2, $3, $4, $5, 'Automatic safety backup before master data reconciliation', $6, now())`,
-      [backupFilename, Buffer.byteLength(json), checksum, JSON.stringify(counts), schemaRow?.version ?? 'unknown', actor.userId ?? null],
+         (filename, file_path, kind, status, size_bytes, checksum_sha256, table_counts, schema_version, notes, created_by, verified_at)
+       VALUES ($1, $2, 'MANUAL', 'VERIFIED', $3, $4, $5, $6, 'Automatic safety backup before master data reconciliation', $7, now())`,
+      [backupFilename, fullBackupPath, Buffer.byteLength(json), checksum, JSON.stringify(counts), schemaRow?.version ?? 'unknown', actor.userId ?? null],
     );
     logger.info(`Pre-reconciliation backup saved to ${fullBackupPath}`);
   }

@@ -126,6 +126,7 @@ const NAV: (NavItem | NavGroup)[] = [
     items: [
       { to: '/admin/users', label: 'User Management', icon: <UsersIcon size={15} />, permission: 'user.view' },
       { to: '/admin/roles', label: 'Roles & Permissions', icon: <Shield size={15} />, permission: 'role.view' },
+      { to: '/admin/data-management', label: 'Data Management & Audit', icon: <Database size={15} />, anyOf: ['system.admin', 'user.admin', 'role.view'] },
       { to: '/admin/import-export', label: 'Import / Export', icon: <ArrowLeftRight size={15} />, permission: 'item.view' },
       { to: '/admin/sync', label: 'Google Sheets Sync', icon: <RefreshCw size={15} />, permission: 'sync.view' },
       { to: '/admin/backup', label: 'Backup & Restore', icon: <HardDriveDownload size={15} />, permission: 'backup.view' },

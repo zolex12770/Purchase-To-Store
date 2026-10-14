@@ -36,6 +36,7 @@ import syncRoutes from './modules/google-sync/routes.js';
 import googleDbRoutes from './modules/google-db/routes.js';
 import qcRoutes from './modules/qc/routes.js';
 import inventoryRoutes from './modules/inventory/routes.js';
+import dataManagementRoutes from './modules/admin/data-management.routes.js';
 import { getDatabase } from './db/index.js';
 
 export function createApp(): Express {
@@ -208,6 +209,8 @@ export function createApp(): Express {
   guarded.use('/google-db', googleDbRoutes);
   guarded.use('/qc', qcRoutes);
   guarded.use('/inventory', inventoryRoutes);
+  guarded.use('/admin/data-management', dataManagementRoutes);
+  guarded.use('/data-management', dataManagementRoutes);
 
   api.use(guarded);
   app.use('/api/v1', api);

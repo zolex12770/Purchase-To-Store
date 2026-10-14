@@ -50,6 +50,20 @@ export async function publishDestinationSheet(targetTab?: string) {
   const db = await getDatabase();
   console.log('✓ Connected to production PGlite database.');
 
+  // Fetch destination metadata to dynamically adjust sheet grid limits
+  const destMeta = await sheets.spreadsheets.get({ spreadsheetId: destId });
+  const sheetMetaMap = new Map<string, { sheetId: number; rowCount: number; columnCount: number }>();
+  for (const s of destMeta.data.sheets || []) {
+    const title = s.properties?.title;
+    if (title && s.properties?.sheetId !== undefined) {
+      sheetMetaMap.set(title.toLowerCase(), {
+        sheetId: s.properties.sheetId,
+        rowCount: s.properties.gridProperties?.rowCount || 1000,
+        columnCount: s.properties.gridProperties?.columnCount || 26,
+      });
+    }
+  }
+
   const results: Record<string, TabPublicationResult> = {};
 
   // Helper to column letter
@@ -69,7 +83,7 @@ export async function publishDestinationSheet(targetTab?: string) {
     tabName: string,
     headers: string[],
     dataRows: any[][],
-    gridMaxRows: number = 6000,
+    gridMaxRows: number = 7000,
   ): Promise<TabPublicationResult> {
     if (targetTab && tabName.toLowerCase() !== targetTab.toLowerCase()) {
       return {
@@ -85,6 +99,33 @@ export async function publishDestinationSheet(targetTab?: string) {
     console.log(`\n--- Publishing Tab: [${tabName}] ---`);
     console.log(`  * Headers: ${headers.length} columns`);
     console.log(`  * Data rows to write: ${dataRows.length}`);
+
+    // Ensure sheet grid capacity is sufficient
+    const sheetInfo = sheetMetaMap.get(tabName.toLowerCase());
+    const requiredRows = Math.max(dataRows.length + 100, gridMaxRows);
+    if (sheetInfo && sheetInfo.rowCount < requiredRows) {
+      console.log(`  * Expanding grid for [${tabName}]: ${sheetInfo.rowCount} -> ${requiredRows} rows...`);
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: destId,
+        requestBody: {
+          requests: [
+            {
+              updateSheetProperties: {
+                properties: {
+                  sheetId: sheetInfo.sheetId,
+                  gridProperties: {
+                    rowCount: requiredRows,
+                  },
+                },
+                fields: 'gridProperties.rowCount',
+              },
+            },
+          ],
+        },
+      });
+      sheetInfo.rowCount = requiredRows;
+      console.log(`  ✓ Grid expanded successfully.`);
+    }
 
     const colEndLetter = getColumnLetter(headers.length);
 
@@ -386,27 +427,35 @@ export async function publishDestinationSheet(targetTab?: string) {
            rh.requester_user_id as user_id, COALESCE(rh.employee_code, '') as employee_code,
            COALESCE(rh.employee_name, '') as user_name,
            COALESCE(rh.department_name, '') as department,
-           '' as machine_no,
+           COALESCE(m.name, '') as machine_no,
            COALESCE(cc.name, '') as cost_centre,
-           '' as hod_name, rh.status as hod_status, '' as hod_approval_date,
-           'ISSUED' as store_status,
+           COALESCE(rh.hod_name, '') as hod_name,
+           b.hod_status as hod_status,
+           COALESCE(to_char(rh.hod_decided_at, 'YYYY-MM-DD'), '') as hod_approval_date,
+           b.store_status as store_status,
            COALESCE(iss.slip_nos, '') as issue_slip_nos,
            COALESCE(to_char(iss.last_issue_date, 'YYYY-MM-DD'), '') as issue_date,
            COALESCE(iss.issued_qty, 0) as issued_qty,
            GREATEST(0, rl.requested_qty - COALESCE(iss.issued_qty, 0)) as remaining_qty,
-           0 as excess_qty,
+           GREATEST(0, COALESCE(iss.issued_qty, 0) - rl.requested_qty) as excess_qty,
            COALESCE(i.live_stock_qty, 0) as live_stock_qty,
-           'COMPLETED' as line_status,
+           CASE
+             WHEN COALESCE(iss.issued_qty, 0) >= rl.requested_qty THEN 'COMPLETED'
+             WHEN COALESCE(iss.issued_qty, 0) > 0 THEN 'PARTIAL'
+             ELSE 'PENDING'
+           END as line_status,
            COALESCE(rl.remarks, '') as line_remarks,
            COALESCE(rh.remarks, '') as requisition_remarks,
            to_char(rl.created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
            to_char(rl.updated_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as updated_at
       FROM requisition_lines rl
       JOIN requisition_headers rh ON rh.id = rl.requisition_id
+      JOIN v_requisition_header_balance b ON b.requisition_id = rh.id
       LEFT JOIN items i ON i.id = rl.item_id
       LEFT JOIN lookups mg ON mg.id = i.main_group_id
       LEFT JOIN lookups u ON u.id = rl.uom_id
       LEFT JOIN lookups cc ON cc.id = rh.cost_centre_id
+      LEFT JOIN lookups m ON m.id = rh.machine_id
       LEFT JOIN LATERAL (
         SELECT string_agg(DISTINCT ri.issue_slip_no, ', ') as slip_nos,
                MAX(ri.issue_date) as last_issue_date,
@@ -425,7 +474,7 @@ export async function publishDestinationSheet(targetTab?: string) {
     r.issue_date, Number(r.issued_qty), Number(r.remaining_qty), Number(r.excess_qty), Number(r.live_stock_qty),
     r.line_status, r.line_remarks, r.requisition_remarks, r.created_at, r.updated_at
   ]);
-  await publishTab('Requisition', reqHeaders, reqRows, 4500);
+  await publishTab('Requisition', reqHeaders, reqRows, 5000);
 
   // =========================================================================
   // 7. STOCK LEDGER (17 columns - 4,922 movements)

@@ -344,6 +344,7 @@ const requisitionLineSchema = z.object({
 });
 
 const requisitionSchema = z.object({
+  requesterUserId: z.coerce.number().int().positive().nullable().optional(),
   requisitionDate: dateStr.optional(),
   machineId: z.coerce.number().int().positive().nullable().optional(),
   costCentreId: z.coerce.number().int().positive().nullable().optional(),
@@ -398,13 +399,19 @@ router.post(
   asyncHandler(async (req, res) => {
     const body = req.body as RequisitionBody;
     const userId = req.user!.id;
+    const canCreateOnBehalf =
+      req.user?.roles?.includes('ADMIN') ||
+      req.user?.roles?.includes('SUPER_ADMIN') ||
+      req.user?.roles?.includes('STORE') ||
+      req.user?.isSuperAdmin;
+    const effectiveRequesterId = body.requesterUserId && canCreateOnBehalf ? body.requesterUserId : userId;
     const when = body.requisitionDate ? new Date(`${body.requisitionDate}T00:00:00`) : new Date();
 
     const id = await withTransaction(async (tx) => {
       const requester = await txQueryOne<{ employee_name: string; employee_id: string; department_id: number | null }>(
-        tx, 'SELECT employee_name, employee_id, department_id FROM users WHERE id = $1', [userId],
+        tx, 'SELECT employee_name, employee_id, department_id FROM users WHERE id = $1', [effectiveRequesterId],
       );
-      if (!requester) throw new Error('Signed-in user not found.');
+      if (!requester) throw new Error('Requester user not found.');
       const dept = requester.department_id
         ? await txQueryOne<{ name: string }>(tx, 'SELECT name FROM lookups WHERE id = $1', [requester.department_id])
         : null;
@@ -437,7 +444,7 @@ router.post(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
          RETURNING id`,
         [
-          requisitionNo, dateStamp(when), timeStamp(), userId, requester.employee_id, requester.employee_name,
+          requisitionNo, dateStamp(when), timeStamp(), effectiveRequesterId, requester.employee_id, requester.employee_name,
           requester.department_id, dept?.name ?? '', hodUserId, hodName, body.machineId ?? null, costCentreId,
           body.remarks, status, body.submit ? new Date().toISOString() : null, body.submit ? userId : null, userId,
         ],

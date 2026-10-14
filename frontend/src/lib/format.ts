@@ -80,7 +80,19 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 
 function parseDate(value: string | Date | null | undefined): Date | null {
   if (!value) return null;
-  const d = value instanceof Date ? value : new Date(value);
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+    if (m) {
+      const year = parseInt(m[1], 10);
+      const month = parseInt(m[2], 10) - 1;
+      const day = parseInt(m[3], 10);
+      const d = new Date(year, month, day, 12, 0, 0);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+  }
+  const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 

@@ -1,0 +1,1057 @@
+/**
+ * Admin Data Management & Audit Control (SRS §17, §18, §20, §24).
+ *
+ * Dedicated administrative interface for Super Admins and authorized Administrators:
+ * - Search & inspect Master Data and Transaction Documents.
+ * - Deep inspection of record dependencies and foreign key relations.
+ * - Deactivate / Reactivate (soft toggle is_active = TRUE / FALSE).
+ * - Soft-Delete & Restore (deleted_at timestamp toggle).
+ * - Safe Hard-Delete (Permanent Purge) strictly guarded by dependency checks.
+ * - System Super Admins (10221, 10422) can NEVER be deleted or deactivated.
+ */
+import { Router } from 'express';
+import { z } from 'zod';
+import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
+import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
+import { BusinessRuleError, NotFoundError, ValidationError } from '../../core/errors.js';
+import { requireAnyPermission, invalidateAuthState } from '../../auth/middleware.js';
+import { auditIn, actorFrom } from '../../core/audit.js';
+
+const router = Router();
+
+// Guard all data-management operations to Super Admin or administrative authorities
+router.use(requireAnyPermission('system.admin', 'user.admin', 'role.view'));
+
+const PROTECTED_EMPLOYEE_IDS = new Set(['10221', '10422']);
+
+export interface DependencyCheck {
+  table: string;
+  label: string;
+  count: number;
+}
+
+/* ── 1. Summary of all entities ────────────────────────────────────────────── */
+
+router.get(
+  '/summary',
+  asyncHandler(async (_req, res) => {
+    const [
+      usersCount,
+      suppliersCount,
+      itemsCount,
+      lookupsCount,
+      indentsCount,
+      posCount,
+      grnsCount,
+      requisitionsCount,
+      directIssuesCount,
+    ] = await Promise.all([
+      queryOne<{ total: string; active: string; inactive: string; deleted: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN is_active = TRUE AND deleted_at IS NULL THEN 1 END) AS active,
+               COUNT(CASE WHEN is_active = FALSE AND deleted_at IS NULL THEN 1 END) AS inactive,
+               COUNT(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS deleted
+          FROM users
+      `),
+      queryOne<{ total: string; active: string; inactive: string; deleted: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN is_active = TRUE AND deleted_at IS NULL THEN 1 END) AS active,
+               COUNT(CASE WHEN is_active = FALSE AND deleted_at IS NULL THEN 1 END) AS inactive,
+               COUNT(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS deleted
+          FROM suppliers
+      `),
+      queryOne<{ total: string; active: string; inactive: string; deleted: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN is_active = TRUE AND deleted_at IS NULL THEN 1 END) AS active,
+               COUNT(CASE WHEN is_active = FALSE AND deleted_at IS NULL THEN 1 END) AS inactive,
+               COUNT(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS deleted
+          FROM items
+      `),
+      queryOne<{ total: string; active: string; inactive: string; deleted: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN is_active = TRUE AND deleted_at IS NULL THEN 1 END) AS active,
+               COUNT(CASE WHEN is_active = FALSE AND deleted_at IS NULL THEN 1 END) AS inactive,
+               COUNT(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS deleted
+          FROM lookups
+      `),
+      queryOne<{ total: string; draft: string; open: string; closed: string; cancelled: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) AS draft,
+               COUNT(CASE WHEN status IN ('PENDING_APPROVAL', 'APPROVED') THEN 1 END) AS open,
+               COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) AS closed,
+               COUNT(CASE WHEN status = 'CANCELLED' THEN 1 END) AS cancelled
+          FROM purchase_indent_headers
+      `),
+      queryOne<{ total: string; draft: string; open: string; closed: string; cancelled: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) AS draft,
+               COUNT(CASE WHEN status IN ('OPEN', 'PARTIALLY_RECEIVED') THEN 1 END) AS open,
+               COUNT(CASE WHEN status IN ('COMPLETED', 'SHORT_CLOSED') THEN 1 END) AS closed,
+               COUNT(CASE WHEN status = 'CANCELLED' THEN 1 END) AS cancelled
+          FROM purchase_order_headers
+      `),
+      queryOne<{ total: string; completed: string; cancelled: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) AS completed,
+               COUNT(CASE WHEN status = 'CANCELLED' THEN 1 END) AS cancelled
+          FROM grn_headers
+      `),
+      queryOne<{ total: string; draft: string; pending: string; issued: string; cancelled: string }>(`
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN status = 'DRAFT' THEN 1 END) AS draft,
+               COUNT(CASE WHEN status = 'PENDING_APPROVAL' THEN 1 END) AS pending,
+               COUNT(CASE WHEN status IN ('APPROVED', 'PARTIALLY_ISSUED', 'ISSUED') THEN 1 END) AS issued,
+               COUNT(CASE WHEN status = 'CANCELLED' THEN 1 END) AS cancelled
+          FROM requisition_headers
+      `),
+      queryOne<{ total: string }>(`
+        SELECT COUNT(*) AS total FROM direct_issue_headers
+      `),
+    ]);
+
+    sendOk(res, {
+      masters: {
+        users: {
+          total: Number(usersCount?.total ?? 0),
+          active: Number(usersCount?.active ?? 0),
+          inactive: Number(usersCount?.inactive ?? 0),
+          deleted: Number(usersCount?.deleted ?? 0),
+        },
+        suppliers: {
+          total: Number(suppliersCount?.total ?? 0),
+          active: Number(suppliersCount?.active ?? 0),
+          inactive: Number(suppliersCount?.inactive ?? 0),
+          deleted: Number(suppliersCount?.deleted ?? 0),
+        },
+        items: {
+          total: Number(itemsCount?.total ?? 0),
+          active: Number(itemsCount?.active ?? 0),
+          inactive: Number(itemsCount?.inactive ?? 0),
+          deleted: Number(itemsCount?.deleted ?? 0),
+        },
+        lookups: {
+          total: Number(lookupsCount?.total ?? 0),
+          active: Number(lookupsCount?.active ?? 0),
+          inactive: Number(lookupsCount?.inactive ?? 0),
+          deleted: Number(lookupsCount?.deleted ?? 0),
+        },
+      },
+      transactions: {
+        indents: {
+          total: Number(indentsCount?.total ?? 0),
+          draft: Number(indentsCount?.draft ?? 0),
+          open: Number(indentsCount?.open ?? 0),
+          closed: Number(indentsCount?.closed ?? 0),
+          cancelled: Number(indentsCount?.cancelled ?? 0),
+        },
+        purchaseOrders: {
+          total: Number(posCount?.total ?? 0),
+          draft: Number(posCount?.draft ?? 0),
+          open: Number(posCount?.open ?? 0),
+          closed: Number(posCount?.closed ?? 0),
+          cancelled: Number(posCount?.cancelled ?? 0),
+        },
+        grn: {
+          total: Number(grnsCount?.total ?? 0),
+          completed: Number(grnsCount?.completed ?? 0),
+          cancelled: Number(grnsCount?.cancelled ?? 0),
+        },
+        requisitions: {
+          total: Number(requisitionsCount?.total ?? 0),
+          draft: Number(requisitionsCount?.draft ?? 0),
+          pending: Number(requisitionsCount?.pending ?? 0),
+          issued: Number(requisitionsCount?.issued ?? 0),
+          cancelled: Number(requisitionsCount?.cancelled ?? 0),
+        },
+        directIssues: {
+          total: Number(directIssuesCount?.total ?? 0),
+        },
+      },
+    });
+  }),
+);
+
+/* ── 2. Unified query records endpoint ──────────────────────────────────────── */
+
+const queryRecordsSchema = listQuerySchema.extend({
+  entity: z.enum([
+    'users',
+    'suppliers',
+    'items',
+    'lookups',
+    'indents',
+    'purchase_orders',
+    'grn',
+    'requisitions',
+    'direct_issues',
+  ]),
+  status: z.enum(['all', 'active', 'inactive', 'deleted']).default('all'),
+  category: z.string().optional(),
+});
+
+router.get(
+  '/records',
+  validateQuery(queryRecordsSchema),
+  asyncHandler(async (req, res) => {
+    const q = req.query as unknown as z.infer<typeof queryRecordsSchema>;
+    const search = q.search ? `%${q.search.toLowerCase()}%` : null;
+    const page = Number(q.page ?? 1);
+    const pageSize = Number(q.pageSize ?? 25);
+    const offset = (page - 1) * pageSize;
+
+    let items: Array<{
+      id: number;
+      code: string;
+      title: string;
+      subtitle: string;
+      extraInfo: string;
+      status: string;
+      isActive: boolean;
+      deletedAt: string | null;
+      createdAt: string;
+      isProtected: boolean;
+    }> = [];
+    let total = 0;
+
+    if (q.entity === 'users') {
+      const b = new SqlBuilder();
+      if (q.status === 'active') b.addRaw('u.is_active = TRUE AND u.deleted_at IS NULL');
+      else if (q.status === 'inactive') b.addRaw('u.is_active = FALSE AND u.deleted_at IS NULL');
+      else if (q.status === 'deleted') b.addRaw('u.deleted_at IS NOT NULL');
+
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(u.employee_id) LIKE ${p} OR lower(u.employee_name) LIKE ${p} OR lower(COALESCE(u.designation, '')) LIKE ${p})`);
+      }
+
+      const countRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM users u ${b.where()}`, b.params);
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        employee_id: string;
+        employee_name: string;
+        designation: string;
+        department_name: string;
+        email: string;
+        is_active: boolean;
+        deleted_at: string | null;
+        created_at: string;
+      }>(
+        `SELECT u.id, u.employee_id, u.employee_name, u.designation, d.name AS department_name,
+                u.email, u.is_active, u.deleted_at, u.created_at
+           FROM users u
+           LEFT JOIN lookups d ON d.id = u.department_id
+           ${b.where()}
+          ORDER BY u.id ASC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.employee_id,
+        title: r.employee_name,
+        subtitle: [r.designation, r.department_name].filter(Boolean).join(' · '),
+        extraInfo: r.email || '—',
+        status: r.deleted_at ? 'DELETED' : r.is_active ? 'ACTIVE' : 'INACTIVE',
+        isActive: r.is_active,
+        deletedAt: r.deleted_at,
+        createdAt: r.created_at,
+        isProtected: PROTECTED_EMPLOYEE_IDS.has(r.employee_id),
+      }));
+    } else if (q.entity === 'suppliers') {
+      const b = new SqlBuilder();
+      if (q.status === 'active') b.addRaw('s.is_active = TRUE AND s.deleted_at IS NULL');
+      else if (q.status === 'inactive') b.addRaw('s.is_active = FALSE AND s.deleted_at IS NULL');
+      else if (q.status === 'deleted') b.addRaw('s.deleted_at IS NOT NULL');
+
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(s.supplier_code) LIKE ${p} OR lower(s.supplier_name) LIKE ${p} OR lower(COALESCE(s.city, '')) LIKE ${p} OR lower(COALESCE(s.gst_no, '')) LIKE ${p})`);
+      }
+
+      const countRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM suppliers s ${b.where()}`, b.params);
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        supplier_code: string;
+        supplier_name: string;
+        city: string;
+        state: string;
+        gst_no: string;
+        is_active: boolean;
+        deleted_at: string | null;
+        created_at: string;
+      }>(
+        `SELECT s.id, s.supplier_code, s.supplier_name, s.city, s.state, s.gst_no,
+                s.is_active, s.deleted_at, s.created_at
+           FROM suppliers s
+           ${b.where()}
+          ORDER BY s.id ASC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.supplier_code,
+        title: r.supplier_name,
+        subtitle: [r.city, r.state].filter(Boolean).join(', ') || 'No location',
+        extraInfo: r.gst_no ? `GST: ${r.gst_no}` : '—',
+        status: r.deleted_at ? 'DELETED' : r.is_active ? 'ACTIVE' : 'INACTIVE',
+        isActive: r.is_active,
+        deletedAt: r.deleted_at,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    } else if (q.entity === 'items') {
+      const b = new SqlBuilder();
+      if (q.status === 'active') b.addRaw('i.is_active = TRUE AND i.deleted_at IS NULL');
+      else if (q.status === 'inactive') b.addRaw('i.is_active = FALSE AND i.deleted_at IS NULL');
+      else if (q.status === 'deleted') b.addRaw('i.deleted_at IS NOT NULL');
+
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(COALESCE(i.item_specification, '')) LIKE ${p} OR lower(COALESCE(i.hsn_code, '')) LIKE ${p})`);
+      }
+
+      const countRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM items i ${b.where()}`, b.params);
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        item_code: string;
+        item_description: string;
+        uom_code: string;
+        live_stock_qty: string;
+        standard_rate: string;
+        is_active: boolean;
+        deleted_at: string | null;
+        created_at: string;
+      }>(
+        `SELECT i.id, i.item_code, i.item_description, u.name AS uom_code,
+                i.live_stock_qty, i.standard_rate, i.is_active, i.deleted_at, i.created_at
+           FROM items i
+           LEFT JOIN lookups u ON u.id = i.uom_id
+           ${b.where()}
+          ORDER BY i.id ASC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.item_code,
+        title: r.item_description,
+        subtitle: `UOM: ${r.uom_code || '—'} · Rate: ₹${r.standard_rate || 0}`,
+        extraInfo: `Stock: ${Number(r.live_stock_qty || 0).toLocaleString('en-IN')}`,
+        status: r.deleted_at ? 'DELETED' : r.is_active ? 'ACTIVE' : 'INACTIVE',
+        isActive: r.is_active,
+        deletedAt: r.deleted_at,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    } else if (q.entity === 'lookups') {
+      const b = new SqlBuilder();
+      if (q.category) {
+        const p = b.push(q.category);
+        b.addRaw(`l.category = ${p}`);
+      }
+      if (q.status === 'active') b.addRaw('l.is_active = TRUE AND l.deleted_at IS NULL');
+      else if (q.status === 'inactive') b.addRaw('l.is_active = FALSE AND l.deleted_at IS NULL');
+      else if (q.status === 'deleted') b.addRaw('l.deleted_at IS NOT NULL');
+
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(l.name) LIKE ${p} OR lower(l.code) LIKE ${p} OR lower(l.category) LIKE ${p})`);
+      }
+
+      const countRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM lookups l ${b.where()}`, b.params);
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        code: string;
+        name: string;
+        category: string;
+        extra: Record<string, unknown>;
+        is_active: boolean;
+        deleted_at: string | null;
+        created_at: string;
+      }>(
+        `SELECT l.id, l.code, l.name, l.category, l.extra,
+                l.is_active, l.deleted_at, l.created_at
+           FROM lookups l
+           ${b.where()}
+          ORDER BY l.category ASC, l.name ASC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.code || `#${r.id}`,
+        title: r.name,
+        subtitle: `Category: ${r.category}`,
+        extraInfo: r.extra?.hodName ? `HOD: ${r.extra.hodName}` : '—',
+        status: r.deleted_at ? 'DELETED' : r.is_active ? 'ACTIVE' : 'INACTIVE',
+        isActive: r.is_active,
+        deletedAt: r.deleted_at,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    } else if (q.entity === 'indents') {
+      const b = new SqlBuilder();
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(h.indent_no) LIKE ${p} OR lower(h.remarks) LIKE ${p})`);
+      }
+      const countRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM purchase_indent_headers h ${b.where()}`, b.params);
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        indent_no: string;
+        indent_date: string;
+        department_name: string;
+        requester_name: string;
+        status: string;
+        created_at: string;
+      }>(
+        `SELECT h.id, h.indent_no, h.indent_date, d.name AS department_name,
+                u.employee_name AS requester_name, h.status, h.created_at
+           FROM purchase_indent_headers h
+           LEFT JOIN lookups d ON d.id = h.department_id
+           LEFT JOIN users u ON u.id = h.requested_by_user_id
+           ${b.where()}
+          ORDER BY h.id DESC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.indent_no,
+        title: `Indent: ${r.indent_no}`,
+        subtitle: [r.requester_name, r.department_name].filter(Boolean).join(' · '),
+        extraInfo: `Date: ${r.indent_date}`,
+        status: r.status,
+        isActive: r.status !== 'CANCELLED' && r.status !== 'CLOSED',
+        deletedAt: null,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    } else if (q.entity === 'purchase_orders') {
+      const b = new SqlBuilder();
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(h.po_no) LIKE ${p} OR lower(s.supplier_name) LIKE ${p})`);
+      }
+      const countRow = await queryOne<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM purchase_order_headers h LEFT JOIN suppliers s ON s.id = h.supplier_id ${b.where()}`,
+        b.params,
+      );
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        po_no: string;
+        po_date: string;
+        supplier_name: string;
+        status: string;
+        created_at: string;
+      }>(
+        `SELECT h.id, h.po_no, h.po_date, s.supplier_name, h.status, h.created_at
+           FROM purchase_order_headers h
+           LEFT JOIN suppliers s ON s.id = h.supplier_id
+           ${b.where()}
+          ORDER BY h.id DESC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.po_no,
+        title: `PO: ${r.po_no}`,
+        subtitle: `Supplier: ${r.supplier_name || '—'}`,
+        extraInfo: `Date: ${r.po_date}`,
+        status: r.status,
+        isActive: r.status !== 'CANCELLED' && r.status !== 'SHORT_CLOSED',
+        deletedAt: null,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    } else if (q.entity === 'grn') {
+      const b = new SqlBuilder();
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(h.grn_no) LIKE ${p} OR lower(s.supplier_name) LIKE ${p})`);
+      }
+      const countRow = await queryOne<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM grn_headers h LEFT JOIN suppliers s ON s.id = h.supplier_id ${b.where()}`,
+        b.params,
+      );
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        grn_no: string;
+        grn_date: string;
+        supplier_name: string;
+        status: string;
+        created_at: string;
+      }>(
+        `SELECT h.id, h.grn_no, h.grn_date, s.supplier_name, h.status, h.created_at
+           FROM grn_headers h
+           LEFT JOIN suppliers s ON s.id = h.supplier_id
+           ${b.where()}
+          ORDER BY h.id DESC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.grn_no,
+        title: `GRN: ${r.grn_no}`,
+        subtitle: `Supplier: ${r.supplier_name || '—'}`,
+        extraInfo: `Date: ${r.grn_date}`,
+        status: r.status,
+        isActive: r.status !== 'CANCELLED',
+        deletedAt: null,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    } else if (q.entity === 'requisitions') {
+      const b = new SqlBuilder();
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(h.requisition_no) LIKE ${p} OR lower(h.employee_name) LIKE ${p} OR lower(h.department_name) LIKE ${p})`);
+      }
+      const countRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM requisition_headers h ${b.where()}`, b.params);
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        requisition_no: string;
+        requisition_date: string;
+        employee_name: string;
+        department_name: string;
+        hod_name: string;
+        status: string;
+        created_at: string;
+      }>(
+        `SELECT h.id, h.requisition_no, h.requisition_date, h.employee_name, h.department_name,
+                h.hod_name, h.status, h.created_at
+           FROM requisition_headers h
+           ${b.where()}
+          ORDER BY h.id DESC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.requisition_no,
+        title: `Req: ${r.requisition_no}`,
+        subtitle: `${r.employee_name} (${r.department_name || '—'})`,
+        extraInfo: `HOD: ${r.hod_name || '—'} · Date: ${r.requisition_date}`,
+        status: r.status,
+        isActive: r.status !== 'CANCELLED',
+        deletedAt: null,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    } else if (q.entity === 'direct_issues') {
+      const b = new SqlBuilder();
+      if (search) {
+        const p = b.push(search);
+        b.addRaw(`(lower(h.issue_no) LIKE ${p} OR lower(h.recipient_name) LIKE ${p})`);
+      }
+      const countRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM direct_issue_headers h ${b.where()}`, b.params);
+      total = Number(countRow?.n ?? 0);
+
+      const limitP = b.push(pageSize);
+      const offsetP = b.push(offset);
+      const rows = await query<{
+        id: number;
+        issue_no: string;
+        issue_date: string;
+        recipient_name: string;
+        department_name: string;
+        total_qty: string;
+        created_at: string;
+      }>(
+        `SELECT h.id, h.issue_no, h.issue_date, h.recipient_name, h.department_name,
+                h.total_qty, h.created_at
+           FROM direct_issue_headers h
+           ${b.where()}
+          ORDER BY h.id DESC
+          LIMIT ${limitP} OFFSET ${offsetP}`,
+        b.params,
+      );
+
+      items = rows.map((r) => ({
+        id: Number(r.id),
+        code: r.issue_no,
+        title: `Issue: ${r.issue_no}`,
+        subtitle: `${r.recipient_name} (${r.department_name || '—'})`,
+        extraInfo: `Qty: ${r.total_qty} · Date: ${r.issue_date}`,
+        status: 'ISSUED',
+        isActive: true,
+        deletedAt: null,
+        createdAt: r.created_at,
+        isProtected: false,
+      }));
+    }
+
+    sendOk(res, {
+      items,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.ceil(total / pageSize),
+    });
+  }),
+);
+
+/* ── 3. Record Deep Inspection & Dependency Audit ───────────────────────────── */
+
+async function inspectDependencies(entity: string, id: number): Promise<{
+  dependencies: DependencyCheck[];
+  canHardDelete: boolean;
+  blockingReasons: string[];
+}> {
+  const dependencies: DependencyCheck[] = [];
+  const blockingReasons: string[] = [];
+
+  if (entity === 'users') {
+    const user = await queryOne<{ employee_id: string; employee_name: string }>(
+      'SELECT employee_id, employee_name FROM users WHERE id = $1', [id],
+    );
+    if (user && PROTECTED_EMPLOYEE_IDS.has(user.employee_id)) {
+      blockingReasons.push(`System Super Admin (${user.employee_name} - ${user.employee_id}) cannot be deleted.`);
+    }
+
+    const [indents, pos, grns, requisitions, issues, stockMovements] = await Promise.all([
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_indent_headers WHERE requested_by_user_id = $1 OR created_by = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_order_headers WHERE created_by = $1 OR issued_by = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM grn_headers WHERE received_by_user_id = $1 OR created_by = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_headers WHERE requester_user_id = $1 OR hod_user_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_issues WHERE store_user_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM stock_ledger WHERE created_by = $1', [id]),
+    ]);
+
+    dependencies.push(
+      { table: 'purchase_indent_headers', label: 'Purchase Indents authored/requested', count: Number(indents?.n ?? 0) },
+      { table: 'purchase_order_headers', label: 'Purchase Orders authored/issued', count: Number(pos?.n ?? 0) },
+      { table: 'grn_headers', label: 'GRNs received/authored', count: Number(grns?.n ?? 0) },
+      { table: 'requisition_headers', label: 'Requisitions requested/approved', count: Number(requisitions?.n ?? 0) },
+      { table: 'requisition_issues', label: 'Issue Slips issued', count: Number(issues?.n ?? 0) },
+      { table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockMovements?.n ?? 0) },
+    );
+
+    const totalRefs = dependencies.reduce((acc, d) => acc + d.count, 0);
+    if (totalRefs > 0) {
+      blockingReasons.push(`User is referenced in ${totalRefs} transaction document(s) and cannot be hard deleted. Deactivate instead.`);
+    }
+  } else if (entity === 'suppliers') {
+    const [indents, pos, grns] = await Promise.all([
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_indent_headers WHERE suggested_supplier_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_order_headers WHERE supplier_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM grn_headers WHERE supplier_id = $1', [id]),
+    ]);
+
+    dependencies.push(
+      { table: 'purchase_indent_headers', label: 'Purchase Indent suggestions', count: Number(indents?.n ?? 0) },
+      { table: 'purchase_order_headers', label: 'Purchase Orders', count: Number(pos?.n ?? 0) },
+      { table: 'grn_headers', label: 'Goods Receipt Notes', count: Number(grns?.n ?? 0) },
+    );
+
+    const totalRefs = dependencies.reduce((acc, d) => acc + d.count, 0);
+    if (totalRefs > 0) {
+      blockingReasons.push(`Supplier is referenced in ${totalRefs} transaction document(s). Deactivate instead.`);
+    }
+  } else if (entity === 'items') {
+    const [indentLines, poLines, grnLines, reqLines, directLines, stockLedger] = await Promise.all([
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_indent_lines WHERE item_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_order_lines WHERE item_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM grn_lines WHERE item_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_lines WHERE item_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM direct_issue_lines WHERE item_id = $1', [id]),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM stock_ledger WHERE item_id = $1', [id]),
+    ]);
+
+    dependencies.push(
+      { table: 'purchase_indent_lines', label: 'Indent Lines', count: Number(indentLines?.n ?? 0) },
+      { table: 'purchase_order_lines', label: 'PO Lines', count: Number(poLines?.n ?? 0) },
+      { table: 'grn_lines', label: 'GRN Lines', count: Number(grnLines?.n ?? 0) },
+      { table: 'requisition_lines', label: 'Requisition Lines', count: Number(reqLines?.n ?? 0) },
+      { table: 'direct_issue_lines', label: 'Direct Issue Lines', count: Number(directLines?.n ?? 0) },
+      { table: 'stock_ledger', label: 'Stock Ledger Movements', count: Number(stockLedger?.n ?? 0) },
+    );
+
+    const totalRefs = dependencies.reduce((acc, d) => acc + d.count, 0);
+    if (totalRefs > 0) {
+      blockingReasons.push(`Item is referenced in ${totalRefs} document line(s) and stock movements. Deactivate instead.`);
+    }
+  } else if (entity === 'lookups') {
+    const [itemsCount, usersCount, indentsCount, posCount, reqsCount] = await Promise.all([
+      queryOne<{ n: string }>(
+        'SELECT COUNT(*) AS n FROM items WHERE uom_id = $1 OR main_group_id = $1 OR item_type_id = $1 OR department_id = $1 OR cost_centre_id = $1',
+        [id],
+      ),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM users WHERE department_id = $1', [id]),
+      queryOne<{ n: string }>(
+        'SELECT COUNT(*) AS n FROM purchase_indent_headers WHERE indent_type_id = $1 OR department_id = $1 OR cost_centre_id = $1',
+        [id],
+      ),
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_order_headers WHERE po_type_id = $1', [id]),
+      queryOne<{ n: string }>(
+        'SELECT COUNT(*) AS n FROM requisition_headers WHERE department_id = $1 OR cost_centre_id = $1 OR machine_id = $1',
+        [id],
+      ),
+    ]);
+
+    dependencies.push(
+      { table: 'items', label: 'Items linked', count: Number(itemsCount?.n ?? 0) },
+      { table: 'users', label: 'Users linked', count: Number(usersCount?.n ?? 0) },
+      { table: 'purchase_indent_headers', label: 'Purchase Indents linked', count: Number(indentsCount?.n ?? 0) },
+      { table: 'purchase_order_headers', label: 'Purchase Orders linked', count: Number(posCount?.n ?? 0) },
+      { table: 'requisition_headers', label: 'Requisitions linked', count: Number(reqsCount?.n ?? 0) },
+    );
+
+    const totalRefs = dependencies.reduce((acc, d) => acc + d.count, 0);
+    if (totalRefs > 0) {
+      blockingReasons.push(`Lookup value is referenced by ${totalRefs} record(s). Deactivate instead.`);
+    }
+  } else if (entity === 'indents') {
+    const poSources = await queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM po_indent_sources WHERE indent_id = $1', [id]);
+    dependencies.push({ table: 'po_indent_sources', label: 'Linked PO Lines', count: Number(poSources?.n ?? 0) });
+    if (Number(poSources?.n ?? 0) > 0) {
+      blockingReasons.push(`Indent is linked to ${poSources?.n} PO line(s). Cannot hard-delete.`);
+    }
+  } else if (entity === 'purchase_orders') {
+    const grnRefs = await queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM grn_headers WHERE po_id = $1', [id]);
+    dependencies.push({ table: 'grn_headers', label: 'Linked GRNs', count: Number(grnRefs?.n ?? 0) });
+    if (Number(grnRefs?.n ?? 0) > 0) {
+      blockingReasons.push(`Purchase Order is referenced by ${grnRefs?.n} GRN(s). Cannot hard-delete.`);
+    }
+  } else if (entity === 'grn') {
+    const stockRefs = await queryOne<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM stock_ledger WHERE grn_id = $1 OR (reference_id = $1 AND reference_type IN ('GRN', 'GRN_INWARD', 'GRN_REVERSAL'))`,
+      [id],
+    );
+    dependencies.push({ table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockRefs?.n ?? 0) });
+    if (Number(stockRefs?.n ?? 0) > 0) {
+      blockingReasons.push(`GRN has ${stockRefs?.n} stock movements in the ledger. Cannot hard-delete posted inventory.`);
+    }
+  } else if (entity === 'requisitions') {
+    const issueRefs = await queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_issues WHERE requisition_id = $1', [id]);
+    dependencies.push({ table: 'requisition_issues', label: 'Material Issue Slips', count: Number(issueRefs?.n ?? 0) });
+    if (Number(issueRefs?.n ?? 0) > 0) {
+      blockingReasons.push(`Requisition has ${issueRefs?.n} issued material slip(s). Cannot hard-delete.`);
+    }
+  }
+
+  const canHardDelete = blockingReasons.length === 0;
+  return { dependencies, canHardDelete, blockingReasons };
+}
+
+router.get(
+  '/inspect/:entity/:id',
+  asyncHandler(async (req, res) => {
+    const { entity } = req.params;
+    const id = Number(req.params.id);
+    if (!id || Number.isNaN(id)) throw ValidationError('Valid record ID required.');
+
+    let record: Record<string, unknown> | null = null;
+    let entityLabel = `${entity} #${id}`;
+
+    if (entity === 'users') {
+      record = await queryOne('SELECT * FROM users WHERE id = $1', [id]);
+    } else if (entity === 'suppliers') {
+      record = await queryOne('SELECT * FROM suppliers WHERE id = $1', [id]);
+    } else if (entity === 'items') {
+      record = await queryOne('SELECT * FROM items WHERE id = $1', [id]);
+    } else if (entity === 'lookups') {
+      record = await queryOne('SELECT * FROM lookups WHERE id = $1', [id]);
+    } else if (entity === 'indents') {
+      record = await queryOne('SELECT * FROM purchase_indent_headers WHERE id = $1', [id]);
+    } else if (entity === 'purchase_orders') {
+      record = await queryOne('SELECT * FROM purchase_order_headers WHERE id = $1', [id]);
+    } else if (entity === 'grn') {
+      record = await queryOne('SELECT * FROM grn_headers WHERE id = $1', [id]);
+    } else if (entity === 'requisitions') {
+      record = await queryOne('SELECT * FROM requisition_headers WHERE id = $1', [id]);
+    } else if (entity === 'direct_issues') {
+      record = await queryOne('SELECT * FROM direct_issue_headers WHERE id = $1', [id]);
+    }
+
+    if (!record) throw NotFoundError(`${entity} record`);
+
+    const { dependencies, canHardDelete, blockingReasons } = await inspectDependencies(entity, id);
+
+    // Audit trail for this record
+    const auditLogs = await query<{
+      id: number;
+      action: string;
+      actor_name: string;
+      actor_employee_id: string;
+      message: string;
+      created_at: string;
+    }>(
+      `SELECT id, action, actor_name, actor_employee_id, message, created_at
+         FROM audit_logs
+        WHERE (entity = $1 AND entity_id = $2)
+           OR (entity_label = $3)
+        ORDER BY id DESC LIMIT 20`,
+      [entity, id, entityLabel],
+    );
+
+    sendOk(res, {
+      entity,
+      id,
+      record,
+      dependencies,
+      canHardDelete,
+      blockingReasons,
+      auditLogs,
+    });
+  }),
+);
+
+/* ── 4. Bulk Toggle Active (Deactivate / Reactivate) ────────────────────────── */
+
+const bulkToggleActiveSchema = z.object({
+  entity: z.enum(['users', 'suppliers', 'items', 'lookups']),
+  ids: z.array(z.number().int().positive()).min(1, 'Select at least one record.'),
+  isActive: z.boolean(),
+});
+
+router.post(
+  '/bulk-toggle-active',
+  validateBody(bulkToggleActiveSchema),
+  asyncHandler(async (req, res) => {
+    const { entity, ids, isActive } = req.body as z.infer<typeof bulkToggleActiveSchema>;
+    const actor = actorFrom(req);
+
+    let filteredIds = [...ids];
+    if (entity === 'users') {
+      // Protect super admins
+      const protectedUsers = await query<{ id: number; employee_name: string }>(
+        `SELECT id, employee_name FROM users WHERE id = ANY($1) AND employee_id IN ('10221', '10422')`,
+        [ids],
+      );
+      if (protectedUsers.length > 0) {
+        if (!isActive) {
+          const protectedSet = new Set(protectedUsers.map((u) => Number(u.id)));
+          filteredIds = ids.filter((id) => !protectedSet.has(id));
+          if (filteredIds.length === 0) {
+            throw BusinessRuleError('Super Admin accounts (10221, 10422) cannot be deactivated.');
+          }
+        }
+      }
+    }
+
+    await withTransaction(async (tx) => {
+      const table = entity;
+      await tx.query(
+        `UPDATE ${table}
+            SET is_active = $1, updated_at = now(), updated_by = $2
+          WHERE id = ANY($3)`,
+        [isActive, req.user!.id, filteredIds],
+      );
+
+      if (entity === 'users') {
+        for (const uid of filteredIds) {
+          invalidateAuthState(uid);
+        }
+      }
+
+      await auditIn(tx, {
+        actor,
+        action: 'UPDATE',
+        entity: `admin.${entity}`,
+        entityId: filteredIds[0],
+        entityLabel: `${filteredIds.length} ${entity} records`,
+        message: `Bulk ${isActive ? 'reactivated' : 'deactivated'} ${filteredIds.length} ${entity} row(s).`,
+        after: { ids: filteredIds, isActive },
+      });
+    });
+
+    sendOk(res, {
+      updatedCount: filteredIds.length,
+      message: `Successfully ${isActive ? 'activated' : 'deactivated'} ${filteredIds.length} ${entity} record(s).`,
+    });
+  }),
+);
+
+/* ── 5. Bulk Soft-Delete & Restore ─────────────────────────────────────────── */
+
+const bulkSoftDeleteSchema = z.object({
+  entity: z.enum(['users', 'suppliers', 'items', 'lookups']),
+  ids: z.array(z.number().int().positive()).min(1, 'Select at least one record.'),
+  restore: z.boolean().default(false),
+});
+
+router.post(
+  '/bulk-soft-delete',
+  validateBody(bulkSoftDeleteSchema),
+  asyncHandler(async (req, res) => {
+    const { entity, ids, restore } = req.body as z.infer<typeof bulkSoftDeleteSchema>;
+    const actor = actorFrom(req);
+
+    let filteredIds = [...ids];
+    if (entity === 'users' && !restore) {
+      const protectedUsers = await query<{ id: number }>(
+        `SELECT id FROM users WHERE id = ANY($1) AND employee_id IN ('10221', '10422')`,
+        [ids],
+      );
+      if (protectedUsers.length > 0) {
+        const protectedSet = new Set(protectedUsers.map((u) => Number(u.id)));
+        filteredIds = ids.filter((id) => !protectedSet.has(id));
+        if (filteredIds.length === 0) {
+          throw BusinessRuleError('Super Admin accounts (10221, 10422) cannot be soft-deleted.');
+        }
+      }
+    }
+
+    await withTransaction(async (tx) => {
+      const table = entity;
+      const timestamp = restore ? null : new Date().toISOString();
+      await tx.query(
+        `UPDATE ${table}
+            SET deleted_at = $1, updated_at = now(), updated_by = $2
+          WHERE id = ANY($3)`,
+        [timestamp, req.user!.id, filteredIds],
+      );
+
+      if (entity === 'users') {
+        for (const uid of filteredIds) {
+          invalidateAuthState(uid);
+        }
+      }
+
+      await auditIn(tx, {
+        actor,
+        action: restore ? 'RESTORE' : 'DELETE',
+        entity: `admin.${entity}`,
+        entityId: filteredIds[0],
+        entityLabel: `${filteredIds.length} ${entity} records`,
+        message: `Bulk ${restore ? 'restored' : 'soft-deleted'} ${filteredIds.length} ${entity} row(s).`,
+        after: { ids: filteredIds, restore },
+      });
+    });
+
+    sendOk(res, {
+      updatedCount: filteredIds.length,
+      message: `Successfully ${restore ? 'restored' : 'soft-deleted'} ${filteredIds.length} ${entity} record(s).`,
+    });
+  }),
+);
+
+/* ── 6. Safe Hard-Delete (Permanent Purge) ─────────────────────────────────── */
+
+const hardDeleteSchema = z.object({
+  entity: z.enum([
+    'users',
+    'suppliers',
+    'items',
+    'lookups',
+    'indents',
+    'purchase_orders',
+    'grn',
+    'requisitions',
+    'direct_issues',
+  ]),
+  id: z.coerce.number().int().positive(),
+  confirm: z.string(),
+});
+
+router.post(
+  '/hard-delete',
+  validateBody(hardDeleteSchema),
+  asyncHandler(async (req, res) => {
+    const { entity, id, confirm } = req.body as z.infer<typeof hardDeleteSchema>;
+    if (confirm !== 'DELETE') {
+      throw ValidationError('Type "DELETE" in the confirmation field to authorize permanent deletion.');
+    }
+
+    const { canHardDelete, blockingReasons } = await inspectDependencies(entity, id);
+    if (!canHardDelete) {
+      throw BusinessRuleError(
+        `Permanent deletion blocked: ${blockingReasons.join(' ')} Use deactivation instead.`,
+      );
+    }
+
+    const actor = actorFrom(req);
+
+    await withTransaction(async (tx) => {
+      if (entity === 'users') {
+        await tx.query('DELETE FROM user_roles WHERE user_id = $1', [id]);
+        await tx.query('DELETE FROM user_sessions WHERE user_id = $1', [id]);
+        await tx.query('DELETE FROM users WHERE id = $1', [id]);
+        invalidateAuthState(id);
+      } else if (entity === 'suppliers') {
+        await tx.query('DELETE FROM suppliers WHERE id = $1', [id]);
+      } else if (entity === 'items') {
+        await tx.query('DELETE FROM items WHERE id = $1', [id]);
+      } else if (entity === 'lookups') {
+        await tx.query('DELETE FROM lookups WHERE id = $1', [id]);
+      } else if (entity === 'indents') {
+        await tx.query('DELETE FROM indent_approvals WHERE indent_id = $1', [id]);
+        await tx.query('DELETE FROM purchase_indent_lines WHERE indent_id = $1', [id]);
+        await tx.query('DELETE FROM purchase_indent_headers WHERE id = $1', [id]);
+      } else if (entity === 'purchase_orders') {
+        await tx.query('DELETE FROM purchase_order_lines WHERE po_id = $1', [id]);
+        await tx.query('DELETE FROM purchase_order_headers WHERE id = $1', [id]);
+      } else if (entity === 'grn') {
+        await tx.query('DELETE FROM grn_lines WHERE grn_id = $1', [id]);
+        await tx.query('DELETE FROM grn_headers WHERE id = $1', [id]);
+      } else if (entity === 'requisitions') {
+        await tx.query('DELETE FROM requisition_approvals WHERE requisition_id = $1', [id]);
+        await tx.query('DELETE FROM requisition_lines WHERE requisition_id = $1', [id]);
+        await tx.query('DELETE FROM requisition_headers WHERE id = $1', [id]);
+      } else if (entity === 'direct_issues') {
+        await tx.query('DELETE FROM direct_issue_lines WHERE direct_issue_id = $1', [id]);
+        await tx.query('DELETE FROM direct_issue_headers WHERE id = $1', [id]);
+      }
+
+      await auditIn(tx, {
+        actor,
+        action: 'DELETE',
+        entity: `admin.${entity}`,
+        entityId: id,
+        entityLabel: `${entity} #${id}`,
+        message: `Permanently deleted ${entity} #${id} with zero blocking dependencies.`,
+      });
+    });
+
+    sendOk(res, {
+      deleted: true,
+      message: `Record ${entity} #${id} has been permanently deleted from the database.`,
+    });
+  }),
+);
+
+export default router;

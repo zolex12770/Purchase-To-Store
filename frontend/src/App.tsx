@@ -52,6 +52,7 @@ const Backup         = lazy(() => import('./pages/admin/Backup'));
 const ImportExport   = lazy(() => import('./pages/admin/ImportExport'));
 const SyncAdmin      = lazy(() => import('./pages/admin/SyncAdmin'));
 const SettingsPage   = lazy(() => import('./pages/admin/SettingsPage'));
+const DataManagement = lazy(() => import('./pages/admin/DataManagement'));
 const Profile        = lazy(() => import('./pages/Profile'));
 
 function FullPageLoader() {
@@ -210,6 +211,7 @@ export default function App() {
                 <Route path="/admin/import-export" element={<ImportExport />} />
                 <Route path="/admin/sync" element={guard('sync.view', <SyncAdmin />)} />
                 <Route path="/admin/settings" element={guard('system.admin', <SettingsPage />)} />
+                <Route path="/admin/data-management" element={<RequirePermission permission="system.admin" anyOf={['system.admin', 'user.admin', 'role.view']}><DataManagement /></RequirePermission>} />
 
                 <Route path="*" element={<NotFound />} />
               </Routes>
