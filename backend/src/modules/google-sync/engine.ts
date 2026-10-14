@@ -946,14 +946,357 @@ async function syncUserRow(ctx: RowContext): Promise<void> {
   }
 }
 
+function parseSheetDate(val: string | null | undefined): string {
+  if (!val || !val.trim()) return new Date().toISOString().slice(0, 10);
+  const s = val.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // Indian numeric format DD/MM/YYYY or DD-MM-YYYY
+  const mParts = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+  if (mParts) {
+    const day = mParts[1].padStart(2, '0');
+    const month = mParts[2].padStart(2, '0');
+    let year = mParts[3];
+    if (year.length === 2) year = '20' + year;
+    return `${year}-${month}-${day}`;
+  }
+
+  // Textual months e.g. "3-Apr-2026", "1 October 2026", "24-Mar-2026"
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function resolveOrCreateItem(
+  tx: Queryable,
+  code: string,
+  description: string,
+  uomId: number | null,
+): Promise<{ id: number; itemCode: string; itemDescription: string }> {
+  let it = await txQueryOne<{ id: number; item_code: string; item_description: string }>(
+    tx,
+    'SELECT id, item_code, item_description FROM items WHERE upper(item_code) = upper($1) AND deleted_at IS NULL LIMIT 1',
+    [code],
+  );
+  if (!it && description) {
+    it = await txQueryOne<{ id: number; item_code: string; item_description: string }>(
+      tx,
+      'SELECT id, item_code, item_description FROM items WHERE lower(item_description) = lower($1) AND deleted_at IS NULL LIMIT 1',
+      [description],
+    );
+  }
+  if (!it) {
+    const cleanCode = code || ('ITM_' + Math.random().toString(36).slice(2, 8).toUpperCase());
+    const cleanDesc = description || cleanCode;
+    const ins = await txQueryOne<{ id: number }>(
+      tx,
+      `INSERT INTO items (item_code, item_description, uom_id, is_active, live_stock_qty)
+       VALUES ($1, $2, $3, TRUE, 0)
+       RETURNING id`,
+      [cleanCode, cleanDesc, uomId],
+    );
+    return { id: Number(ins!.id), itemCode: cleanCode, itemDescription: cleanDesc };
+  }
+  return { id: Number(it.id), itemCode: it.item_code, itemDescription: it.item_description };
+}
+
+async function resolveOrCreateSupplier(
+  tx: Queryable,
+  supplierName: string,
+  supplierCode?: string,
+): Promise<number> {
+  const cleanName = supplierName.trim() || 'General Supplier';
+  let s = await txQueryOne<{ id: number }>(
+    tx,
+    'SELECT id FROM suppliers WHERE lower(supplier_name) = lower($1) AND deleted_at IS NULL LIMIT 1',
+    [cleanName],
+  );
+  if (!s && supplierCode) {
+    s = await txQueryOne<{ id: number }>(
+      tx,
+      'SELECT id FROM suppliers WHERE upper(supplier_code) = upper($1) AND deleted_at IS NULL LIMIT 1',
+      [supplierCode.trim()],
+    );
+  }
+  if (!s) {
+    const code = supplierCode?.trim() || ('SUP_' + Math.random().toString(36).slice(2, 8).toUpperCase());
+    const ins = await txQueryOne<{ id: number }>(
+      tx,
+      `INSERT INTO suppliers (supplier_code, supplier_name, is_active)
+       VALUES ($1, $2, TRUE)
+       RETURNING id`,
+      [code, cleanName],
+    );
+    return Number(ins!.id);
+  }
+  return Number(s.id);
+}
+
+async function syncPurchaseIndentRow(ctx: RowContext): Promise<void> {
+  const indentNo = (ctx.values.indent_no ?? '').trim();
+  const itemCode = (ctx.values.item_code ?? '').trim();
+  const qty = parseNumericInput(ctx.values.indent_qty);
+  if (!indentNo || !itemCode || qty === null || Number(qty) <= 0) {
+    ctx.outcome.skipped += 1;
+    return;
+  }
+
+  // 1. Check if line already exists in ERP
+  const existingLine = await txQueryOne<{ id: number; indent_qty: string; status: string }>(
+    ctx.tx,
+    `SELECT l.id, l.indent_qty, h.status
+       FROM purchase_indent_lines l
+       JOIN purchase_indent_headers h ON h.id = l.indent_id
+      WHERE h.indent_no = $1 AND (upper(l.item_code) = upper($2) OR lower(l.item_description) = lower($2))`,
+    [indentNo, itemCode],
+  );
+
+  if (existingLine) {
+    if (Number(existingLine.indent_qty) !== Number(qty)) {
+      ctx.outcome.conflicts += 1;
+      ctx.errors.push({
+        sheet: ctx.sheet, row: ctx.rowNumber, column: 'Indent Qty',
+        businessKey: `${indentNo} / ${itemCode}`, severity: 'CONFLICT', code: 'QTY_MISMATCH',
+        message: `Indent ${indentNo} line ${itemCode}: the sheet says ${qty} but the ERP holds ${existingLine.indent_qty} (document is ${existingLine.status}). The ERP value has been kept.`,
+        existing: { indentQty: existingLine.indent_qty, status: existingLine.status },
+        incoming: { indentQty: qty },
+      });
+    } else {
+      ctx.outcome.skipped += 1;
+    }
+    return;
+  }
+
+  // 2. Resolve lookups
+  const rawDate = ctx.values.date || ctx.values.source_date || '';
+  const indentDate = parseSheetDate(rawDate);
+  const rawTime = (ctx.values.time || ctx.values.source_time || '').trim();
+
+  const indentTypeName = (ctx.values.indent_type ?? '').trim() || 'Consumable';
+  const indentTypeId = await ensureLookup(ctx.tx, ctx.lookups, 'INDENT_TYPE', indentTypeName);
+
+  const deptName = (ctx.values.department ?? '').trim();
+  const departmentId = deptName ? (ctx.lookups.get(`DEPARTMENT:${deptName.toLowerCase()}`) ?? await ensureLookup(ctx.tx, ctx.lookups, 'DEPARTMENT', deptName)) : null;
+
+  const ccName = (ctx.values.cost_centre ?? '').trim();
+  const costCentreId = ccName ? (ctx.lookups.get(`COST_CENTRE:${ccName.toLowerCase()}`) ?? await ensureLookup(ctx.tx, ctx.lookups, 'COST_CENTRE', ccName)) : null;
+
+  const uomRaw = (ctx.values.uom ?? '').trim() || 'NOS';
+  const uomId = looksLikeUnit(uomRaw) ? await ensureLookup(ctx.tx, ctx.lookups, 'UOM', uomRaw) : null;
+
+  // 3. Resolve Header
+  let header = await txQueryOne<{ id: number; status: string }>(
+    ctx.tx,
+    'SELECT id, status FROM purchase_indent_headers WHERE indent_no = $1',
+    [indentNo],
+  );
+
+  if (!header) {
+    const rawStatus = (ctx.values.status || ctx.values.indent_approval || '').trim();
+    const isApproved = /approv/i.test(rawStatus) || Boolean(ctx.values.approved_date);
+    const status = isApproved ? 'APPROVED' : 'PENDING_APPROVAL';
+    const approvedAt = isApproved ? indentDate : null;
+
+    const insH = await txQueryOne<{ id: number }>(
+      ctx.tx,
+      `INSERT INTO purchase_indent_headers
+         (indent_no, indent_date, indent_time, indent_type_id, department_id, cost_centre_id, remarks, status, approved_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id`,
+      [indentNo, indentDate, rawTime, indentTypeId, departmentId, costCentreId, (ctx.values.remarks ?? '').trim(), status, approvedAt],
+    );
+    header = { id: Number(insH!.id), status };
+  }
+
+  // 4. Resolve Item
+  const itemDesc = (ctx.values.item_description ?? '').trim() || itemCode;
+  const item = await resolveOrCreateItem(ctx.tx, itemCode, itemDesc, uomId);
+
+  // 5. Insert Line
+  const nextLineNo = (await txQueryOne<{ n: number }>(
+    ctx.tx,
+    'SELECT COALESCE(MAX(line_no), 0) + 1 AS n FROM purchase_indent_lines WHERE indent_id = $1',
+    [header.id],
+  ))?.n ?? 1;
+
+  const itemSpec = (ctx.values.item_specification ?? '').trim();
+  await ctx.tx.query(
+    `INSERT INTO purchase_indent_lines
+       (indent_id, line_no, item_id, item_code, item_description, indent_qty, uom_id,
+        item_specification, department_id, cost_centre_id, remarks)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      header.id, nextLineNo, item.id, item.itemCode, item.itemDescription,
+      qty, uomId, itemSpec, departmentId, costCentreId, (ctx.values.remarks ?? '').trim(),
+    ],
+  );
+
+  ctx.outcome.inserted += 1;
+}
+
+async function syncPurchaseOrderRow(ctx: RowContext): Promise<void> {
+  const poNo = (ctx.values.po_no ?? '').trim();
+  const itemCode = (ctx.values.item_code ?? '').trim();
+  const qty = parseNumericInput(ctx.values.po_qty);
+  const rate = parseNumericInput(ctx.values.rate) ?? 0;
+  const discountPct = parseNumericInput(ctx.values.discount_pct) ?? 0;
+  if (!poNo || !itemCode || qty === null || Number(qty) <= 0) {
+    ctx.outcome.skipped += 1;
+    return;
+  }
+
+  // 1. Check if line already exists in ERP
+  const existingLine = await txQueryOne<{ id: number; po_qty: string; rate: string; status: string }>(
+    ctx.tx,
+    `SELECT l.id, l.po_qty, l.rate, h.status
+       FROM purchase_order_lines l
+       JOIN purchase_order_headers h ON h.id = l.po_id
+      WHERE h.po_no = $1 AND (upper(l.item_code) = upper($2) OR lower(l.item_description) = lower($2))`,
+    [poNo, itemCode],
+  );
+
+  if (existingLine) {
+    const qtyDiffers = Number(existingLine.po_qty) !== Number(qty);
+    const rateDiffers = Number(existingLine.rate) !== Number(rate);
+    if (qtyDiffers || rateDiffers) {
+      ctx.outcome.conflicts += 1;
+      ctx.errors.push({
+        sheet: ctx.sheet, row: ctx.rowNumber, column: qtyDiffers ? 'Po qty' : 'Rate/pc',
+        businessKey: `${poNo} / ${itemCode}`, severity: 'CONFLICT', code: 'VALUE_MISMATCH',
+        message: `PO ${poNo} line ${itemCode} differs from the sheet (document is ${existingLine.status}). The ERP value has been kept.`,
+        existing: { poQty: existingLine.po_qty, rate: existingLine.rate, status: existingLine.status },
+        incoming: { poQty: qty, rate },
+      });
+    } else {
+      ctx.outcome.skipped += 1;
+    }
+    return;
+  }
+
+  // 2. Resolve lookups & dates
+  const rawDate = ctx.values.date || ctx.values.source_date || '';
+  const poDate = parseSheetDate(rawDate);
+  const rawTime = (ctx.values.time || ctx.values.source_time || '').trim();
+
+  const poTypeName = (ctx.values.po_type ?? '').trim() || 'Standard';
+  const poTypeId = await ensureLookup(ctx.tx, ctx.lookups, 'PO_TYPE', poTypeName);
+
+  const supplierName = (ctx.values.supplier_name ?? '').trim() || (ctx.values.supplier ?? '').trim();
+  const supplierCode = (ctx.values.supplier_code ?? '').trim();
+  const supplierId = await resolveOrCreateSupplier(ctx.tx, supplierName, supplierCode);
+
+  const uomRaw = (ctx.values.uom ?? '').trim() || 'NOS';
+  const uomId = looksLikeUnit(uomRaw) ? await ensureLookup(ctx.tx, ctx.lookups, 'UOM', uomRaw) : null;
+
+  const rawDeliv = ctx.values.delivery_date || ctx.values.expected_date || '';
+  const deliveryDate = rawDeliv ? parseSheetDate(rawDeliv) : null;
+
+  const indentNo = (ctx.values.indent_no ?? '').trim();
+
+  // 3. Resolve Header
+  let header = await txQueryOne<{ id: number; status: string }>(
+    ctx.tx,
+    'SELECT id, status FROM purchase_order_headers WHERE po_no = $1',
+    [poNo],
+  );
+
+  if (!header) {
+    const sourceMode = indentNo ? 'INDENT' : 'DIRECT';
+    const insH = await txQueryOne<{ id: number }>(
+      ctx.tx,
+      `INSERT INTO purchase_order_headers
+         (po_no, po_date, po_time, po_type_id, supplier_id, source_mode, status, remarks, delivery_date)
+       VALUES ($1, $2, $3, $4, $5, $6, 'OPEN', $7, $8)
+       RETURNING id`,
+      [poNo, poDate, rawTime, poTypeId, supplierId, sourceMode, (ctx.values.remarks ?? '').trim(), deliveryDate],
+    );
+    header = { id: Number(insH!.id), status: 'OPEN' };
+  }
+
+  // 4. Resolve Item
+  const itemDesc = (ctx.values.item_description ?? '').trim() || itemCode;
+  const item = await resolveOrCreateItem(ctx.tx, itemCode, itemDesc, uomId);
+
+  // 5. Insert Line
+  const nextLineNo = (await txQueryOne<{ n: number }>(
+    ctx.tx,
+    'SELECT COALESCE(MAX(line_no), 0) + 1 AS n FROM purchase_order_lines WHERE po_id = $1',
+    [header.id],
+  ))?.n ?? 1;
+
+  const itemSpec = (ctx.values.item_specification ?? '').trim();
+  const insL = await txQueryOne<{ id: number }>(
+    ctx.tx,
+    `INSERT INTO purchase_order_lines
+       (po_id, line_no, item_id, item_code, item_description, po_qty, uom_id, rate, discount_pct, item_specification, delivery_date)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     RETURNING id`,
+    [
+      header.id, nextLineNo, item.id, item.itemCode, item.itemDescription,
+      qty, uomId, rate, discountPct, itemSpec, deliveryDate,
+    ],
+  );
+
+  const poLineId = Number(insL!.id);
+
+  // 6. Trace to Indent if indent_no provided
+  if (indentNo) {
+    const indLine = await txQueryOne<{ id: number; indent_id: number }>(
+      ctx.tx,
+      `SELECT l.id, l.indent_id
+         FROM purchase_indent_lines l
+         JOIN purchase_indent_headers h ON h.id = l.indent_id
+        WHERE h.indent_no = $1 AND (l.item_id = $2 OR upper(l.item_code) = upper($3))
+        LIMIT 1`,
+      [indentNo, item.id, itemCode],
+    );
+    if (indLine) {
+      await ctx.tx.query(
+        `INSERT INTO po_indent_sources (po_line_id, indent_line_id, indent_id, consumed_qty)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (po_line_id, indent_line_id) DO NOTHING`,
+        [poLineId, indLine.id, indLine.indent_id, qty],
+      );
+    }
+  }
+
+  // 7. Link to any existing matching GRN lines
+  await ctx.tx.query(
+    `UPDATE grn_lines gl
+        SET po_line_id = $1
+       FROM grn_headers gh
+      WHERE gh.id = gl.grn_id
+        AND gl.po_line_id IS NULL
+        AND (gl.item_id = $2 OR upper(gl.item_code) = upper($3))
+        AND (gh.remarks LIKE '%' || $4 || '%' OR gh.challan_no LIKE '%' || $4 || '%')`,
+    [poLineId, item.id, itemCode, poNo],
+  );
+
+  ctx.outcome.inserted += 1;
+}
+
+async function reconcilePurchaseOrdersPostSync(ctx: { tx: Queryable; outcome: SheetOutcome }): Promise<void> {
+  // Update purchase_order_headers status based on v_po_header_balance derived_status
+  await ctx.tx.query(`
+    UPDATE purchase_order_headers poh
+       SET status = hb.derived_status,
+           updated_at = now()
+      FROM v_po_header_balance hb
+     WHERE hb.po_id = poh.id
+       AND poh.status NOT IN ('CANCELLED', 'SHORT_CLOSED')
+  `);
+}
+
 /**
  * Transactional sheets (Purchase Indent / Purchase Order / GRN).
  *
- * These are NOT imported. SRS §8 forbids sync from silently overwriting protected
- * transactional records, and creating documents here would bypass the numbering,
- * approval and quantity controls that make them trustworthy. Instead the rows are
- * RECONCILED: divergence from the ERP is reported as a CONFLICT for an
- * administrator to resolve deliberately.
+ * Requisition and GRN are reconciled against ERP numbers.
  */
 async function reconcileTransactionalSheet(
   ctx: RowContext, entity: 'purchase_indents' | 'purchase_orders' | 'grns' | 'requisitions',
@@ -1265,7 +1608,11 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
               await syncItemRow(ctx);
             } else if (target === 'users') {
               await syncUserRow(ctx);
-            } else if (target === 'purchase_indents' || target === 'purchase_orders' || target === 'grns' || target === 'requisitions') {
+            } else if (target === 'purchase_indents') {
+              await syncPurchaseIndentRow(ctx);
+            } else if (target === 'purchase_orders') {
+              await syncPurchaseOrderRow(ctx);
+            } else if (target === 'grns' || target === 'requisitions') {
               await reconcileTransactionalSheet(ctx, target);
             } else {
               outcome.skipped += 1;
@@ -1285,6 +1632,9 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
         }
         if (mapping.target_entity === 'items') {
           await reconcileItemsMaster({ tx, seenKeys, outcome });
+        }
+        if (mapping.target_entity === 'purchase_orders') {
+          await reconcilePurchaseOrdersPostSync({ tx, outcome });
         }
 
         await recordErrors(tx, jobId, await onlyNewIssues(tx, mapping.sheet_name, sheetErrors));

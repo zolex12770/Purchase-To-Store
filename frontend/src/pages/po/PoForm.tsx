@@ -364,7 +364,7 @@ export default function PoForm() {
     let cancelled = false;
     void Promise.allSettled(
       wanted.map((itemId) => fetchItemProfile(itemId)
-        .then((p) => [itemId, p.live.openIndentQty, p.live.pendingGrnQty] as const)),
+        .then((p) => [itemId, p.live.liveStockQty, p.live.pendingGrnQty] as const)),
     ).then((results) => {
       if (cancelled) return;
       const byItem = new Map<number, { live: string; pending: string }>();
@@ -416,7 +416,7 @@ export default function PoForm() {
                 itemId: p.id, itemCode: p.itemCode, itemDescription: p.itemDescription,
                 itemSpecification: p.itemSpecification, uomId: p.uomId,
                 rate: p.live.lastPurchaseRate ?? p.standardRate ?? '',
-                liveQty: p.live.openIndentQty,
+                liveQty: p.live.liveStockQty,
                 pendingGrnQty: p.live.pendingGrnQty,
               }
             : l,

@@ -127,20 +127,30 @@ export default function IndentForm() {
     deptAutoFilledRef.current = true;
     costCentreManualRef.current = true;
     setRemarks(d.remarks ?? '');
-    setLines(
-      (d.lines ?? []).map((l, i) => ({
-        uid: `E${i}`,
-        itemId: Number(l.item_id),
-        itemCode: String(l.item_code ?? ''),
-        itemDescription: String(l.item_description ?? ''),
-        indentQty: String(l.indent_qty ?? ''),
-        uomId: l.uom_id ? Number(l.uom_id) : null,
-        uomCode: String(l.uom_code ?? ''),
-        itemSpecification: String(l.item_specification ?? ''),
-        departmentId: l.department_id ? Number(l.department_id) : null,
-        costCentreId: l.cost_centre_id ? Number(l.cost_centre_id) : null,
-      })),
-    );
+    const loaded = (d.lines ?? []).map((l, i) => ({
+      uid: `E${i}`,
+      itemId: Number(l.item_id),
+      itemCode: String(l.item_code ?? ''),
+      itemDescription: String(l.item_description ?? ''),
+      indentQty: String(l.indent_qty ?? ''),
+      uomId: l.uom_id ? Number(l.uom_id) : null,
+      uomCode: String(l.uom_code ?? ''),
+      itemSpecification: String(l.item_specification ?? ''),
+      departmentId: l.department_id ? Number(l.department_id) : null,
+      costCentreId: l.cost_centre_id ? Number(l.cost_centre_id) : null,
+    }));
+    setLines(loaded);
+
+    // Fetch live profile (liveStockQty, pendingGrnQty) for each loaded line
+    void Promise.all(loaded.map(async (l) => {
+      if (!l.itemId) return;
+      try {
+        const p = await fetchItemProfile(l.itemId);
+        setLines((ls) => ls.map((x) => (x.uid === l.uid ? { ...x, live: p.live } : x)));
+      } catch {
+        // keep fallback
+      }
+    }));
   }, [existing.data]);
 
   /* ── Raised By → Department auto-fill (new indent only) ──────────────────── */
@@ -417,7 +427,7 @@ export default function IndentForm() {
                       <td className="cell-wrap cell-muted" style={{ minWidth: 140, maxWidth: 240 }}>
                         {text(l.itemSpecification)}
                       </td>
-                      <td className="right num cell-muted">{l.live ? qty(l.live.openIndentQty) : '—'}</td>
+                      <td className="right num cell-muted">{l.live ? qty(l.live.liveStockQty) : '—'}</td>
                       <td className="right num cell-muted">{l.live ? qty(l.live.pendingGrnQty) : '—'}</td>
                     </tr>
                   ))}
