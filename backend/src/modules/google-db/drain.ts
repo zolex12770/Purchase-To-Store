@@ -261,6 +261,12 @@ export async function drainOutbox(limit = DEFAULT_LIMIT): Promise<DrainResult> {
       logger.warn(`Google replica: the "${lost}" tab is missing in Google — queued a full export to recreate it.`);
     }
 
+    const overflow = /Range\s+'?((?:[^'!]|'')+)'?!.*?exceeds grid limits/i.exec(message)?.[1]?.replace(/''/g, "'");
+    if (overflow && viewBySheet(overflow)) {
+      await execute('UPDATE google_db_state SET grid_rows = 0 WHERE sheet_name = $1', [overflow]);
+      logger.warn(`Google replica: the "${overflow}" tab grid is smaller than written range — reset cached grid_rows to trigger auto-expansion.`);
+    }
+
     return {
       status: 'FAILED', changes: queued.length, rowsWritten: 0, rowsUnchanged: unchanged,
       apiCalls: apiCallCount() - apiBefore, sheets: [], deferred: [...deferred],
