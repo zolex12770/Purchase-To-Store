@@ -37,20 +37,47 @@ const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 
 router.get(
   '/departments/:id/hod',
-  requirePermission('lookup.view'),
+  requireAnyPermission('lookup.view', 'requisition.view', 'requisition.create'),
   asyncHandler(async (req, res) => {
     const id = idParam(req);
-    const row = await queryOne<{ category: string; extra: Record<string, unknown> }>(
-      'SELECT category, extra FROM lookups WHERE id = $1 AND deleted_at IS NULL', [id],
+    const row = await queryOne<{ category: string; name: string; extra: Record<string, unknown> }>(
+      'SELECT category, name, extra FROM lookups WHERE id = $1 AND deleted_at IS NULL', [id],
     );
     if (!row || row.category !== 'DEPARTMENT') throw NotFoundError('Department');
-    const hodUserId = row.extra?.hodUserId ? Number(row.extra.hodUserId) : null;
-    const hod = hodUserId
+    let hodUserId = row.extra?.hodUserId ? Number(row.extra.hodUserId) : null;
+    let hod = hodUserId
       ? await queryOne<{ id: number; employee_name: string; employee_id: string }>(
           'SELECT id, employee_name, employee_id FROM users WHERE id = $1 AND deleted_at IS NULL', [hodUserId],
         )
       : null;
-    sendOk(res, { departmentId: id, hodUserId, hod });
+    let hodName = typeof row.extra?.hodName === 'string' ? row.extra.hodName : '';
+
+    if (!hod && hodName) {
+      hod = await queryOne<{ id: number; employee_name: string; employee_id: string }>(
+        'SELECT id, employee_name, employee_id FROM users WHERE lower(employee_name) = lower($1) AND deleted_at IS NULL LIMIT 1',
+        [hodName],
+      );
+      if (!hod) {
+        const clean = hodName.replace(/^Mr\.?\s*/i, '').trim();
+        hod = await queryOne<{ id: number; employee_name: string; employee_id: string }>(
+          'SELECT id, employee_name, employee_id FROM users WHERE lower(employee_name) LIKE lower($1) AND deleted_at IS NULL ORDER BY id ASC LIMIT 1',
+          [`%${clean}%`],
+        );
+      }
+    }
+
+    if (!hod && row.name.trim().toUpperCase() === 'MDO') {
+      hod = await queryOne<{ id: number; employee_name: string; employee_id: string }>(
+        "SELECT id, employee_name, employee_id FROM users WHERE employee_id = '10221' AND deleted_at IS NULL",
+      );
+    }
+
+    if (hod) {
+      hodUserId = hod.id;
+      hodName = hod.employee_name;
+    }
+
+    sendOk(res, { departmentId: id, hodUserId, hodName, hod });
   }),
 );
 
@@ -67,13 +94,17 @@ router.put(
     );
     if (!dept || dept.category !== 'DEPARTMENT') throw NotFoundError('Department');
 
+    let hodUser: { id: number; employee_name: string } | null = null;
     if (hodUserId != null) {
-      const user = await queryOne<{ id: number }>('SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL', [hodUserId]);
-      if (!user) throw ValidationError('The selected HOD user does not exist.', [{ field: 'hodUserId', message: 'Not found.' }]);
+      hodUser = await queryOne<{ id: number; employee_name: string }>('SELECT id, employee_name FROM users WHERE id = $1 AND deleted_at IS NULL', [hodUserId]);
+      if (!hodUser) throw ValidationError('The selected HOD user does not exist.', [{ field: 'hodUserId', message: 'Not found.' }]);
     }
 
     await withTransaction(async (tx) => {
-      const nextExtra = { ...dept.extra, hodUserId };
+      const nextExtra: Record<string, unknown> = { ...dept.extra, hodUserId };
+      if (hodUser) {
+        nextExtra.hodName = hodUser.employee_name;
+      }
       await tx.query('UPDATE lookups SET extra = $2, updated_at = now(), updated_by = $3 WHERE id = $1',
         [id, JSON.stringify(nextExtra), req.user!.id]);
       await auditIn(tx, {
@@ -88,8 +119,8 @@ router.put(
 /** Resolves the department's currently-mapped HOD, snapshotting the name too. */
 async function resolveHod(tx: Queryable, departmentId: number | null): Promise<{ hodUserId: number | null; hodName: string }> {
   if (!departmentId) return { hodUserId: null, hodName: '' };
-  const dept = await txQueryOne<{ extra: Record<string, unknown> }>(
-    tx, 'SELECT extra FROM lookups WHERE id = $1', [departmentId],
+  const dept = await txQueryOne<{ name: string; extra: Record<string, unknown> }>(
+    tx, 'SELECT name, extra FROM lookups WHERE id = $1', [departmentId],
   );
   let hodUserId = dept?.extra?.hodUserId ? Number(dept.extra.hodUserId) : null;
   let hodName = typeof dept?.extra?.hodName === 'string' ? dept.extra.hodName : '';
@@ -100,14 +131,32 @@ async function resolveHod(tx: Queryable, departmentId: number | null): Promise<{
     );
     if (hod?.employee_name) hodName = hod.employee_name;
   } else if (hodName) {
-    const matchedUser = await txQueryOne<{ id: number; employee_name: string }>(
+    let matchedUser = await txQueryOne<{ id: number; employee_name: string }>(
       tx, 'SELECT id, employee_name FROM users WHERE lower(employee_name) = lower($1) AND deleted_at IS NULL LIMIT 1', [hodName],
     );
+    if (!matchedUser) {
+      const clean = hodName.replace(/^Mr\.?\s*/i, '').trim();
+      matchedUser = await txQueryOne<{ id: number; employee_name: string }>(
+        tx, 'SELECT id, employee_name FROM users WHERE lower(employee_name) LIKE lower($1) AND deleted_at IS NULL ORDER BY id ASC LIMIT 1', [`%${clean}%`],
+      );
+    }
     if (matchedUser) {
       hodUserId = matchedUser.id;
       hodName = matchedUser.employee_name;
     }
   }
+
+  // Explicit MDO fallback
+  if (!hodUserId && dept?.name?.trim().toUpperCase() === 'MDO') {
+    const kunal = await txQueryOne<{ id: number; employee_name: string }>(
+      tx, "SELECT id, employee_name FROM users WHERE employee_id = '10221' AND deleted_at IS NULL",
+    );
+    if (kunal) {
+      hodUserId = kunal.id;
+      hodName = kunal.employee_name;
+    }
+  }
+
   return { hodUserId, hodName };
 }
 
@@ -289,7 +338,22 @@ router.get(
     if (!header) throw NotFoundError('Requisition');
 
     const lines = await query(
-      `SELECT v.*, u.code AS uom_code, u.name AS uom_name, l.remarks, i.live_stock_qty AS available_stock
+      `SELECT v.*, u.code AS uom_code, u.name AS uom_name, l.remarks, i.live_stock_qty AS available_stock,
+              COALESCE(
+                NULLIF(i.standard_rate, 0),
+                (SELECT gl.rate FROM grn_lines gl WHERE gl.item_id = l.item_id AND gl.rate > 0 ORDER BY gl.id DESC LIMIT 1)
+              ) AS estimated_rate,
+              CASE
+                WHEN COALESCE(
+                  NULLIF(i.standard_rate, 0),
+                  (SELECT gl.rate FROM grn_lines gl WHERE gl.item_id = l.item_id AND gl.rate > 0 ORDER BY gl.id DESC LIMIT 1)
+                ) IS NOT NULL
+                THEN ROUND(l.requested_qty * COALESCE(
+                  NULLIF(i.standard_rate, 0),
+                  (SELECT gl.rate FROM grn_lines gl WHERE gl.item_id = l.item_id AND gl.rate > 0 ORDER BY gl.id DESC LIMIT 1)
+                ), 2)
+                ELSE NULL
+              END AS estimated_value
          FROM requisition_lines l
          JOIN v_requisition_line_balance v ON v.requisition_line_id = l.id
          LEFT JOIN items i ON i.id = l.item_id
@@ -341,6 +405,8 @@ const requisitionLineSchema = z.object({
   itemId: z.coerce.number().int().positive({ message: 'Select an item.' }),
   requestedQty: z.union([z.number(), z.string()]).refine((v) => Number(v) > 0, 'Requested quantity must be greater than zero.'),
   remarks: z.string().trim().max(500).default(''),
+  rate: z.union([z.number(), z.string()]).nullable().optional(),
+  estimatedRate: z.union([z.number(), z.string()]).nullable().optional(),
 });
 
 const requisitionSchema = z.object({

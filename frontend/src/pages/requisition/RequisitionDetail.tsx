@@ -25,7 +25,7 @@ import {
   LoadingBlock, ErrorState, Input, Checkbox,
 } from '../../components/ui';
 import { StatTile } from '../../components/KpiCard';
-import { qty, formatDate, formatDateTime, count, text, statusLabel } from '../../lib/format';
+import { qty, money, formatDate, formatDateTime, count, text, statusLabel } from '../../lib/format';
 
 interface RequisitionLine {
   requisition_line_id: number;
@@ -43,6 +43,8 @@ interface RequisitionLine {
   line_status: string;
   issue_count: number;
   remarks: string;
+  estimated_rate?: string | null;
+  estimated_value?: string | null;
 }
 
 interface RequisitionDoc {
@@ -206,10 +208,13 @@ export default function RequisitionDetail() {
     : wrongHod ? 'Only this requisition\'s HOD can approve it.' : undefined;
 
   const hasAnyIssue = data.issues.length > 0;
+  const canSeeFinancials = can('requisition.approve') || isSuperAdmin;
   const totalRequested = data.lines.reduce((s, l) => s + Number(l.requested_qty), 0);
   const totalIssued = data.lines.reduce((s, l) => s + Number(l.issued_qty), 0);
   const totalPending = data.lines.reduce((s, l) => s + Number(l.pending_qty), 0);
   const totalExcess = data.lines.reduce((s, l) => s + Number(l.excess_qty), 0);
+  const totalEstimatedValue = data.lines.reduce((s, l) => s + (l.estimated_value != null ? Number(l.estimated_value) : 0), 0);
+  const unpricedLinesCount = data.lines.filter((l) => l.estimated_rate == null || Number(l.estimated_rate) <= 0).length;
 
   return (
     <>
@@ -321,6 +326,14 @@ export default function RequisitionDetail() {
         <StatTile label="Issued" value={qty(totalIssued)} tone="info" />
         <StatTile label="Pending" value={qty(totalPending)} tone={totalPending > 0 ? 'warning' : 'success'} />
         <StatTile label="Excess (over-issued)" value={qty(totalExcess)} tone={totalExcess > 0 ? 'warning' : 'default'} />
+        {canSeeFinancials && (
+          <StatTile
+            label="Estimated value"
+            value={money(totalEstimatedValue)}
+            tone={unpricedLinesCount > 0 ? 'warning' : 'info'}
+            sub={unpricedLinesCount > 0 ? `${unpricedLinesCount} unpriced item(s)` : undefined}
+          />
+        )}
       </div>
 
       <Card style={{ marginBottom: 'var(--sp-4)' }}>
@@ -360,6 +373,8 @@ export default function RequisitionDetail() {
                   <th className="right">Pending</th>
                   <th className="right">Excess</th>
                   <th className="right">Available Stock</th>
+                  {canSeeFinancials && <th className="right" style={{ minWidth: 105 }}>Rate</th>}
+                  {canSeeFinancials && <th className="right" style={{ minWidth: 110 }}>Value</th>}
                   <th className="center">Status</th>
                 </tr>
               </thead>
@@ -378,6 +393,26 @@ export default function RequisitionDetail() {
                     <td className="right num" style={{ color: Number(l.pending_qty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)', fontWeight: 600 }}>{qty(l.pending_qty)}</td>
                     <td className="right num" style={{ color: Number(l.excess_qty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>{qty(l.excess_qty)}</td>
                     <td className="right num cell-muted">{l.available_stock != null ? qty(l.available_stock) : '—'}</td>
+                    {canSeeFinancials && (
+                      <td className="right num">
+                        {l.estimated_rate != null && Number(l.estimated_rate) > 0 ? (
+                          money(l.estimated_rate)
+                        ) : (
+                          <span style={{ color: 'var(--warning-700)', fontWeight: 500, fontSize: 'var(--text-xs)' }} title="No approved rate in Item Master or purchase receipts">
+                            Not available
+                          </span>
+                        )}
+                      </td>
+                    )}
+                    {canSeeFinancials && (
+                      <td className="right num cell-strong">
+                        {l.estimated_value != null && Number(l.estimated_value) > 0 ? (
+                          money(l.estimated_value)
+                        ) : (
+                          <span style={{ color: 'var(--text-faint)' }}>—</span>
+                        )}
+                      </td>
+                    )}
                     <td className="center"><StatusBadge status={l.line_status} /></td>
                   </tr>
                 ))}
@@ -390,11 +425,22 @@ export default function RequisitionDetail() {
                   <td className="right num">{qty(totalPending)}</td>
                   <td className="right num">{qty(totalExcess)}</td>
                   <td />
+                  {canSeeFinancials && <td />}
+                  {canSeeFinancials && (
+                    <td className="right num cell-strong" title={unpricedLinesCount > 0 ? `${unpricedLinesCount} unpriced item(s) excluded` : undefined}>
+                      {money(totalEstimatedValue)}{unpricedLinesCount > 0 ? '*' : ''}
+                    </td>
+                  )}
                   <td />
                 </tr>
               </tfoot>
             </table>
           </div>
+          {canSeeFinancials && unpricedLinesCount > 0 && (
+            <div style={{ padding: 'var(--sp-2) var(--sp-4)', fontSize: 'var(--text-xs)', color: 'var(--text-muted)', borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-subtle)' }}>
+              * Rate is marked <strong>Not available</strong> for items with no rate configured in the Item Master or past purchase receipts. Those items are excluded from the estimated total value.
+            </div>
+          )}
         </CardBody>
       </Card>
 

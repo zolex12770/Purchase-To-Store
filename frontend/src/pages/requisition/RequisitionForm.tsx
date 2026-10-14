@@ -23,7 +23,7 @@ import { PageHeader } from '../../layout/AppShell';
 import {
   Button, Card, CardBody, CardHeader, Field, Input, Select, EmptyState, LoadingBlock,
 } from '../../components/ui';
-import { qty, money, today, text, toShortUom } from '../../lib/format';
+import { qty, today, text, toShortUom } from '../../lib/format';
 
 interface LineDraft {
   uid: string;
@@ -32,7 +32,6 @@ interface LineDraft {
   itemDescription: string;
   mainGroupName: string;
   requestedQty: string;
-  rate: string;
   uomId: number | null;
   uomCode: string;
   remarks: string;
@@ -42,10 +41,8 @@ interface LineDraft {
 const newLine = (): LineDraft => ({
   uid: `L${Date.now()}${Math.round(performance.now() * 1000) % 1000}`,
   itemId: null, itemCode: '', itemDescription: '', mainGroupName: '',
-  requestedQty: '', rate: '', uomId: null, uomCode: '', remarks: '',
+  requestedQty: '', uomId: null, uomCode: '', remarks: '',
 });
-
-const lineValue = (l: LineDraft) => Number(l.requestedQty || 0) * Number(l.rate || 0);
 
 export default function RequisitionForm() {
   const { id } = useParams();
@@ -54,7 +51,6 @@ export default function RequisitionForm() {
   const toast = useToast();
   const qc = useQueryClient();
   const { user, can, isSuperAdmin } = useAuth();
-  const canSeeFinancials = can('requisition.approve') || isSuperAdmin;
   const canCreateOnBehalf = can('user.admin') || user?.roles.includes('ADMIN') || user?.roles.includes('STORE') || isSuperAdmin;
 
   const { data: userOptions } = useUserOptions();
@@ -78,8 +74,15 @@ export default function RequisitionForm() {
   const effectiveDepartmentId = effectiveUser?.departmentId;
   const effectiveDepartmentName = (effectiveUser as { departmentName?: string | null })?.departmentName ?? (effectiveUser as { department?: string })?.department;
 
-  const userDept = allDepartments.find((d) => d.id === effectiveDepartmentId || d.name === effectiveDepartmentName);
-  const hodName = ((userDept?.extra as { hodName?: string } | undefined)?.hodName) || '';
+  const userDept = allDepartments.find((d) => d.id === effectiveDepartmentId || d.name?.trim().toLowerCase() === effectiveDepartmentName?.trim().toLowerCase());
+  const fallbackHodName = ((userDept?.extra as { hodName?: string } | undefined)?.hodName) || '';
+
+  const deptHodQuery = useQuery({
+    queryKey: ['department-hod', effectiveDepartmentId],
+    queryFn: () => api.get<{ departmentId: number; hodUserId: number | null; hodName: string; hod: { employee_name: string } | null }>(`/requisitions/departments/${effectiveDepartmentId}/hod`),
+    enabled: Boolean(effectiveDepartmentId),
+  });
+  const hodName = deptHodQuery.data?.hod?.employee_name || deptHodQuery.data?.hodName || fallbackHodName;
 
   const machines = allMachines
     .filter((m) => !effectiveDepartmentId || m.parentId === effectiveDepartmentId)
@@ -112,22 +115,20 @@ export default function RequisitionForm() {
       itemDescription: String(l.item_description ?? ''),
       mainGroupName: String(l.main_group_name ?? ''),
       requestedQty: String(l.requested_qty ?? ''),
-      rate: '', // requisition_lines carries no rate (Sections 5-8) — fetched below from the live Item Master
       uomId: l.uom_id ? Number(l.uom_id) : null,
       uomCode: String(l.uom_code ?? ''),
       remarks: String(l.remarks ?? ''),
     }));
     setLines(loaded);
 
-    // Current standard rate is informational display only — fetched
-    // per line, same as a fresh item selection, never persisted.
+    // Fetch live stock for informational display
     void Promise.all(loaded.map(async (l) => {
       if (!l.itemId) return;
       try {
         const p = await fetchItemProfile(l.itemId);
-        setLines((ls) => ls.map((x) => (x.uid === l.uid ? { ...x, rate: p.standardRate ?? '0', live: p.live } : x)));
+        setLines((ls) => ls.map((x) => (x.uid === l.uid ? { ...x, live: p.live } : x)));
       } catch {
-        // A deleted/inactive item still shows its snapshot fields; rate simply stays blank.
+        // snapshot fields remain visible
       }
     }));
   }, [existing.data]);
@@ -158,7 +159,6 @@ export default function RequisitionForm() {
                 mainGroupName: p.mainGroupName ?? '',
                 uomId: p.uomId,
                 uomCode: p.uomCode ?? '',
-                rate: p.standardRate ?? '0',
                 live: p.live,
               }
             : l,
@@ -179,7 +179,6 @@ export default function RequisitionForm() {
   const totals = {
     items: validLines.length,
     qty: validLines.reduce((s, l) => s + Number(l.requestedQty || 0), 0),
-    value: validLines.reduce((s, l) => s + lineValue(l), 0),
   };
   const existingStatus = (existing.data as { status?: string } | undefined)?.status;
   const editingPending = isEdit && (existingStatus === 'PENDING_APPROVAL' || existingStatus === 'RETURNED');
@@ -342,8 +341,6 @@ export default function RequisitionForm() {
                     <th className="right" style={{ width: 100 }}>Requested Qty</th>
                     <th style={{ width: 80 }}>UOM</th>
                     <th className="right" style={{ width: 100 }}>Live Stock</th>
-                    {canSeeFinancials && <th className="right" style={{ width: 100 }}>Rate</th>}
-                    {canSeeFinancials && <th className="right" style={{ width: 110 }}>Value</th>}
                     <th style={{ minWidth: 160 }}>Remarks</th>
                   </tr>
                 </thead>
@@ -381,19 +378,6 @@ export default function RequisitionForm() {
                       >
                         {l.live ? qty(l.live.liveStockQty) : '—'}
                       </td>
-                      {canSeeFinancials && (
-                        <td>
-                          <Input
-                            numeric type="number" step="0.0001" min="0" className="input-sm"
-                            value={l.rate} placeholder="0"
-                            onChange={(e) => updateLine(l.uid, { rate: e.target.value })}
-                            title="Informational only — for visibility and reporting, not a purchase price"
-                          />
-                        </td>
-                      )}
-                      {canSeeFinancials && (
-                        <td className="right num cell-strong">{l.itemId ? money(lineValue(l)) : '—'}</td>
-                      )}
                       <td>
                         <Input className="input-sm" value={l.remarks} onChange={(e) => updateLine(l.uid, { remarks: e.target.value })} placeholder="Optional" />
                       </td>
@@ -409,8 +393,6 @@ export default function RequisitionForm() {
                       <td className="right num cell-strong">{qty(totals.qty)}</td>
                       <td />
                       <td />
-                      {canSeeFinancials && <td />}
-                      {canSeeFinancials && <td className="right num cell-strong">{money(totals.value)}</td>}
                       <td />
                     </tr>
                   </tfoot>

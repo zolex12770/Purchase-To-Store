@@ -177,11 +177,20 @@ router.get(
       is_hod: boolean;
     }>(
       `SELECT u.id, u.employee_id, u.employee_name, u.department_id, d.name AS department_name,
-              EXISTS (
-                SELECT 1 FROM lookups dept
-                WHERE dept.category = 'DEPARTMENT'
-                  AND dept.deleted_at IS NULL
-                  AND (dept.extra->>'hodUserId')::bigint = u.id
+              (
+                EXISTS (
+                  SELECT 1 FROM lookups dept
+                  WHERE dept.category = 'DEPARTMENT'
+                    AND dept.deleted_at IS NULL
+                    AND (
+                      (dept.extra->>'hodUserId')::bigint = u.id OR
+                      (dept.extra->>'secondaryHodUserId')::bigint = u.id
+                    )
+                ) OR EXISTS (
+                  SELECT 1 FROM user_roles ur
+                  JOIN roles r ON r.id = ur.role_id
+                  WHERE ur.user_id = u.id AND r.code = 'HOD'
+                )
               ) AS is_hod
          FROM users u
          LEFT JOIN lookups d ON d.id = u.department_id AND d.deleted_at IS NULL
