@@ -22,9 +22,11 @@ const router = Router();
 
 /** Shared projection: an item plus every resolved master label. */
 const ITEM_SELECT = `
-  SELECT i.id, i.item_code, i.item_description, i.hsn_code, i.item_specification,
+  SELECT i.id, i.item_code, i.item_description, i.item_description AS item_name, i.hsn_code, i.item_specification,
+         '' AS rack_id,
          i.standard_rate, i.reorder_level, i.min_stock, i.max_stock, i.reorder_qty, i.gst_rate,
          i.live_stock_qty, i.qc_required,
+         COALESCE((SELECT SUM(pending_grn_qty) FROM v_po_line_balance plb WHERE plb.item_id = i.id AND plb.is_receivable), 0) AS pending_grn_qty,
          i.is_active, i.created_at, i.updated_at,
          i.item_type_id,      it.name  AS item_type_name,
          i.department_id,     d.name   AS department_name,
