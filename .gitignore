@@ -43,6 +43,7 @@ logs/
 *.sqlite3
 *.db
 pgdata/
+scratch/
 
 # ── Editors and OS ────────────────────────────────────────────────────────────
 .vscode/*

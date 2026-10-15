@@ -205,4 +205,91 @@ describe('Enterprise Inventory Module API', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.data).toBeInstanceOf(Array);
   });
+
+  it('GET /api/v1/inventory/categories/RM/summary returns category metrics and last sync checkpoint', async () => {
+    const res = await request(app)
+      .get('/api/v1/inventory/categories/RM/summary')
+      .set(auth(adminToken));
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.category).toBe('RM');
+    expect(res.body.data.stats).toBeDefined();
+    expect(res.body.data.stats.totalItems).toBeGreaterThanOrEqual(0);
+  });
+
+  it('GET /api/v1/inventory/categories/RM returns paginated inventory items', async () => {
+    const res = await request(app)
+      .get('/api/v1/inventory/categories/RM?pageSize=10')
+      .set(auth(adminToken));
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toBeInstanceOf(Array);
+    expect(res.body.meta).toBeDefined();
+  });
+
+  it('POST /api/v1/inventory/categories/GENERAL/transactions posts atomic inward and outward with 409 guard', async () => {
+    // 1. Post Inward
+    const inRes = await request(app)
+      .post('/api/v1/inventory/categories/GENERAL/transactions')
+      .set(auth(adminToken))
+      .send({
+        itemId: testItemId,
+        txnType: 'GRN_INWARD',
+        direction: 'IN',
+        quantity: 15,
+        uom: 'Nos',
+        notes: 'Test Inward Receipt',
+      });
+
+    expect(inRes.status).toBe(201);
+    expect(inRes.body.success).toBe(true);
+    expect(inRes.body.data.txnNo).toMatch(/^ITXN-/);
+    const postInwardQty = Number(inRes.body.data.balanceQtyAfter);
+
+    // 2. Attempt Excessive Outward (Must fail with 409 Conflict)
+    const failRes = await request(app)
+      .post('/api/v1/inventory/categories/GENERAL/transactions')
+      .set(auth(adminToken))
+      .send({
+        itemId: testItemId,
+        txnType: 'DIRECT_ISSUE',
+        direction: 'OUT',
+        quantity: postInwardQty + 999999,
+        uom: 'Nos',
+        notes: 'Excessive outward should fail',
+      });
+
+    expect(failRes.status).toBe(409);
+    expect(failRes.body.error.message).toContain('Insufficient stock');
+
+    // 3. Post Valid Outward
+    const outRes = await request(app)
+      .post('/api/v1/inventory/categories/GENERAL/transactions')
+      .set(auth(adminToken))
+      .send({
+        itemId: testItemId,
+        txnType: 'DIRECT_ISSUE',
+        direction: 'OUT',
+        quantity: 5,
+        uom: 'Nos',
+        notes: 'Test Outward Issue',
+      });
+
+    expect(outRes.status).toBe(201);
+    expect(outRes.body.success).toBe(true);
+    expect(Number(outRes.body.data.balanceQtyAfter)).toBe(postInwardQty - 5);
+  });
+
+  it('GET /api/v1/inventory/sync/status returns checkpoints for all categories', async () => {
+    const res = await request(app)
+      .get('/api/v1/inventory/sync/status')
+      .set(auth(adminToken));
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toBeInstanceOf(Array);
+  });
 });
+

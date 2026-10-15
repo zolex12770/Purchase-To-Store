@@ -25,6 +25,8 @@ import { nextDocumentNumber, dateStamp, timeStamp } from '../../domain/numbering
 import { toQty, toRate } from '../../domain/money.js';
 import { toShortUom } from '../../domain/uom.js';
 import { adjustStockPhysicalCount } from '../../domain/stock.js';
+import { recordInventoryMovement, INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
+import { syncCategoryFromSheet, syncAllInventoryCategories } from './sync-engine.js';
 import directIssueRoutes from './direct-issue.routes.js';
 
 const router = Router();
@@ -1414,6 +1416,325 @@ router.post(
       ...result,
       message: `Successfully created Purchase Indent ${result.indentNo} for item ${result.itemCode}.`,
     });
+  }),
+);
+
+/* ── Category Workspaces & Live Data Synchronization ───────────────────────── */
+
+const categoryParam = z.enum(['RM', 'FG', 'TRADING', 'WIP', 'GENERAL']);
+
+// 1. GET /inventory/categories/:category - Category Stock Register
+router.get(
+  '/categories/:category',
+  requirePermission('inventory.view'),
+  asyncHandler(async (req, res) => {
+    const rawCategory = (req.params.category || '').toUpperCase();
+    const parseCat = categoryParam.safeParse(rawCategory);
+    if (!parseCat.success) {
+      throw ValidationError(`Invalid inventory category "${req.params.category}". Must be one of: RM, FG, TRADING, WIP, GENERAL.`);
+    }
+    const category = parseCat.data;
+
+    const q = listQuerySchema.extend({
+      status: z.enum(['ALL', 'NORMAL', 'BELOW_REORDER', 'CRITICAL', 'EXCESS']).default('ALL'),
+    }).parse(req.query);
+
+    const b = new SqlBuilder();
+    const catParam = b.push(category);
+    let whereClause = `ii.category = ${catParam} AND ii.deleted_at IS NULL`;
+
+    if (q.search) {
+      const s = b.push(`%${q.search}%`);
+      whereClause += ` AND (ii.item_code ILIKE ${s} OR ii.item_description ILIKE ${s} OR ii.rack_id ILIKE ${s})`;
+    }
+
+    if (q.status !== 'ALL') {
+      if (q.status === 'CRITICAL') {
+        whereClause += ` AND (ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0))`;
+      } else if (q.status === 'BELOW_REORDER') {
+        whereClause += ` AND (ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 AND NOT (ii.available_qty < ii.min_stock_level))`;
+      } else if (q.status === 'EXCESS') {
+        whereClause += ` AND (ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2))`;
+      } else if (q.status === 'NORMAL') {
+        whereClause += ` AND (ii.available_qty > ii.reorder_point OR (ii.reorder_point = 0 AND ii.available_qty > ii.min_stock_level))`;
+      }
+    }
+
+    const countSql = `SELECT COUNT(*)::int AS count FROM inventory_items ii WHERE ${whereClause}`;
+    const totalRow = await queryOne<{ count: number }>(countSql, b.params);
+    const total = totalRow?.count || 0;
+
+    const sortCol = q.sortBy === 'item_code' ? 'ii.item_code'
+      : q.sortBy === 'live_stock_qty' ? 'ii.live_stock_qty'
+      : q.sortBy === 'available_qty' ? 'ii.available_qty'
+      : 'ii.id';
+    const sortDir = q.sortDir === 'asc' ? 'ASC' : 'DESC';
+
+    const limitParam = b.push(q.pageSize);
+    const offsetParam = b.push(offsetOf(q));
+
+    const rowsSql = `
+      SELECT
+        ii.id,
+        ii.item_id,
+        ii.item_code,
+        ii.item_description,
+        ii.category,
+        ii.primary_uom,
+        ii.secondary_uom,
+        ii.conversion_factor,
+        ii.weight_per_1000pc_kg,
+        ii.opening_stock_qty,
+        ii.opening_weight_kg,
+        ii.live_stock_qty,
+        ii.live_weight_kg,
+        ii.allocated_qty,
+        ii.available_qty,
+        ii.qc_hold_qty,
+        ii.min_stock_level,
+        ii.reorder_point,
+        ii.rack_id,
+        ii.main_group,
+        ii.unit_price,
+        ROUND((ii.live_stock_qty * COALESCE(ii.unit_price, 0)), 2) AS stock_valuation,
+        ii.source_spreadsheet_id,
+        ii.source_tab,
+        ii.source_row_index,
+        ii.last_sync_at,
+        CASE
+          WHEN ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
+          WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 THEN 'BELOW_REORDER'
+          WHEN ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2) THEN 'EXCESS'
+          ELSE 'NORMAL'
+        END AS stock_status
+      FROM inventory_items ii
+      WHERE ${whereClause}
+      ORDER BY ${sortCol} ${sortDir}
+      LIMIT ${limitParam} OFFSET ${offsetParam}
+    `;
+
+    const rows = await query<any>(rowsSql, b.params);
+    sendPage(res, rows, total, q.page, q.pageSize);
+  }),
+);
+
+// 2. GET /inventory/categories/:category/summary - Category Metric Cards
+router.get(
+  '/categories/:category/summary',
+  requirePermission('inventory.view'),
+  asyncHandler(async (req, res) => {
+    const rawCategory = (req.params.category || '').toUpperCase();
+    const parseCat = categoryParam.safeParse(rawCategory);
+    if (!parseCat.success) {
+      throw ValidationError(`Invalid inventory category "${req.params.category}".`);
+    }
+    const category = parseCat.data;
+
+    const sql = `
+      SELECT
+        COUNT(*)::int AS total_items,
+        COALESCE(SUM(live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
+        COALESCE(SUM(live_weight_kg), 0)::numeric(18, 4) AS total_weight_kg,
+        COALESCE(SUM(live_stock_qty * COALESCE(unit_price, 0)), 0)::numeric(18, 2) AS total_valuation,
+        COUNT(CASE WHEN available_qty < min_stock_level OR (min_stock_level > 0 AND available_qty = 0) THEN 1 END)::int AS critical_count,
+        COUNT(CASE WHEN available_qty <= reorder_point AND reorder_point > 0 AND NOT (available_qty < min_stock_level) THEN 1 END)::int AS below_reorder_count,
+        COUNT(CASE WHEN allocated_qty > 0 THEN 1 END)::int AS reserved_items_count,
+        COALESCE(SUM(allocated_qty), 0)::numeric(18, 4) AS total_allocated_qty,
+        MAX(last_sync_at) AS last_sync_at
+      FROM inventory_items
+      WHERE category = $1 AND deleted_at IS NULL
+    `;
+
+    const stats = await queryOne<any>(sql, [category]);
+
+    // Check last sync checkpoint
+    const lastCheck = await queryOne<any>(
+      `SELECT * FROM inventory_sync_checkpoints WHERE category = $1 ORDER BY id DESC LIMIT 1`,
+      [category],
+    );
+
+    sendOk(res, {
+      category,
+      stats: {
+        totalItems: stats?.total_items || 0,
+        totalStockQty: Number(stats?.total_stock_qty || 0),
+        totalWeightKg: Number(stats?.total_weight_kg || 0),
+        totalWeightTon: Number((Number(stats?.total_weight_kg || 0) / 1000).toFixed(2)),
+        totalValuation: Number(stats?.total_valuation || 0),
+        valuationLakhs: Number((Number(stats?.total_valuation || 0) / 100000).toFixed(2)),
+        valuationCr: Number((Number(stats?.total_valuation || 0) / 10000000).toFixed(2)),
+        criticalCount: stats?.critical_count || 0,
+        belowReorderCount: stats?.below_reorder_count || 0,
+        reservedItemsCount: stats?.reserved_items_count || 0,
+        totalAllocatedQty: Number(stats?.total_allocated_qty || 0),
+        lastSyncAt: stats?.last_sync_at,
+      },
+      lastSync: lastCheck || null,
+    });
+  }),
+);
+
+// 3. GET /inventory/categories/:category/transactions - Category Movement Ledger
+router.get(
+  '/categories/:category/transactions',
+  requirePermission('inventory.view'),
+  asyncHandler(async (req, res) => {
+    const rawCategory = (req.params.category || '').toUpperCase();
+    const parseCat = categoryParam.safeParse(rawCategory);
+    if (!parseCat.success) {
+      throw ValidationError(`Invalid inventory category "${req.params.category}".`);
+    }
+    const category = parseCat.data;
+
+    const q = listQuerySchema.extend({
+      txnType: z.string().trim().optional(),
+      itemCode: z.string().trim().optional(),
+      dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }).parse(req.query);
+
+    const b = new SqlBuilder();
+    const catP = b.push(category);
+    let whereClause = `category = ${catP}`;
+
+    if (q.search) {
+      const s = b.push(`%${q.search}%`);
+      whereClause += ` AND (item_code ILIKE ${s} OR reference_doc_no ILIKE ${s} OR txn_no ILIKE ${s} OR notes ILIKE ${s})`;
+    }
+    if (q.itemCode) {
+      const ic = b.push(q.itemCode);
+      whereClause += ` AND UPPER(item_code) = UPPER(${ic})`;
+    }
+    if (q.txnType) {
+      const tt = b.push(q.txnType);
+      whereClause += ` AND txn_type = ${tt}`;
+    }
+    if (q.dateFrom) {
+      const df = b.push(q.dateFrom);
+      whereClause += ` AND txn_date >= ${df}::date`;
+    }
+    if (q.dateTo) {
+      const dt = b.push(q.dateTo);
+      whereClause += ` AND txn_date <= ${dt}::date`;
+    }
+
+    const countSql = `SELECT COUNT(*)::int AS count FROM inventory_transactions WHERE ${whereClause}`;
+    const totalRow = await queryOne<{ count: number }>(countSql, b.params);
+    const total = totalRow?.count || 0;
+
+    const limitP = b.push(q.pageSize);
+    const offsetP = b.push(offsetOf(q));
+
+    const rowsSql = `
+      SELECT
+        id, txn_no, category, item_id, item_code, txn_type, direction,
+        quantity, weight_kg, uom, rate, amount,
+        balance_qty_after, balance_weight_after,
+        reference_doc_type, reference_doc_no,
+        from_location, to_location, department,
+        status, notes, created_by_name, txn_date, created_at
+      FROM inventory_transactions
+      WHERE ${whereClause}
+      ORDER BY id DESC
+      LIMIT ${limitP} OFFSET ${offsetP}
+    `;
+
+    const rows = await query<any>(rowsSql, b.params);
+    sendPage(res, rows, total, q.page, q.pageSize);
+  }),
+);
+
+// 4. POST /inventory/categories/:category/transactions - Post Atomic Category Movement
+router.post(
+  '/categories/:category/transactions',
+  requirePermission('inventory.adjust'),
+  asyncHandler(async (req, res) => {
+    const rawCategory = (req.params.category || '').toUpperCase();
+    const parseCat = categoryParam.safeParse(rawCategory);
+    if (!parseCat.success) {
+      throw ValidationError(`Invalid inventory category "${req.params.category}".`);
+    }
+    const category = parseCat.data;
+
+    const bodySchema = z.object({
+      itemId: z.number().int().positive(),
+      txnType: z.string().trim().min(1),
+      direction: z.enum(['IN', 'OUT', 'ADJUST']),
+      quantity: z.number().positive(),
+      weightKg: z.number().optional().nullable(),
+      uom: z.string().trim().default('Nos'),
+      rate: z.number().optional().nullable(),
+      amount: z.number().optional().nullable(),
+      referenceDocType: z.string().optional().nullable(),
+      referenceDocNo: z.string().optional().nullable(),
+      fromLocation: z.string().optional().nullable(),
+      toLocation: z.string().optional().nullable(),
+      department: z.string().optional().nullable(),
+      notes: z.string().optional().nullable(),
+      txnDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+    });
+
+    const parsed = bodySchema.parse(req.body);
+    const actor = actorFrom(req);
+
+    const result = await withTransaction(async (tx) => {
+      return recordInventoryMovement(tx, {
+        ...parsed,
+        category,
+        userId: actor.userId,
+        userName: actor.name,
+      });
+    });
+
+    sendCreated(res, {
+      ...result,
+      message: `Transaction ${result.txnNo} recorded successfully. New balance: ${result.balanceQtyAfter} ${parsed.uom}.`,
+    });
+  }),
+);
+
+// 5. POST /inventory/sync/:category - Trigger Category Google Sheets Sync
+router.post(
+  '/sync/:category',
+  requirePermission('inventory.adjust'),
+  asyncHandler(async (req, res) => {
+    const rawCategory = (req.params.category || '').toUpperCase();
+    const parseCat = categoryParam.safeParse(rawCategory);
+    if (!parseCat.success) {
+      throw ValidationError(`Invalid inventory category "${req.params.category}".`);
+    }
+    const category = parseCat.data;
+
+    const result = await syncCategoryFromSheet(category);
+    sendOk(res, result);
+  }),
+);
+
+// 6. POST /inventory/sync-all - Trigger Sync for all 5 categories
+router.post(
+  '/sync-all',
+  requirePermission('inventory.adjust'),
+  asyncHandler(async (_req, res) => {
+    const results = await syncAllInventoryCategories();
+    sendOk(res, results);
+  }),
+);
+
+// 7. GET /inventory/sync/status - Latest sync status for all categories
+router.get(
+  '/sync/status',
+  requirePermission('inventory.view'),
+  asyncHandler(async (_req, res) => {
+    const rows = await query<any>(`
+      SELECT DISTINCT ON (category)
+        id, category, spreadsheet_id, tab_name, total_rows_read,
+        valid_records_imported, quarantined_records, status, error_message,
+        sync_duration_ms, created_at
+      FROM inventory_sync_checkpoints
+      ORDER BY category, id DESC
+    `);
+
+    sendOk(res, rows);
   }),
 );
 

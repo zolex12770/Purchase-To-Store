@@ -31,10 +31,16 @@ async function main() {
   console.log('========================================================================\n');
 
   // 1. Sign in as Super Admin
-  const login = await request(
+  let login = await request(
     { hostname: '127.0.0.1', port: 4001, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
-    { employeeId: '10221', password: 'Admin@123' },
+    { employeeId: '10221', password: 'Admin@12345' },
   );
+  if (!login.data?.success) {
+    login = await request(
+      { hostname: '127.0.0.1', port: 4001, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
+      { employeeId: '10221', password: 'Admin@123' },
+    );
+  }
   if (!login.data?.success) {
     throw new Error('Failed to sign in as Super Admin: ' + JSON.stringify(login.data));
   }

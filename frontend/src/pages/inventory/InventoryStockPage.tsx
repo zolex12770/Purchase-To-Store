@@ -15,7 +15,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Zap, Download, CheckCircle2, XCircle, FileText,
   Boxes, ArrowRight, History, ClipboardCheck,
-  PackageSearch, Plus, LayoutDashboard, PackageMinus,
+  PackageSearch, Plus, LayoutDashboard, PackageMinus, Package,
+  RefreshCw, Layers, PackageCheck, Tag,
 } from 'lucide-react';
 import { api, downloadFile, qs, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
@@ -30,6 +31,7 @@ import {
   Modal, Field, Textarea, Select, Input,
 } from '../../components/ui';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
+import { CategoryWorkspaceView, type InventoryCategoryKey } from './CategoryWorkspaceView';
 
 /* ── Type Interfaces ────────────────────────────────────────────────────────── */
 
@@ -483,6 +485,21 @@ export default function InventoryStockPage() {
       navigate(`/indents/${res.indentId}`);
     },
     onError: (err) => toast.fromError(err, 'Failed to convert suggestion to indent'),
+  });
+
+  // Sync All 5 Google Sheets
+  const syncAllMutation = useMutation({
+    mutationFn: () => api.post<Array<{ category: string; validRecordsImported: number; quarantinedRecords: number }>>('/inventory/sync-all'),
+    onSuccess: (results) => {
+      const totalImported = results.reduce((acc, r) => acc + (r.validRecordsImported || 0), 0);
+      const totalQuarantined = results.reduce((acc, r) => acc + (r.quarantinedRecords || 0), 0);
+      toast.success(`Synchronized all 5 Google Sheets: ${count(totalImported)} valid records imported, ${count(totalQuarantined)} quarantined.`);
+      void qc.invalidateQueries({ queryKey: ['inventory-overview'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-category-summary'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-category-items'] });
+    },
+    onError: (err) => toast.fromError(err, 'Failed to synchronize all Google Sheets'),
   });
 
   /* ── Export Handlers ────────────────────────────────────────────────────── */
@@ -1151,7 +1168,12 @@ export default function InventoryStockPage() {
         <Tabs
           tabs={[
             { key: 'overview', label: 'Overview & Analytics', icon: <LayoutDashboard size={16} /> },
-            { key: 'stock', label: 'Stock Register (FG/RM/Gen)', icon: <Boxes size={16} /> },
+            { key: 'rm', label: 'Raw Material (RM)', icon: <Layers size={16} /> },
+            { key: 'fg', label: 'Finished Goods (FG)', icon: <PackageCheck size={16} /> },
+            { key: 'wip', label: 'Work in Progress (WIP)', icon: <Boxes size={16} /> },
+            { key: 'trading', label: 'Trading Materials', icon: <Tag size={16} /> },
+            { key: 'general', label: 'General Stores & Spares', icon: <Package size={16} /> },
+            { key: 'stock', label: 'Unified Stock Register', icon: <Boxes size={16} /> },
             { key: 'ledger', label: 'Movement Ledger', icon: <History size={16} /> },
             { key: 'adjustments', label: 'Physical Adjustments', icon: <ClipboardCheck size={16} /> },
             {
@@ -1219,6 +1241,195 @@ export default function InventoryStockPage() {
               sub="Above maximum inventory limit"
             />
           </div>
+
+          {/* Factory Store Quick Action Hub */}
+          <Card>
+            <CardHeader
+              title="Factory Store Quick Action Hub"
+              subtitle="Direct operational access to category workspaces, rapid store issues, physical counts, and live sheet synchronization"
+              actions={
+                can('inventory.adjust') && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    icon={<RefreshCw size={13} className={syncAllMutation.isPending ? 'spin' : ''} />}
+                    loading={syncAllMutation.isPending}
+                    onClick={() => syncAllMutation.mutate()}
+                  >
+                    Sync All 5 Google Sheets
+                  </Button>
+                )
+              }
+            />
+            <CardBody>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                  gap: 'var(--sp-3)',
+                }}
+              >
+                <div
+                  onClick={() => setTab('rm')}
+                  style={{
+                    padding: 'var(--sp-3)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    backgroundColor: 'var(--surface)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+                    <Layers size={18} color="var(--brand-600)" />
+                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Raw Material (RM)</span>
+                  </div>
+                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+                    Ton & Kg dual-units, Copper / Aluminium stock & sheet sync
+                  </span>
+                </div>
+
+                <div
+                  onClick={() => setTab('fg')}
+                  style={{
+                    padding: 'var(--sp-3)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    backgroundColor: 'var(--surface)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+                    <PackageCheck size={18} color="var(--success-600)" />
+                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Finished Goods (FG)</span>
+                  </div>
+                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+                    Nos & Weight dual-units, series tags & dispatch availability
+                  </span>
+                </div>
+
+                <div
+                  onClick={() => setTab('wip')}
+                  style={{
+                    padding: 'var(--sp-3)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    backgroundColor: 'var(--surface)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+                    <Boxes size={18} color="var(--neutral-600)" />
+                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Work in Progress (WIP)</span>
+                  </div>
+                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+                    Sheet Metal, Plating, Assembly intermediate stages
+                  </span>
+                </div>
+
+                <div
+                  onClick={() => setTab('trading')}
+                  style={{
+                    padding: 'var(--sp-3)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    backgroundColor: 'var(--surface)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+                    <Tag size={18} color="var(--warning-600)" />
+                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Trading Materials</span>
+                  </div>
+                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+                    Resale materials, purchase rates & reorder tracking
+                  </span>
+                </div>
+
+                <div
+                  onClick={() => setTab('general')}
+                  style={{
+                    padding: 'var(--sp-3)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    backgroundColor: 'var(--surface)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+                    <Package size={18} color="var(--neutral-800)" />
+                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>General Stores & Spares</span>
+                  </div>
+                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+                    Packaging (Bag/Box), Hardware, Safety, Electrical & Consumables
+                  </span>
+                </div>
+
+                <div
+                  onClick={() => navigate('/inventory/direct-issue')}
+                  style={{
+                    padding: 'var(--sp-3)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    backgroundColor: 'var(--surface)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+                    <PackageMinus size={18} color="var(--danger-600)" />
+                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Direct Store Issue</span>
+                  </div>
+                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+                    Urgent counter issue directly without prior requisition
+                  </span>
+                </div>
+
+                <div
+                  onClick={() => {
+                    setSelectedAdjItem(null);
+                    setAdjItemSearch('');
+                    setAdjActualCount('');
+                    setIsAdjModalOpen(true);
+                  }}
+                  style={{
+                    padding: 'var(--sp-3)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    backgroundColor: 'var(--surface)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+                    <ClipboardCheck size={18} color="var(--brand-600)" />
+                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Physical Count Audit</span>
+                  </div>
+                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+                    Cycle count physical reconciliation & variance audit
+                  </span>
+                </div>
+              </div>
+            </CardBody>
+          </Card>
 
           {/* Operational Pipeline & Day Movements */}
           <div
@@ -1365,6 +1576,28 @@ export default function InventoryStockPage() {
             </CardBody>
           </Card>
         </div>
+      )}
+
+      {/* ── CATEGORY WORKSPACES (RM, FG, WIP, TRADING, GENERAL) ───────────── */}
+      {['rm', 'fg', 'wip', 'trading', 'general'].includes(currentTab) && (
+        <CategoryWorkspaceView
+          category={currentTab.toUpperCase() as InventoryCategoryKey}
+          onOpenAdjustment={(item) => {
+            setSelectedAdjItem({
+              id: item.id,
+              code: item.code,
+              description: item.description,
+              category: item.category,
+              currentStock: item.currentStock,
+              uom: item.uom,
+            });
+            setAdjActualCount(String(item.currentStock));
+            setAdjReason('Cycle Count Reconciliation');
+            setAdjFindings('');
+            setAdjRemarks('');
+            setIsAdjModalOpen(true);
+          }}
+        />
       )}
 
       {/* ── 2. STOCK REGISTER TAB ──────────────────────────────────────────────── */}
