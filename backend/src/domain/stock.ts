@@ -329,3 +329,66 @@ export async function issueDirectStoreLine(
 
   return { newBalance };
 }
+
+/**
+ * Applies a physical count audit adjustment to an item.
+ * Calculates delta = actualStockQty - live_stock_qty.
+ * Updates items.live_stock_qty to actualStockQty.
+ * Records the adjustment in stock_ledger under STOCK_ADJUSTMENT.
+ */
+export async function adjustStockPhysicalCount(
+  tx: Queryable,
+  itemRef: { item_id: number; uom_id: number | null },
+  actualQty: string,
+  ctx: {
+    adjustmentId: number;
+    adjustmentNo: string;
+    adjustmentDate: string;
+    reason: string;
+    findings?: string;
+    userId: number | null;
+  },
+): Promise<{ previousBalance: string; newBalance: string; deltaQty: string }> {
+  const item = await txQueryOne<{ id: number; item_code: string; live_stock_qty: string }>(
+    tx, 'SELECT id, item_code, live_stock_qty FROM items WHERE id = $1 FOR UPDATE', [itemRef.item_id],
+  );
+  if (!item) throw new Error(`Item ${itemRef.item_id} not found while adjusting stock.`);
+
+  const current = dec(item.live_stock_qty ?? '0');
+  const actual = dec(actualQty);
+  if (actual.isNegative()) {
+    throw BusinessRuleError(
+      `Actual stock quantity cannot be negative (specified: ${toQty(actual)}).`,
+      { itemCode: item.item_code, actualQty: toQty(actual) },
+    );
+  }
+
+  const delta = actual.minus(current);
+  const finalBalance = toQty(actual);
+  await tx.query('UPDATE items SET live_stock_qty = $2, updated_at = now() WHERE id = $1', [itemRef.item_id, finalBalance]);
+
+  const isInward = delta.isPositive();
+  await tx.query(
+    `INSERT INTO stock_ledger
+       (item_id, txn_type, reference_type, reference_id, reference_no,
+        inward_qty, outward_qty, balance_qty, uom_id, txn_date, created_by)
+     VALUES ($1, 'STOCK_ADJUSTMENT', 'STOCK_ADJUSTMENT', $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [
+      itemRef.item_id,
+      ctx.adjustmentId,
+      ctx.adjustmentNo,
+      isInward ? toQty(delta) : 0,
+      isInward ? 0 : toQty(delta.abs()),
+      finalBalance,
+      itemRef.uom_id,
+      ctx.adjustmentDate,
+      ctx.userId,
+    ],
+  );
+
+  return {
+    previousBalance: toQty(current),
+    newBalance: finalBalance,
+    deltaQty: toQty(delta),
+  };
+}

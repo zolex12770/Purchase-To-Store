@@ -14,7 +14,7 @@ import {
   PanelLeftClose, PanelLeft, RefreshCw, Package, Building2, Tags, Users as UsersIcon,
   ScrollText, HardDriveDownload, ArrowLeftRight, Settings, CircleAlert, Zap, X,
   Sun, Moon, MonitorCog, Tag, ClipboardList, PackageSearch, PackageCheck, ListChecks, Home,
-  ShieldCheck, Boxes, PackageMinus,
+  ShieldCheck, Boxes, PackageMinus, History, ClipboardCheck,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth';
 import { useTheme, type ThemePreference } from '../lib/theme';
@@ -114,11 +114,15 @@ const NAV: (NavItem | NavGroup)[] = [
     ],
   },
   {
-    label: 'Inventory & Stock', icon: <Boxes size={17} />, base: '/inventory', permission: 'auto_indent.view', accent: 'var(--module-master)',
+    label: 'Inventory & Stock', icon: <Boxes size={17} />, base: '/inventory', anyOf: ['inventory.view', 'auto_indent.view', 'direct_issue.view', 'requisition.issue'], accent: 'var(--module-master)',
     items: [
-      { to: '/inventory?tab=stock', label: 'Stock & Reorder Status', icon: <Package size={15} />, permission: 'auto_indent.view' },
+      { to: '/inventory?tab=overview', label: 'Inventory Overview', icon: <LayoutDashboard size={15} />, anyOf: ['inventory.view', 'auto_indent.view'] },
+      { to: '/inventory?tab=stock', label: 'Stock Register (FG/RM/Gen)', icon: <Package size={15} />, anyOf: ['inventory.view', 'auto_indent.view'] },
+      { to: '/inventory?tab=ledger', label: 'Stock Movement Ledger', icon: <History size={15} />, anyOf: ['inventory.view', 'auto_indent.view'] },
+      { to: '/inventory?tab=adjustments', label: 'Physical Count Adjustments', icon: <ClipboardCheck size={15} />, anyOf: ['inventory.adjust', 'inventory.view', 'auto_indent.view'] },
+      { to: '/inventory?tab=requisition-queue', label: 'Store Requisition Queue', icon: <PackageSearch size={15} />, anyOf: ['inventory.view', 'requisition.issue', 'auto_indent.view'] },
       { to: '/inventory/direct-issue', label: 'Direct Issue from Store', icon: <PackageMinus size={15} />, anyOf: ['direct_issue.view', 'auto_indent.view', 'requisition.issue'] },
-      { to: '/inventory?tab=auto-indent', label: 'Auto Indent Queue', icon: <Zap size={15} />, permission: 'auto_indent.view' },
+      { to: '/inventory?tab=auto-indent', label: 'Auto Indent Replenish', icon: <Zap size={15} />, anyOf: ['auto_indent.view', 'inventory.view'] },
     ],
   },
   {

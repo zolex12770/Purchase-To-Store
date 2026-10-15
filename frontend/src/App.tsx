@@ -195,10 +195,10 @@ export default function App() {
                 <Route path="/requisitions/:id" element={guard('requisition.view', <RequisitionDetail />)} />
                 <Route path="/requisitions/:id/edit" element={guard('requisition.edit', <RequisitionForm />)} />
 
-                <Route path="/inventory" element={guard('auto_indent.view', <InventoryStockPage />)} />
-                <Route path="/inventory/stock" element={guard('auto_indent.view', <InventoryStockPage />)} />
-                <Route path="/inventory/direct-issue" element={<RequirePermission permission="direct_issue.view" anyOf={['direct_issue.view', 'auto_indent.view', 'requisition.issue']}><DirectIssuePage /></RequirePermission>} />
-                <Route path="/inventory/auto-indent" element={guard('auto_indent.view', <InventoryStockPage />)} />
+                <Route path="/inventory" element={<RequirePermission permission="inventory.view" anyOf={['inventory.view', 'auto_indent.view']}><InventoryStockPage /></RequirePermission>} />
+                <Route path="/inventory/stock" element={<RequirePermission permission="inventory.view" anyOf={['inventory.view', 'auto_indent.view']}><InventoryStockPage /></RequirePermission>} />
+                <Route path="/inventory/direct-issue" element={<RequirePermission permission="direct_issue.view" anyOf={['direct_issue.view', 'auto_indent.view', 'requisition.issue', 'inventory.view']}><DirectIssuePage /></RequirePermission>} />
+                <Route path="/inventory/auto-indent" element={<RequirePermission permission="auto_indent.view" anyOf={['auto_indent.view', 'inventory.view']}><InventoryStockPage /></RequirePermission>} />
 
                 <Route path="/qc" element={guard('qc.view', <QcPage />)} />
                 <Route path="/qc/inspections" element={guard('qc.view', <QcPage />)} />

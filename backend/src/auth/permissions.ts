@@ -9,6 +9,7 @@
 export const ACTIONS = [
   'view', 'create', 'edit', 'delete', 'approve', 'reject', 'issue',
   'export', 'import', 'print', 'analyze', 'admin', 'inspect', 'config',
+  'adjust',
 ] as const;
 export type Action = (typeof ACTIONS)[number];
 
@@ -166,6 +167,15 @@ const MODULES: ModuleDef[] = [
     },
   },
   {
+    module: 'inventory',
+    label: 'Inventory Management',
+    actions: {
+      view: 'View inventory dashboard, stock register, and movement history',
+      adjust: 'Adjust physical stock counts and audit book balances',
+      export: 'Export stock register and inventory reports to CSV',
+    },
+  },
+  {
     module: 'system',
     label: 'System Administration',
     actions: { admin: 'Manage settings and system configuration' },
@@ -219,6 +229,7 @@ export const ROLES: RoleDef[] = [
       'po.view', 'po.create', 'po.edit', 'po.approve', 'po.export', 'po.print', 'po.analyze',
       'grn.view', 'grn.export', 'grn.print', 'grn.analyze',
       'qc.view', 'auto_indent.view', 'auto_indent.approve',
+      'inventory.view', 'inventory.export',
       'item.export', 'supplier.export',
       // A Purchase Head is very often ALSO a department HOD — same
       // "explicit permission, never a blanket role check" self-approval
@@ -238,7 +249,7 @@ export const ROLES: RoleDef[] = [
       'indent.export', 'indent.print', 'indent.analyze',
       'po.view', 'po.create', 'po.edit', 'po.delete', 'po.export', 'po.print', 'po.analyze',
       'grn.view', 'grn.print',
-      'auto_indent.view',
+      'auto_indent.view', 'inventory.view',
       'item.create', 'item.edit', 'supplier.create', 'supplier.edit',
       'requisition.view', 'requisition.create', 'requisition.edit', 'requisition.print',
     ],
@@ -256,6 +267,7 @@ export const ROLES: RoleDef[] = [
       'grn.export', 'grn.print', 'grn.analyze',
       'qc.view', 'qc.inspect', 'qc.approve',
       'auto_indent.view', 'auto_indent.approve',
+      'inventory.view', 'inventory.adjust', 'inventory.export',
       'requisition.view', 'requisition.create', 'requisition.edit', 'requisition.issue',
       'requisition.print', 'requisition.analyze',
       'direct_issue.view', 'direct_issue.create', 'direct_issue.print', 'direct_issue.export',
@@ -267,9 +279,9 @@ export const ROLES: RoleDef[] = [
     description: 'Read-only analytical access with full drill-down to source transactions.',
     permissions: [
       'dashboard.view', 'dashboard.analyze', 'dashboard.export',
-      ...viewAll(['item', 'supplier', 'lookup', 'indent', 'po', 'grn', 'audit', 'sync', 'requisition', 'qc', 'auto_indent', 'direct_issue']),
+      ...viewAll(['item', 'supplier', 'lookup', 'indent', 'po', 'grn', 'audit', 'sync', 'requisition', 'qc', 'auto_indent', 'direct_issue', 'inventory']),
       'indent.analyze', 'po.analyze', 'grn.analyze', 'requisition.analyze',
-      'indent.export', 'po.export', 'grn.export', 'requisition.export', 'direct_issue.export',
+      'indent.export', 'po.export', 'grn.export', 'requisition.export', 'direct_issue.export', 'inventory.export',
       'indent.print', 'po.print', 'grn.print', 'requisition.print', 'direct_issue.print',
     ],
   },
@@ -279,7 +291,7 @@ export const ROLES: RoleDef[] = [
     description: 'Read-only access to permitted screens.',
     permissions: [
       'dashboard.view',
-      ...viewAll(['item', 'supplier', 'lookup', 'indent', 'po', 'grn', 'requisition', 'qc', 'auto_indent']),
+      ...viewAll(['item', 'supplier', 'lookup', 'indent', 'po', 'grn', 'requisition', 'qc', 'auto_indent', 'inventory']),
     ],
   },
   {

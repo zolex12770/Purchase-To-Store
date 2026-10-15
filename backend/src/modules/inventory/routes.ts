@@ -15,7 +15,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import {
-  asyncHandler, sendOk, sendPage, validateBody, validateQuery, parsedQuery,
+  asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery, parsedQuery,
   listQuerySchema, offsetOf, idParam, csvIdArray, toKolkataStartOfDay, toKolkataEndOfDay,
 } from '../../core/http.js';
 import { NotFoundError, ValidationError, BusinessRuleError } from '../../core/errors.js';
@@ -24,6 +24,7 @@ import { actorFrom, auditIn } from '../../core/audit.js';
 import { nextDocumentNumber, dateStamp, timeStamp } from '../../domain/numbering.js';
 import { toQty, toRate } from '../../domain/money.js';
 import { toShortUom } from '../../domain/uom.js';
+import { adjustStockPhysicalCount } from '../../domain/stock.js';
 import directIssueRoutes from './direct-issue.routes.js';
 
 const router = Router();
@@ -31,9 +32,149 @@ router.use('/direct-issues', directIssueRoutes);
 
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 
+/* ── GET /inventory/overview ────────────────────────────────────────────────── */
+
+router.get(
+  '/overview',
+  requireAnyPermission('inventory.view', 'auto_indent.view'),
+  asyncHandler(async (_req, res) => {
+    // 1. Overall stock health stats
+    const statsSql = `
+      SELECT
+        COUNT(*)::int AS total_items,
+        COALESCE(SUM(i.live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
+        COALESCE(SUM(i.live_stock_qty * COALESCE(i.standard_rate, 0)), 0)::numeric(18, 2) AS total_valuation,
+        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
+                     OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
+                   THEN 1 END)::int AS critical_stock,
+        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
+                     AND COALESCE(i.reorder_level, 0) > 0
+                     AND NOT (GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
+                              OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0))
+                   THEN 1 END)::int AS below_reorder,
+        COUNT(CASE WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
+                     AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock
+                   THEN 1 END)::int AS excess_stock,
+        COUNT(CASE WHEN NOT (GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0) AND COALESCE(i.reorder_level, 0) > 0)
+                     AND NOT (GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
+                              OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0))
+                     AND NOT (i.max_stock IS NOT NULL AND i.max_stock > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock)
+                   THEN 1 END)::int AS normal_stock
+        FROM items i
+        LEFT JOIN (
+          SELECT rl.item_id, SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) AS allocated_qty
+            FROM requisition_lines rl
+            JOIN requisition_headers rh ON rh.id = rl.requisition_id
+            JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
+           WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
+           GROUP BY rl.item_id
+        ) req ON req.item_id = i.id
+       WHERE i.deleted_at IS NULL AND i.is_active = TRUE
+    `;
+    const stats = await queryOne<Record<string, unknown>>(statsSql);
+
+    // 2. Category distribution
+    const catSql = `
+      SELECT
+        i.inventory_category AS category,
+        COUNT(*)::int AS item_count,
+        COALESCE(SUM(i.live_stock_qty), 0)::numeric(18, 4) AS stock_qty,
+        COALESCE(SUM(i.live_stock_qty * COALESCE(i.standard_rate, 0)), 0)::numeric(18, 2) AS valuation,
+        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
+                     OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
+                   THEN 1 END)::int AS critical_count,
+        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
+                     AND COALESCE(i.reorder_level, 0) > 0
+                   THEN 1 END)::int AS below_reorder_count
+        FROM items i
+        LEFT JOIN (
+          SELECT rl.item_id, SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) AS allocated_qty
+            FROM requisition_lines rl
+            JOIN requisition_headers rh ON rh.id = rl.requisition_id
+            JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
+           WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
+           GROUP BY rl.item_id
+        ) req ON req.item_id = i.id
+       WHERE i.deleted_at IS NULL AND i.is_active = TRUE
+       GROUP BY i.inventory_category
+       ORDER BY i.inventory_category
+    `;
+    const catRows = await query<Record<string, unknown>>(catSql);
+
+    // 3. Pipeline activity
+    const indentsSummary = await queryOne<{ count: string; qty: string }>(
+      `SELECT COUNT(DISTINCT indent_id)::int AS count, COALESCE(SUM(pending_qty), 0)::numeric(18, 4) AS qty
+         FROM v_indent_line_balance WHERE indent_status IN ('APPROVED', 'PENDING_APPROVAL')`,
+    );
+    const posSummary = await queryOne<{ count: string; qty: string }>(
+      `SELECT COUNT(DISTINCT po_id)::int AS count, COALESCE(SUM(pending_grn_qty), 0)::numeric(18, 4) AS qty
+         FROM v_po_line_balance WHERE is_receivable = TRUE`,
+    );
+    const reqsSummary = await queryOne<{ count: string; qty: string }>(
+      `SELECT COUNT(DISTINCT rh.id)::int AS count, COALESCE(SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)), 0)::numeric(18, 4) AS qty
+         FROM requisition_lines rl
+         JOIN requisition_headers rh ON rh.id = rl.requisition_id
+         JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
+        WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')`,
+    );
+
+    // 4. Today's movement
+    const todayMovements = await queryOne<{ inward_qty: string; outward_qty: string; txns_count: string }>(
+      `SELECT
+         COALESCE(SUM(inward_qty), 0)::numeric(18, 4) AS inward_qty,
+         COALESCE(SUM(outward_qty), 0)::numeric(18, 4) AS outward_qty,
+         COUNT(*)::int AS txns_count
+        FROM stock_ledger
+       WHERE txn_date = CURRENT_DATE`,
+    );
+
+    // 5. Recent 10 ledger movements
+    const recentLedger = await query<Record<string, unknown>>(
+      `SELECT sl.id, sl.item_id, i.item_code, i.item_description, i.inventory_category AS category,
+              COALESCE(u.code, '') AS uom_code,
+              sl.txn_type, sl.reference_type, sl.reference_id, sl.reference_no,
+              sl.inward_qty, sl.outward_qty, sl.balance_qty, sl.txn_date,
+              sl.created_at, usr.employee_name AS created_by_name
+         FROM stock_ledger sl
+         JOIN items i ON i.id = sl.item_id
+         LEFT JOIN lookups u ON u.id = sl.uom_id
+         LEFT JOIN users usr ON usr.id = sl.created_by
+        ORDER BY sl.id DESC
+        LIMIT 10`,
+    );
+
+    sendOk(res, {
+      kpis: {
+        totalItems: Number(stats?.total_items ?? 0),
+        totalStockQty: Number(stats?.total_stock_qty ?? 0),
+        totalValuation: Number(stats?.total_valuation ?? 0),
+        normalStock: Number(stats?.normal_stock ?? 0),
+        belowReorder: Number(stats?.below_reorder ?? 0),
+        criticalStock: Number(stats?.critical_stock ?? 0),
+        excessStock: Number(stats?.excess_stock ?? 0),
+        pendingIndentsCount: Number(indentsSummary?.count ?? 0),
+        pendingIndentsQty: Number(indentsSummary?.qty ?? 0),
+        pendingPosCount: Number(posSummary?.count ?? 0),
+        pendingPosQty: Number(posSummary?.qty ?? 0),
+        pendingRequisitionsCount: Number(reqsSummary?.count ?? 0),
+        pendingRequisitionsQty: Number(reqsSummary?.qty ?? 0),
+        todayInwardQty: Number(todayMovements?.inward_qty ?? 0),
+        todayOutwardQty: Number(todayMovements?.outward_qty ?? 0),
+        todayTxnsCount: Number(todayMovements?.txns_count ?? 0),
+      },
+      categoryBreakdown: catRows,
+      recentMovements: recentLedger.map((r) => ({
+        ...r,
+        uom_code: toShortUom(r.uom_code as string),
+      })),
+    });
+  }),
+);
+
 /* ── GET /inventory/stock ───────────────────────────────────────────────────── */
 
 const stockQuerySchema = listQuerySchema.extend({
+  category: z.enum(['ALL', 'GENERAL', 'RM', 'FG', 'TRADING', 'WIP']).default('ALL'),
   departmentId: csvIdArray,
   costCentreId: csvIdArray,
   itemTypeId: csvIdArray,
@@ -46,13 +187,16 @@ const stockQuerySchema = listQuerySchema.extend({
 
 router.get(
   '/stock',
-  requirePermission('auto_indent.view'),
+  requireAnyPermission('inventory.view', 'auto_indent.view'),
   validateQuery(stockQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof stockQuerySchema>>(res);
     const b = new SqlBuilder();
 
     b.addRaw('i.deleted_at IS NULL AND i.is_active = TRUE');
+    if (q.category && q.category !== 'ALL') {
+      b.add('i.inventory_category = ?', q.category);
+    }
     b.addIn('i.department_id', q.departmentId);
     b.addIn('i.cost_centre_id', q.costCentreId);
     b.addIn('i.item_type_id', q.itemTypeId);
@@ -148,15 +292,30 @@ router.get(
       below_reorder: string;
       critical_stock: string;
       excess_stock: string;
+      total_valuation: string;
+      total_fg: string;
+      total_rm: string;
+      total_trading: string;
+      total_general: string;
+      total_wip: string;
     }>(
       `SELECT
          COUNT(*) AS total_active,
          COUNT(CASE WHEN t.stock_status = 'NORMAL' THEN 1 END) AS normal_stock,
          COUNT(CASE WHEN t.stock_status = 'BELOW_REORDER' THEN 1 END) AS below_reorder,
          COUNT(CASE WHEN t.stock_status = 'CRITICAL' THEN 1 END) AS critical_stock,
-         COUNT(CASE WHEN t.stock_status = 'EXCESS' THEN 1 END) AS excess_stock
+         COUNT(CASE WHEN t.stock_status = 'EXCESS' THEN 1 END) AS excess_stock,
+         COALESCE(SUM(t.live_stock_qty * COALESCE(t.standard_rate, 0)), 0) AS total_valuation,
+         COUNT(CASE WHEN t.inventory_category = 'FG' THEN 1 END) AS total_fg,
+         COUNT(CASE WHEN t.inventory_category = 'RM' THEN 1 END) AS total_rm,
+         COUNT(CASE WHEN t.inventory_category = 'TRADING' THEN 1 END) AS total_trading,
+         COUNT(CASE WHEN t.inventory_category = 'GENERAL' THEN 1 END) AS total_general,
+         COUNT(CASE WHEN t.inventory_category = 'WIP' THEN 1 END) AS total_wip
        FROM (
          SELECT i.id,
+                i.inventory_category,
+                i.live_stock_qty,
+                i.standard_rate,
                 CASE
                   WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
                        OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
@@ -169,8 +328,8 @@ router.get(
                     THEN 'EXCESS'
                   ELSE 'NORMAL'
                 END AS stock_status
-         ${baseFrom}
-         ${b.where()}
+          ${baseFrom}
+          ${b.where()}
        ) t`,
       b.params,
     );
@@ -183,6 +342,9 @@ router.get(
         SELECT i.id AS item_id,
                i.item_code,
                i.item_description,
+               i.inventory_category AS category,
+               COALESCE(i.opening_stock_qty, 0) AS opening_stock_qty,
+               ROUND((i.live_stock_qty * COALESCE(i.standard_rate, 0)), 2) AS stock_valuation,
                u.id AS uom_id,
                COALESCE(u.code, '') AS uom_code,
                COALESCE(u.name, '') AS uom_name,
@@ -250,6 +412,14 @@ router.get(
         belowReorder: Number(summaryRow?.below_reorder ?? 0),
         criticalStock: Number(summaryRow?.critical_stock ?? 0),
         excessStock: Number(summaryRow?.excess_stock ?? 0),
+        totalValuation: Number(summaryRow?.total_valuation ?? 0),
+        categories: {
+          FG: Number(summaryRow?.total_fg ?? 0),
+          RM: Number(summaryRow?.total_rm ?? 0),
+          TRADING: Number(summaryRow?.total_trading ?? 0),
+          GENERAL: Number(summaryRow?.total_general ?? 0),
+          WIP: Number(summaryRow?.total_wip ?? 0),
+        },
       },
     });
   }),
@@ -259,18 +429,22 @@ router.get(
 
 router.get(
   '/stock/export',
-  requirePermission('auto_indent.view'),
+  requireAnyPermission('inventory.export', 'inventory.view', 'auto_indent.view'),
   validateQuery(stockQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof stockQuerySchema>>(res);
     const b = new SqlBuilder();
 
     b.addRaw('i.deleted_at IS NULL AND i.is_active = TRUE');
+    if (q.category && q.category !== 'ALL') {
+      b.add('i.inventory_category = ?', q.category);
+    }
     b.addIn('i.department_id', q.departmentId);
     b.addIn('i.cost_centre_id', q.costCentreId);
     b.addIn('i.item_type_id', q.itemTypeId);
     b.addIn('i.main_group_id', q.mainGroupId);
     b.addIn('i.sub_main_group_id', q.subMainGroupId);
+    b.addIn('i.id', q.itemId);
 
     if (q.search) {
       const p = b.push(`%${q.search.toLowerCase()}%`);
@@ -281,6 +455,8 @@ router.get(
 
     const selectSql = `
       SELECT i.item_code, i.item_description,
+             i.inventory_category AS category,
+             COALESCE(i.opening_stock_qty, 0) AS opening_stock,
              COALESCE(u.code, '') AS uom,
              COALESCE(d.name, '') AS department,
              COALESCE(cc.name, '') AS cost_centre,
@@ -293,6 +469,7 @@ router.get(
              COALESCE(i.max_stock, 0) AS max_stock,
              COALESCE(ind.pending_indent_qty, 0) AS pending_indents,
              COALESCE(po.pending_po_qty, 0) AS pending_pos,
+             ROUND((i.live_stock_qty * COALESCE(i.standard_rate, 0)), 2) AS stock_valuation,
              CASE
                WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
                  THEN 'CRITICAL'
@@ -329,15 +506,15 @@ router.get(
         ) po ON po.item_id = i.id
        ${b.where()}
        ORDER BY i.item_code ASC
-       LIMIT 5000
+       LIMIT 10000
     `;
 
     const rows = await query<Record<string, unknown>>(selectSql, b.params);
 
     const headers = [
-      'Item Code', 'Item Description', 'UOM', 'Department', 'Cost Centre',
+      'Item Code', 'Item Description', 'Category', 'Opening Stock', 'UOM', 'Department', 'Cost Centre',
       'Live Stock', 'Allocated Stock', 'Available Stock', 'Reorder Level',
-      'Reorder Qty', 'Min Stock', 'Max Stock', 'Pending Indents', 'Pending POs', 'Status',
+      'Reorder Qty', 'Min Stock', 'Max Stock', 'Pending Indents', 'Pending POs', 'Valuation (INR)', 'Status',
     ];
 
     const csvRows = [headers.join(',')];
@@ -345,6 +522,8 @@ router.get(
       csvRows.push([
         `"${String(r.item_code).replace(/"/g, '""')}"`,
         `"${String(r.item_description).replace(/"/g, '""')}"`,
+        `"${String(r.category || 'GENERAL')}"`,
+        r.opening_stock,
         `"${toShortUom(r.uom as string)}"`,
         `"${String(r.department).replace(/"/g, '""')}"`,
         `"${String(r.cost_centre).replace(/"/g, '""')}"`,
@@ -357,13 +536,396 @@ router.get(
         r.max_stock,
         r.pending_indents,
         r.pending_pos,
+        r.stock_valuation,
         r.stock_status,
       ].join(','));
     }
 
     res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="stock_and_reorder.csv"');
+    res.setHeader('Content-Disposition', 'attachment; filename="inventory_stock_register.csv"');
     res.status(200).send(csvRows.join('\r\n'));
+  }),
+);
+
+/* ── GET /inventory/ledger ──────────────────────────────────────────────────── */
+
+const ledgerQuerySchema = listQuerySchema.extend({
+  category: z.enum(['ALL', 'GENERAL', 'RM', 'FG', 'TRADING', 'WIP']).default('ALL'),
+  itemId: csvIdArray,
+  txnType: z.string().optional(),
+  fromDate: dateStr.optional(),
+  toDate: dateStr.optional(),
+});
+
+router.get(
+  '/ledger',
+  requireAnyPermission('inventory.view', 'auto_indent.view'),
+  validateQuery(ledgerQuerySchema),
+  asyncHandler(async (_req, res) => {
+    const q = parsedQuery<z.infer<typeof ledgerQuerySchema>>(res);
+    const b = new SqlBuilder();
+
+    if (q.category && q.category !== 'ALL') {
+      b.add('i.inventory_category = ?', q.category);
+    }
+    b.addIn('sl.item_id', q.itemId);
+    if (q.txnType) {
+      b.add('sl.txn_type = ?', q.txnType);
+    }
+    if (q.fromDate) {
+      b.add('sl.txn_date >= ?', q.fromDate);
+    }
+    if (q.toDate) {
+      b.add('sl.txn_date <= ?', q.toDate);
+    }
+
+    if (q.search) {
+      const p = b.push(`%${q.search.toLowerCase()}%`);
+      b.addRaw(
+        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(COALESCE(sl.reference_no, '')) LIKE ${p} OR lower(sl.txn_type) LIKE ${p})`,
+      );
+    }
+
+    const baseFrom = `
+      FROM stock_ledger sl
+      JOIN items i ON i.id = sl.item_id
+      LEFT JOIN lookups u ON u.id = sl.uom_id
+      LEFT JOIN users usr ON usr.id = sl.created_by
+    `;
+
+    const summaryRow = await queryOne<{
+      total_count: string;
+      total_inward: string;
+      total_outward: string;
+    }>(
+      `SELECT
+         COUNT(*)::int AS total_count,
+         COALESCE(SUM(sl.inward_qty), 0)::numeric(18, 4) AS total_inward,
+         COALESCE(SUM(sl.outward_qty), 0)::numeric(18, 4) AS total_outward
+       ${baseFrom}
+       ${b.where()}`,
+      b.params,
+    );
+
+    const total = Number(summaryRow?.total_count ?? 0);
+    const limit = b.push(q.pageSize);
+    const offset = b.push(offsetOf(q));
+
+    const selectSql = `
+      SELECT sl.id, sl.item_id, i.item_code, i.item_description, i.inventory_category AS category,
+             COALESCE(u.code, '') AS uom_code,
+             sl.txn_type, sl.reference_type, sl.reference_id, sl.reference_no,
+             sl.inward_qty, sl.outward_qty, sl.balance_qty, sl.txn_date,
+             sl.created_at, usr.employee_name AS created_by_name
+       ${baseFrom}
+       ${b.where()}
+       ORDER BY sl.id DESC
+       LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const rows = await query<Record<string, unknown>>(selectSql, b.params);
+
+    sendPage(res, rows.map((r) => ({ ...r, uom_code: toShortUom(r.uom_code as string) })), total, q.page, q.pageSize, {
+      summary: {
+        totalMovements: total,
+        totalInward: Number(summaryRow?.total_inward ?? 0),
+        totalOutward: Number(summaryRow?.total_outward ?? 0),
+      },
+    });
+  }),
+);
+
+/* ── GET /inventory/ledger/export ───────────────────────────────────────────── */
+
+router.get(
+  '/ledger/export',
+  requireAnyPermission('inventory.export', 'inventory.view', 'auto_indent.view'),
+  validateQuery(ledgerQuerySchema),
+  asyncHandler(async (_req, res) => {
+    const q = parsedQuery<z.infer<typeof ledgerQuerySchema>>(res);
+    const b = new SqlBuilder();
+
+    if (q.category && q.category !== 'ALL') {
+      b.add('i.inventory_category = ?', q.category);
+    }
+    b.addIn('sl.item_id', q.itemId);
+    if (q.txnType) {
+      b.add('sl.txn_type = ?', q.txnType);
+    }
+    if (q.fromDate) {
+      b.add('sl.txn_date >= ?', q.fromDate);
+    }
+    if (q.toDate) {
+      b.add('sl.txn_date <= ?', q.toDate);
+    }
+
+    if (q.search) {
+      const p = b.push(`%${q.search.toLowerCase()}%`);
+      b.addRaw(
+        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(COALESCE(sl.reference_no, '')) LIKE ${p} OR lower(sl.txn_type) LIKE ${p})`,
+      );
+    }
+
+    const selectSql = `
+      SELECT sl.id, sl.item_id, i.item_code, i.item_description, i.inventory_category AS category,
+             COALESCE(u.code, '') AS uom_code,
+             sl.txn_type, sl.reference_type, sl.reference_id, sl.reference_no,
+             sl.inward_qty, sl.outward_qty, sl.balance_qty, sl.txn_date,
+             sl.created_at, usr.employee_name AS created_by_name
+        FROM stock_ledger sl
+        JOIN items i ON i.id = sl.item_id
+        LEFT JOIN lookups u ON u.id = sl.uom_id
+        LEFT JOIN users usr ON usr.id = sl.created_by
+       ${b.where()}
+       ORDER BY sl.id DESC
+       LIMIT 10000
+    `;
+
+    const rows = await query<Record<string, unknown>>(selectSql, b.params);
+
+    const headers = [
+      'Date', 'Time', 'Item Code', 'Item Description', 'Category', 'Movement Type',
+      'Reference Doc', 'Inward Qty', 'Outward Qty', 'Balance Qty', 'UOM', 'Recorded By',
+    ];
+
+    const csvRows = [headers.join(',')];
+    for (const r of rows) {
+      const createdAt = new Date(r.created_at as string);
+      const timeStr = createdAt.toLocaleTimeString('en-IN', { hour12: false });
+      csvRows.push([
+        r.txn_date,
+        timeStr,
+        `"${String(r.item_code).replace(/"/g, '""')}"`,
+        `"${String(r.item_description).replace(/"/g, '""')}"`,
+        `"${String(r.category || 'GENERAL')}"`,
+        r.txn_type,
+        `"${String(r.reference_no || '—').replace(/"/g, '""')}"`,
+        r.inward_qty,
+        r.outward_qty,
+        r.balance_qty,
+        `"${toShortUom(r.uom_code as string)}"`,
+        `"${String(r.created_by_name || 'System').replace(/"/g, '""')}"`,
+      ].join(','));
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="stock_movement_ledger.csv"');
+    res.status(200).send(csvRows.join('\r\n'));
+  }),
+);
+
+/* ── GET /inventory/adjustments ─────────────────────────────────────────────── */
+
+const adjustmentQuerySchema = listQuerySchema.extend({
+  category: z.enum(['ALL', 'GENERAL', 'RM', 'FG', 'TRADING', 'WIP']).default('ALL'),
+  itemId: csvIdArray,
+  fromDate: dateStr.optional(),
+  toDate: dateStr.optional(),
+});
+
+router.get(
+  '/adjustments',
+  requireAnyPermission('inventory.view', 'auto_indent.view'),
+  validateQuery(adjustmentQuerySchema),
+  asyncHandler(async (_req, res) => {
+    const q = parsedQuery<z.infer<typeof adjustmentQuerySchema>>(res);
+    const b = new SqlBuilder();
+
+    if (q.category && q.category !== 'ALL') {
+      b.add('sa.category = ?', q.category);
+    }
+    b.addIn('sa.item_id', q.itemId);
+    if (q.fromDate) {
+      b.add('sa.adjustment_date >= ?', q.fromDate);
+    }
+    if (q.toDate) {
+      b.add('sa.adjustment_date <= ?', q.toDate);
+    }
+    if (q.search) {
+      const p = b.push(`%${q.search.toLowerCase()}%`);
+      b.addRaw(
+        `(lower(sa.adjustment_no) LIKE ${p} OR lower(sa.item_code) LIKE ${p} OR lower(sa.item_description) LIKE ${p} OR lower(sa.reason) LIKE ${p})`,
+      );
+    }
+
+    const countSql = `SELECT COUNT(*)::int AS n FROM stock_adjustments sa ${b.where()}`;
+    const totalRow = await queryOne<{ n: number }>(countSql, b.params);
+    const total = Number(totalRow?.n ?? 0);
+
+    const limit = b.push(q.pageSize);
+    const offset = b.push(offsetOf(q));
+
+    const selectSql = `
+      SELECT sa.*, u.employee_name AS created_by_name, app.employee_name AS approved_by_name
+        FROM stock_adjustments sa
+        LEFT JOIN users u ON u.id = sa.created_by
+        LEFT JOIN users app ON app.id = sa.approved_by
+       ${b.where()}
+       ORDER BY sa.id DESC
+       LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const rows = await query<Record<string, unknown>>(selectSql, b.params);
+    sendPage(res, rows, total, q.page, q.pageSize);
+  }),
+);
+
+/* ── POST /inventory/adjustments ────────────────────────────────────────────── */
+
+const createAdjustmentSchema = z.object({
+  itemId: z.coerce.number().int().positive('Item selection is required.'),
+  actualStockQty: z.union([z.number(), z.string()]).refine((v) => Number(v) >= 0, 'Actual stock cannot be negative.'),
+  reason: z.string().trim().min(2, 'Reason is mandatory for stock adjustments.').max(500),
+  findings: z.string().trim().max(1000).default(''),
+  remarks: z.string().trim().max(1000).default(''),
+  adjustmentDate: dateStr.default(() => dateStamp(new Date())),
+});
+
+router.post(
+  '/adjustments',
+  requireAnyPermission('inventory.adjust', 'auto_indent.approve'),
+  validateBody(createAdjustmentSchema),
+  asyncHandler(async (req, res) => {
+    const body = req.body as z.infer<typeof createAdjustmentSchema>;
+
+    const result = await withTransaction(async (tx) => {
+      const item = await txQueryOne<{
+        id: number;
+        item_code: string;
+        item_description: string;
+        inventory_category: string;
+        uom_id: number | null;
+        live_stock_qty: string;
+      }>(
+        tx,
+        'SELECT id, item_code, item_description, inventory_category, uom_id, live_stock_qty FROM items WHERE id = $1 FOR UPDATE',
+        [body.itemId],
+      );
+      if (!item) throw NotFoundError('Item');
+
+      const when = new Date(body.adjustmentDate || Date.now());
+      const adjustmentNo = await nextDocumentNumber(tx, 'STOCK_ADJUSTMENT', when);
+
+      const adjRow = await txQueryOne<{ id: number }>(
+        tx,
+        `INSERT INTO stock_adjustments
+           (adjustment_no, adjustment_date, item_id, item_code, item_description,
+            category, system_stock_qty, actual_stock_qty, adjustment_qty,
+            reason, findings, approved_by, approver_name, remarks, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         RETURNING id`,
+        [
+          adjustmentNo,
+          body.adjustmentDate,
+          item.id,
+          item.item_code,
+          item.item_description,
+          item.inventory_category || 'GENERAL',
+          item.live_stock_qty,
+          toQty(body.actualStockQty),
+          toQty(Number(body.actualStockQty) - Number(item.live_stock_qty)),
+          body.reason,
+          body.findings,
+          req.user!.id,
+          req.user!.employeeName,
+          body.remarks,
+          req.user!.id,
+        ],
+      );
+
+      const adjusted = await adjustStockPhysicalCount(
+        tx,
+        { item_id: item.id, uom_id: item.uom_id },
+        String(body.actualStockQty),
+        {
+          adjustmentId: adjRow!.id,
+          adjustmentNo,
+          adjustmentDate: body.adjustmentDate,
+          reason: body.reason,
+          findings: body.findings,
+          userId: req.user!.id,
+        },
+      );
+
+      await auditIn(tx, {
+        actor: actorFrom(req),
+        action: 'CREATE',
+        entity: 'stock_adjustment',
+        entityId: adjRow!.id,
+        entityLabel: adjustmentNo,
+        before: { systemStock: adjusted.previousBalance },
+        after: { actualStock: adjusted.newBalance, delta: adjusted.deltaQty },
+        message: `Physical stock adjustment ${adjustmentNo} for ${item.item_code}: ${adjusted.previousBalance} -> ${adjusted.newBalance} (delta ${adjusted.deltaQty}). Reason: ${body.reason}`,
+      });
+
+      return {
+        id: adjRow!.id,
+        adjustmentNo,
+        itemCode: item.item_code,
+        previousStock: adjusted.previousBalance,
+        newStock: adjusted.newBalance,
+        deltaQty: adjusted.deltaQty,
+      };
+    });
+
+    sendCreated(res, {
+      ...result,
+      message: `Stock adjustment ${result.adjustmentNo} posted successfully for ${result.itemCode}.`,
+    });
+  }),
+);
+
+/* ── GET /inventory/requisition-queue ───────────────────────────────────────── */
+
+router.get(
+  '/requisition-queue',
+  requireAnyPermission('inventory.view', 'requisition.issue', 'auto_indent.view'),
+  asyncHandler(async (_req, res) => {
+    const rows = await query<Record<string, unknown>>(
+      `SELECT h.id AS requisition_id,
+              h.requisition_no,
+              h.requisition_date,
+              h.department_id,
+              COALESCE(d.name, '') AS department_name,
+              h.cost_centre_id,
+              COALESCE(cc.name, '') AS cost_centre_name,
+              u.employee_name AS requester_name,
+              h.status,
+              'APPROVED' AS hod_status,
+              rl.id AS requisition_line_id,
+              rl.line_no,
+              rl.item_id,
+              rl.item_code,
+              rl.item_description,
+              rl.requested_qty,
+              COALESCE(v.issued_qty, 0) AS issued_qty,
+              (rl.requested_qty - COALESCE(v.issued_qty, 0)) AS balance_to_issue,
+              COALESCE(lu.code, '') AS uom_code,
+              i.inventory_category AS category,
+              i.live_stock_qty,
+              GREATEST(0, i.live_stock_qty - COALESCE(req_all.allocated_qty, 0)) AS available_stock_qty
+         FROM requisition_lines rl
+         JOIN requisition_headers h ON h.id = rl.requisition_id
+         JOIN items i ON i.id = rl.item_id
+         LEFT JOIN lookups d ON d.id = h.department_id
+         LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
+         LEFT JOIN lookups lu ON lu.id = rl.uom_id
+         LEFT JOIN users u ON u.id = h.requester_user_id
+         LEFT JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
+         LEFT JOIN (
+           SELECT rl2.item_id, SUM(rl2.requested_qty - COALESCE(v2.issued_qty, 0)) AS allocated_qty
+             FROM requisition_lines rl2
+             JOIN requisition_headers rh2 ON rh2.id = rl2.requisition_id
+             JOIN v_requisition_line_balance v2 ON v2.requisition_line_id = rl2.id
+            WHERE rh2.status IN ('APPROVED', 'PARTIALLY_ISSUED')
+            GROUP BY rl2.item_id
+         ) req_all ON req_all.item_id = i.id
+        WHERE h.status IN ('APPROVED', 'PARTIALLY_ISSUED')
+          AND (rl.requested_qty - COALESCE(v.issued_qty, 0)) > 0
+        ORDER BY h.requisition_date ASC, h.id ASC, rl.line_no ASC`,
+    );
+
+    sendOk(res, rows.map((r) => ({ ...r, uom_code: toShortUom(r.uom_code as string) })));
   }),
 );
 
