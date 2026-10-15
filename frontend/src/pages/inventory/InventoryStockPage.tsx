@@ -71,6 +71,8 @@ interface OverviewData {
     totalItems: number;
     totalStockQty: number;
     totalValuation: number;
+    zeroStockCount?: number;
+    positiveStockCount?: number;
     normalStock: number;
     belowReorder: number;
     criticalStock: number;
@@ -84,14 +86,29 @@ interface OverviewData {
     todayInwardQty: number;
     todayOutwardQty: number;
     todayTxnsCount: number;
+    quarantinedCount?: number;
+    unsyncedCount?: number;
   };
+  unitsSummary?: Array<{
+    primary_uom: string;
+    item_count: number;
+    total_qty: string;
+  }>;
   categoryBreakdown: Array<{
     category: string;
     item_count: number;
+    sheet_items_count?: number;
+    unsynced_items_count?: number;
     stock_qty: string;
+    sheet_stock_qty?: string;
+    total_weight_kg?: string;
+    weight_ton?: string;
     valuation: string;
+    zero_stock_count?: number;
+    positive_stock_count?: number;
     critical_count: number;
     below_reorder_count: number;
+    quarantined_count?: number;
   }>;
   recentMovements: Array<{
     id: number;
@@ -327,6 +344,7 @@ export default function InventoryStockPage() {
 
   // Requisition Queue
   const [reqQueueSearch, setReqQueueSearch] = useState('');
+  const [reqStockFilter, setReqStockFilter] = useState<'ALL' | 'READY' | 'SHORTAGE'>('ALL');
 
   // Auto Indent
   const [indentPage, setIndentPage] = useState(1);
@@ -1226,7 +1244,7 @@ export default function InventoryStockPage() {
       {/* ── 1. OVERVIEW & ANALYTICS TAB ────────────────────────────────────────── */}
       {currentTab === 'overview' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-4)' }}>
-          {/* Top KPI Cards */}
+          {/* Top KPI Cards (All Clickable) */}
           <div
             style={{
               display: 'grid',
@@ -1239,39 +1257,57 @@ export default function InventoryStockPage() {
               value={moneyCompact(overviewData?.kpis?.totalValuation ?? 0)}
               sub={`Exact: ${money(overviewData?.kpis?.totalValuation ?? 0)}`}
               tone="default"
+              onClick={() => setTab('stock')}
             />
             <StatTile
               label="Total Active Items"
               value={count(overviewData?.kpis?.totalItems ?? 0)}
-              sub={`${count(overviewData?.kpis?.totalStockQty ?? 0)} total units`}
+              sub={`${count(overviewData?.kpis?.totalStockQty ?? 0)} total units in view`}
+              onClick={() => setTab('stock')}
             />
             <StatTile
               label="Critical / Zero Stock"
               value={count(overviewData?.kpis?.criticalStock ?? 0)}
               tone="danger"
               sub="Immediate replenishment required"
+              onClick={() => {
+                setStockStatusFilter('CRITICAL');
+                setTab('stock');
+              }}
             />
             <StatTile
               label="Below Reorder Level"
               value={count(overviewData?.kpis?.belowReorder ?? 0)}
               tone="warning"
               sub="Reorder threshold reached"
+              onClick={() => {
+                setStockStatusFilter('BELOW_REORDER');
+                setTab('stock');
+              }}
             />
             <StatTile
               label="Healthy Stock"
               value={count(overviewData?.kpis?.normalStock ?? 0)}
               tone="success"
               sub="Normal buffer maintained"
+              onClick={() => {
+                setStockStatusFilter('NORMAL');
+                setTab('stock');
+              }}
             />
             <StatTile
               label="Excess Stock Items"
               value={count(overviewData?.kpis?.excessStock ?? 0)}
               tone="info"
               sub="Above maximum inventory limit"
+              onClick={() => {
+                setStockStatusFilter('EXCESS');
+                setTab('stock');
+              }}
             />
           </div>
 
-          {/* Operational Pipeline & Day Movements */}
+          {/* Operational Pipeline & Day Movements (Clickable Drilldown) */}
           <div
             style={{
               display: 'grid',
@@ -1279,60 +1315,120 @@ export default function InventoryStockPage() {
               gap: 'var(--sp-3)',
             }}
           >
-            <Card>
+            <Card
+              className="card-clickable"
+              onClick={() => setTab('requisition-queue')}
+              style={{ cursor: 'pointer' }}
+              title="Click to view Store Requisition Queue"
+            >
               <CardBody>
                 <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>Material to Issue (Store Queue)</div>
                 <div className="num cell-strong" style={{ fontSize: 'var(--text-xl)', marginTop: 4, color: 'var(--brand-700)' }}>
                   {count(overviewData?.kpis?.pendingRequisitionsCount ?? 0)} Requisitions
                 </div>
                 <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-faint)', marginTop: 2 }}>
-                  {qty(overviewData?.kpis?.pendingRequisitionsQty ?? 0)} total units awaiting issue
+                  {qty(overviewData?.kpis?.pendingRequisitionsQty ?? 0)} total units awaiting issue →
                 </div>
               </CardBody>
             </Card>
 
-            <Card>
+            <Card
+              className="card-clickable"
+              onClick={() => navigate('/purchase-orders')}
+              style={{ cursor: 'pointer' }}
+              title="Click to view Purchase Orders pipeline"
+            >
               <CardBody>
                 <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>Pipeline POs (Awaiting GRN)</div>
                 <div className="num cell-strong" style={{ fontSize: 'var(--text-xl)', marginTop: 4, color: 'var(--brand-600)' }}>
                   {count(overviewData?.kpis?.pendingPosCount ?? 0)} Purchase Orders
                 </div>
                 <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-faint)', marginTop: 2 }}>
-                  {qty(overviewData?.kpis?.pendingPosQty ?? 0)} units expected from suppliers
+                  {qty(overviewData?.kpis?.pendingPosQty ?? 0)} units expected from suppliers →
                 </div>
               </CardBody>
             </Card>
 
-            <Card>
+            <Card
+              className="card-clickable"
+              onClick={() => {
+                setLedgerTxnType('GRN_INWARD');
+                setTab('ledger');
+              }}
+              style={{ cursor: 'pointer' }}
+              title="Click to view today's inward receipts in ledger"
+            >
               <CardBody>
                 <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>Today's Inward Receipts</div>
                 <div className="num cell-strong" style={{ fontSize: 'var(--text-xl)', marginTop: 4, color: 'var(--success-600)' }}>
                   +{qty(overviewData?.kpis?.todayInwardQty ?? 0)}
                 </div>
                 <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-faint)', marginTop: 2 }}>
-                  Goods receipt receipts posted today
+                  Goods receipt receipts posted today →
                 </div>
               </CardBody>
             </Card>
 
-            <Card>
+            <Card
+              className="card-clickable"
+              onClick={() => {
+                setLedgerTxnType('REQUISITION_ISSUE');
+                setTab('ledger');
+              }}
+              style={{ cursor: 'pointer' }}
+              title="Click to view today's outward issues in ledger"
+            >
               <CardBody>
                 <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>Today's Outward Issues</div>
                 <div className="num cell-strong" style={{ fontSize: 'var(--text-xl)', marginTop: 4, color: 'var(--danger-600)' }}>
                   -{qty(overviewData?.kpis?.todayOutwardQty ?? 0)}
                 </div>
                 <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-faint)', marginTop: 2 }}>
-                  Material issued against requisitions / direct issues
+                  Material issued against requisitions / direct issues →
                 </div>
               </CardBody>
             </Card>
           </div>
 
-          {/* Category Breakdown Cards */}
+          {/* Distinct Units of Measurement Summary (Never Mix Unrelated Units) */}
+          {overviewData?.unitsSummary && overviewData.unitsSummary.length > 0 && (
+            <Card>
+              <CardBody style={{ padding: 'var(--sp-2) var(--sp-4)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
+                  <div style={{ fontSize: 'var(--text-xs)', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    Physical Stock Distribution by Measurement Unit (UOM)
+                  </div>
+                  <div style={{ display: 'flex', gap: 'var(--sp-3)', flexWrap: 'wrap', alignItems: 'center' }}>
+                    {overviewData.unitsSummary.map((u) => (
+                      <div
+                        key={u.primary_uom}
+                        style={{
+                          fontSize: 'var(--text-xs)',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          padding: '3px 8px',
+                          borderRadius: 'var(--radius-sm)',
+                          backgroundColor: 'var(--surface-muted)',
+                          border: '1px solid var(--border-subtle)',
+                        }}
+                      >
+                        <Badge tone="neutral" plain>{toShortUom(u.primary_uom)}</Badge>
+                        <strong className="num">{qty(u.total_qty)}</strong>
+                        <span style={{ color: 'var(--text-faint)', fontSize: '10px' }}>({count(u.item_count)} items)</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </CardBody>
+            </Card>
+          )}
+
+          {/* Category Breakdown Cards (Clickable Direct Access) */}
           <Card>
             <CardHeader
               title="Inventory Category Portfolios"
-              subtitle="Breakdown of physical inventory across Finished Goods, Raw Material, Trading, and General Stores"
+              subtitle="Click any category to open its full workspace with Google Sheet tabs, live stock, and transaction registers"
             />
             <CardBody>
               <div
@@ -1345,6 +1441,12 @@ export default function InventoryStockPage() {
                 {(overviewData?.categoryBreakdown || []).map((cat) => (
                   <div
                     key={cat.category}
+                    onClick={() => setTab(cat.category.toLowerCase())}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') setTab(cat.category.toLowerCase());
+                    }}
                     style={{
                       border: '1px solid var(--border-subtle)',
                       borderRadius: 'var(--radius-md)',
@@ -1353,7 +1455,18 @@ export default function InventoryStockPage() {
                       display: 'flex',
                       flexDirection: 'column',
                       justifyContent: 'space-between',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease',
                     }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = 'var(--brand-500)';
+                      e.currentTarget.style.transform = 'translateY(-2px)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = 'var(--border-subtle)';
+                      e.currentTarget.style.transform = 'none';
+                    }}
+                    title={`Click to open ${cat.category} workspace`}
                   >
                     <div>
                       <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
@@ -1369,13 +1482,32 @@ export default function InventoryStockPage() {
                         {money(cat.valuation)}
                       </div>
                       <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-faint)', marginTop: 2 }}>
-                        Stock: {qty(cat.stock_qty)} units
+                        {cat.category === 'RM' || cat.category === 'FG' || cat.category === 'WIP' ? (
+                          cat.weight_ton ? `${qty(cat.weight_ton)} Ton (${qty(cat.total_weight_kg || cat.stock_qty)} Kg)` : `${qty(cat.stock_qty)} Kg`
+                        ) : (
+                          `Stock: ${qty(cat.stock_qty)} units`
+                        )}
                       </div>
-                      {cat.critical_count > 0 && (
-                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--danger-600)', marginTop: 6, fontWeight: 500 }}>
-                          ⚠ {count(cat.critical_count)} items critical
-                        </div>
-                      )}
+                      <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                        {cat.sheet_items_count !== undefined && (
+                          <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
+                            ✓ {count(cat.sheet_items_count)} sheet
+                          </span>
+                        )}
+                        {cat.critical_count > 0 && (
+                          <span style={{ fontSize: '10px', color: 'var(--danger-700)', fontWeight: 600 }}>
+                            ⚠ {count(cat.critical_count)} critical
+                          </span>
+                        )}
+                        {cat.quarantined_count !== undefined && cat.quarantined_count > 0 && (
+                          <span style={{ fontSize: '10px', color: 'var(--warning-700)', fontWeight: 600 }}>
+                            🛡 {count(cat.quarantined_count)} quarantined
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--brand-600)', marginTop: 10, fontWeight: 500 }}>
+                      Open Workspace →
                     </div>
                   </div>
                 ))}
@@ -1478,7 +1610,7 @@ export default function InventoryStockPage() {
             })}
           </div>
 
-          {/* Stat Tiles */}
+          {/* Stat Tiles (Clickable Filters) */}
           <div
             style={{
               display: 'grid',
@@ -1487,27 +1619,51 @@ export default function InventoryStockPage() {
               marginBottom: 'var(--sp-4)',
             }}
           >
-            <StatTile label="Active Items in View" value={count(stockData?.meta?.summary?.totalActive ?? stockData?.meta?.total ?? 0)} />
+            <StatTile
+              label="Active Items in View"
+              value={count(stockData?.meta?.summary?.totalActive ?? stockData?.meta?.total ?? 0)}
+              onClick={() => {
+                setStockStatusFilter('ALL');
+                setStockSearch('');
+                setStockPage(1);
+              }}
+            />
             <StatTile
               label="Total Valuation (View)"
               value={moneyCompact(stockData?.meta?.summary?.totalValuation ?? 0)}
               sub={`Exact: ${money(stockData?.meta?.summary?.totalValuation ?? 0)}`}
               tone="default"
+              onClick={() => {
+                setStockStatusFilter('NORMAL');
+                setStockPage(1);
+              }}
             />
             <StatTile
               label="Critical / Zero Stock"
               value={count(stockData?.meta?.summary?.criticalStock ?? 0)}
               tone="danger"
+              onClick={() => {
+                setStockStatusFilter('CRITICAL');
+                setStockPage(1);
+              }}
             />
             <StatTile
               label="Below Reorder Level"
               value={count(stockData?.meta?.summary?.belowReorder ?? 0)}
               tone="warning"
+              onClick={() => {
+                setStockStatusFilter('BELOW_REORDER');
+                setStockPage(1);
+              }}
             />
             <StatTile
               label="Excess Stock Items"
               value={count(stockData?.meta?.summary?.excessStock ?? 0)}
               tone="info"
+              onClick={() => {
+                setStockStatusFilter('EXCESS');
+                setStockPage(1);
+              }}
             />
           </div>
 
@@ -1578,18 +1734,34 @@ export default function InventoryStockPage() {
               marginBottom: 'var(--sp-4)',
             }}
           >
-            <StatTile label="Total Movement Entries" value={count(ledgerData?.meta?.summary?.totalMovements ?? 0)} />
+            <StatTile
+              label="Total Movement Entries"
+              value={count(ledgerData?.meta?.summary?.totalMovements ?? 0)}
+              onClick={() => {
+                setLedgerTxnType('');
+                setLedgerCategory('ALL');
+                setLedgerPage(1);
+              }}
+            />
             <StatTile
               label="Total Inward Quantity"
               value={qty(ledgerData?.meta?.summary?.totalInward ?? 0)}
               tone="success"
               sub="GRN receipts & positive stock audits"
+              onClick={() => {
+                setLedgerTxnType('GRN_INWARD');
+                setLedgerPage(1);
+              }}
             />
             <StatTile
               label="Total Outward Quantity"
               value={qty(ledgerData?.meta?.summary?.totalOutward ?? 0)}
               tone="warning"
               sub="Requisition issues & store issues"
+              onClick={() => {
+                setLedgerTxnType('REQUISITION_ISSUE');
+                setLedgerPage(1);
+              }}
             />
           </div>
 
@@ -1741,41 +1913,100 @@ export default function InventoryStockPage() {
       )}
 
       {/* ── 5. STORE REQUISITION QUEUE TAB ───────────────────────────────────── */}
-      {currentTab === 'requisition-queue' && (
-        <Card>
-          <CardHeader
-            title="Store Requisition Issue Queue"
-            subtitle="Material requisitions approved by Department HODs ready for store issue with live stock check"
-            actions={
-              <Link to="/inventory/direct-issue">
-                <Button variant="secondary" size="sm" icon={<PackageMinus size={14} />}>
-                  Direct Issue from Store →
-                </Button>
-              </Link>
-            }
-          />
-          <CardBody flush>
-            <DataTable
-              columns={reqQueueColumns}
-              rows={(reqQueueData || []).filter(
-                (r) =>
-                  !reqQueueSearch ||
-                  r.requisition_no.toLowerCase().includes(reqQueueSearch.toLowerCase()) ||
-                  r.item_code.toLowerCase().includes(reqQueueSearch.toLowerCase()) ||
-                  r.item_description.toLowerCase().includes(reqQueueSearch.toLowerCase()) ||
-                  r.requester_name.toLowerCase().includes(reqQueueSearch.toLowerCase()),
-              )}
-              rowKey={(r) => r.requisition_line_id}
-              loading={reqQueueLoading}
-              search={reqQueueSearch}
-              onSearchChange={setReqQueueSearch}
-              searchPlaceholder="Search requisition no, item, requester…"
-              emptyTitle="No pending requisitions in queue"
-              emptyMessage="All approved store requisitions have been fully issued."
-            />
-          </CardBody>
-        </Card>
-      )}
+      {currentTab === 'requisition-queue' && (() => {
+        const totalReq = reqQueueData?.length ?? 0;
+        const readyReq = (reqQueueData || []).filter((r) => Number(r.available_stock_qty || 0) >= Number(r.balance_to_issue || 0)).length;
+        const shortageReq = (reqQueueData || []).filter((r) => Number(r.available_stock_qty || 0) < Number(r.balance_to_issue || 0)).length;
+
+        const filteredQueue = (reqQueueData || []).filter((r) => {
+          const matchSearch =
+            !reqQueueSearch ||
+            r.requisition_no.toLowerCase().includes(reqQueueSearch.toLowerCase()) ||
+            r.item_code.toLowerCase().includes(reqQueueSearch.toLowerCase()) ||
+            r.item_description.toLowerCase().includes(reqQueueSearch.toLowerCase()) ||
+            r.requester_name.toLowerCase().includes(reqQueueSearch.toLowerCase());
+
+          if (!matchSearch) return false;
+
+          const isReady = Number(r.available_stock_qty || 0) >= Number(r.balance_to_issue || 0);
+          if (reqStockFilter === 'READY') return isReady;
+          if (reqStockFilter === 'SHORTAGE') return !isReady;
+          return true;
+        });
+
+        return (
+          <>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                gap: 'var(--sp-3)',
+                marginBottom: 'var(--sp-4)',
+              }}
+            >
+              <StatTile
+                label="Requisition Lines in Queue"
+                value={count(totalReq)}
+                sub="Approved lines awaiting store issue"
+                tone="default"
+                onClick={() => setReqStockFilter('ALL')}
+              />
+              <StatTile
+                label="Ready to Issue (Full Stock)"
+                value={count(readyReq)}
+                tone="success"
+                sub="Available in physical store"
+                onClick={() => setReqStockFilter('READY')}
+              />
+              <StatTile
+                label="Stock Shortage / Blocked"
+                value={count(shortageReq)}
+                tone="danger"
+                sub="Requires replenishment"
+                onClick={() => setReqStockFilter('SHORTAGE')}
+              />
+            </div>
+
+            <Card>
+              <CardHeader
+                title="Store Requisition Issue Queue"
+                subtitle="Material requisitions approved by Department HODs ready for store issue with live stock check"
+                actions={
+                  <div className="row" style={{ gap: 'var(--sp-2)' }}>
+                    <Select
+                      value={reqStockFilter}
+                      onChange={(e) => setReqStockFilter(e.target.value as any)}
+                      style={{ width: 175 }}
+                    >
+                      <option value="ALL">All Items in Queue</option>
+                      <option value="READY">Ready to Issue (Full Stock)</option>
+                      <option value="SHORTAGE">Stock Shortage Only</option>
+                    </Select>
+                    <Link to="/inventory/direct-issue">
+                      <Button variant="secondary" size="sm" icon={<PackageMinus size={14} />}>
+                        Direct Issue from Store →
+                      </Button>
+                    </Link>
+                  </div>
+                }
+              />
+              <CardBody flush>
+                <DataTable
+                  columns={reqQueueColumns}
+                  rows={filteredQueue}
+                  rowKey={(r) => r.requisition_line_id}
+                  loading={reqQueueLoading}
+                  search={reqQueueSearch}
+                  onSearchChange={setReqQueueSearch}
+                  searchPlaceholder="Search requisition no, item, requester…"
+                  emptyTitle="No pending requisitions in queue"
+                  emptyMessage="All approved store requisitions have been fully issued or none match current filters."
+                />
+              </CardBody>
+            </Card>
+          </>
+        );
+      })()}
 
       {/* ── 6. AUTO INDENT REPLENISHMENT TAB ──────────────────────────────────── */}
       {currentTab === 'auto-indent' && (
@@ -1788,11 +2019,35 @@ export default function InventoryStockPage() {
               marginBottom: 'var(--sp-4)',
             }}
           >
-            <StatTile label="Total Generated" value={count(autoIndentStats?.total ?? 0)} />
-            <StatTile label="Pending Review" value={count(autoIndentStats?.pending ?? 0)} tone="warning" />
-            <StatTile label="Store Approved" value={count(autoIndentStats?.storeApproved ?? 0)} tone="info" />
-            <StatTile label="Ready for Purchase" value={count(autoIndentStats?.approved ?? 0)} tone="success" />
-            <StatTile label="Converted to Indent" value={count(autoIndentStats?.converted ?? 0)} tone="default" />
+            <StatTile
+              label="Total Generated"
+              value={count(autoIndentStats?.total ?? 0)}
+              onClick={() => setIndentStatusFilter('')}
+            />
+            <StatTile
+              label="Pending Review"
+              value={count(autoIndentStats?.pending ?? 0)}
+              tone="warning"
+              onClick={() => setIndentStatusFilter('PENDING_APPROVAL')}
+            />
+            <StatTile
+              label="Store Approved"
+              value={count(autoIndentStats?.storeApproved ?? 0)}
+              tone="info"
+              onClick={() => setIndentStatusFilter('STORE_APPROVED')}
+            />
+            <StatTile
+              label="Ready for Purchase"
+              value={count(autoIndentStats?.approved ?? 0)}
+              tone="success"
+              onClick={() => setIndentStatusFilter('APPROVED')}
+            />
+            <StatTile
+              label="Converted to Indent"
+              value={count(autoIndentStats?.converted ?? 0)}
+              tone="default"
+              onClick={() => setIndentStatusFilter('CONVERTED')}
+            />
           </div>
 
           <div style={{ marginBottom: 'var(--sp-4)' }}>

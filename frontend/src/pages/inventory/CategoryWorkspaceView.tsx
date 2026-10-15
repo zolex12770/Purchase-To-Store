@@ -2,17 +2,18 @@ import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   RefreshCw, Plus, Minus, ArrowUpRight, ArrowDownLeft, Scale,
-  Database, FileSpreadsheet
+  Database, FileSpreadsheet, Download
 } from 'lucide-react';
-import { api, qs, type PageMeta } from '../../lib/api';
+import { api, downloadFile, qs, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { DataTable, type Column } from '../../components/DataTable';
+import { StatTile } from '../../components/KpiCard';
 import {
   Button, Card, CardBody, Badge,
   Modal, Field, Textarea, Select, Input
 } from '../../components/ui';
-import { qty, formatDate, formatDateTime, count, money, toShortUom } from '../../lib/format';
+import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
 
 export type InventoryCategoryKey = 'RM' | 'FG' | 'WIP' | 'TRADING' | 'GENERAL';
 
@@ -77,18 +78,31 @@ interface CategorySummary {
   category: string;
   stats: {
     totalItems: number;
+    sheetItemsCount: number;
+    unsyncedItemsCount: number;
     totalStockQty: number;
+    sheetStockQty: number;
     totalWeightKg: number;
     totalWeightTon: number;
     totalValuation: number;
     valuationLakhs: number;
     valuationCr: number;
+    zeroStockCount: number;
+    positiveStockCount: number;
     criticalCount: number;
     belowReorderCount: number;
     reservedItemsCount: number;
     totalAllocatedQty: number;
+    quarantinedCount: number;
+    inwardTxnCount: number;
+    inwardTxnQty: number;
+    outwardTxnCount: number;
+    outwardTxnQty: number;
+    prodInwardTxnCount: number;
+    prodInwardTxnQty: number;
     lastSyncAt: string | null;
   };
+  mainGroups?: Array<{ name: string; count: number; totalQty: number }>;
   lastSync: {
     id: number;
     category: string;
@@ -187,6 +201,9 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
   const [stockPageSize, setStockPageSize] = useState(25);
   const [stockSearch, setStockSearch] = useState('');
   const [stockStatus, setStockStatus] = useState('ALL');
+  const [stockSource, setStockSource] = useState<'ALL' | 'LIVE_SHEET' | 'ERP_ONLY'>('ALL');
+  const [stockMainGroup, setStockMainGroup] = useState<string>('');
+  const [isQuarantineModalOpen, setIsQuarantineModalOpen] = useState(false);
 
   // Filters for Transactions
   const [txnPage, setTxnPage] = useState(1);
@@ -224,6 +241,8 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     pageSize: stockPageSize,
     search: stockSearch || undefined,
     status: stockStatus !== 'ALL' ? stockStatus : undefined,
+    source: stockSource !== 'ALL' ? stockSource : undefined,
+    mainGroup: stockMainGroup || undefined,
   };
 
   const { data: itemsData, isLoading: itemsLoading } = useQuery({
@@ -246,6 +265,23 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     queryFn: () => api.getWithMeta<CategoryTxnRow[], PageMeta>(`/inventory/categories/${category}/transactions${qs(txnParams)}`),
     enabled: currentSubTabDef.type !== 'stock',
   });
+
+  // 4. Fetch Quarantined Records
+  const { data: quarantineData, isLoading: quarantineLoading } = useQuery({
+    queryKey: ['inventory-quarantine', category],
+    queryFn: () => api.getWithMeta<any[], PageMeta>(`/inventory/quarantine?category=${category}&pageSize=50`),
+    enabled: isQuarantineModalOpen,
+  });
+
+  // Export Category CSV Handler
+  const exportCategoryCsv = async () => {
+    try {
+      await downloadFile(`/inventory/categories/${category}/export`, `inventory_${category.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.csv`);
+      toast.success(`${category} stock register exported successfully.`);
+    } catch (err) {
+      toast.fromError(err, 'Failed to export CSV');
+    }
+  };
 
   // 4. Live Google Sheet Sync Mutation
   const syncMutation = useMutation({
@@ -415,6 +451,15 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
       });
     }
 
+    if (category === 'FG' || category === 'WIP') {
+      cols.push({
+        key: 'weight_1000pc',
+        header: '1000pc Wt (Kg)',
+        align: 'right',
+        render: (r) => (Number(r.weight_per_1000pc_kg) > 0 ? <span className="num">{qty(r.weight_per_1000pc_kg)} Kg</span> : <span className="cell-muted">—</span>),
+      });
+    }
+
     cols.push(
       {
         key: 'live_stock_qty',
@@ -456,6 +501,19 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
             </div>
           );
         },
+      },
+      {
+        key: 'origin',
+        header: 'Source',
+        align: 'center',
+        width: '100px',
+        render: (r) => (
+          r.source_spreadsheet_id ? (
+            <Badge tone="success" plain>Sheet Synced</Badge>
+          ) : (
+            <Badge tone="neutral" plain>ERP Only</Badge>
+          )
+        ),
       },
       {
         key: 'status',
@@ -624,33 +682,34 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
-      {/* ── 1. Minimal Category Overview Header ────────────────────────── */}
+      {/* ── 1. Category Action & Sync Header Bar ────────────────────────── */}
       <Card>
         <CardBody style={{ padding: 'var(--sp-3) var(--sp-4)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <Badge tone="info">{category}</Badge>
-              <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
-                <strong>{count(stats?.totalItems ?? itemsData?.meta?.total ?? 0)}</strong> active items
+              <span style={{ fontSize: 'var(--text-sm)', fontWeight: 600, color: 'var(--text)' }}>
+                {config.title}
               </span>
-              {(category === 'RM' || category === 'FG' || category === 'WIP') && stats?.totalWeightTon !== undefined && (
-                <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
-                  • Total Weight: <strong style={{ color: 'var(--text)' }}>{qty(stats.totalWeightTon)} Ton</strong> ({qty(stats.totalStockQty)} Kg)
-                </span>
-              )}
-              {stats?.totalValuation !== undefined && (
-                <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
-                  • Valuation: <strong style={{ color: 'var(--text)' }}>{money(stats.totalValuation)}</strong>
-                </span>
-              )}
               {lastSync && (
                 <span style={{ fontSize: '11px', color: 'var(--text-faint)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                  <Database size={12} /> Synced: {formatDate(lastSync.created_at)} ({lastSync.tab_name})
+                  <Database size={12} /> Last synced: {formatDate(lastSync.created_at)} ({lastSync.tab_name})
+                  {lastSync.sync_duration_ms > 0 && ` in ${(lastSync.sync_duration_ms / 1000).toFixed(1)}s`}
                 </span>
               )}
             </div>
 
-            <div className="row" style={{ gap: 'var(--sp-2)' }}>
+            <div className="row" style={{ gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Download size={13} />}
+                onClick={() => void exportCategoryCsv()}
+                title={`Export ${category} Stock Register to CSV`}
+              >
+                Export CSV
+              </Button>
+
               {can('inventory.adjust') && (
                 <>
                   <Button
@@ -659,6 +718,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                     icon={<RefreshCw size={13} className={syncMutation.isPending ? 'spin' : ''} />}
                     loading={syncMutation.isPending}
                     onClick={() => syncMutation.mutate()}
+                    title={`Fetch and reconcile live data from Google Sheet "${currentSubTabDef.sheetTabName}"`}
                   >
                     Sync with Sheet
                   </Button>
@@ -702,7 +762,125 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         </CardBody>
       </Card>
 
-      {/* ── 2. Source-Sheet Sub-Tabs (Clean Spreadsheet Style) ──────────── */}
+      {/* ── 2. Clickable Analytical Cards Strip (StatTiles) ─────────────── */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))',
+          gap: 'var(--sp-2)',
+        }}
+      >
+        <StatTile
+          label="Total Items"
+          value={count(stats?.totalItems ?? itemsData?.meta?.total ?? 0)}
+          sub={`${stats?.sheetItemsCount ?? 0} sheet • ${stats?.unsyncedItemsCount ?? 0} ERP only`}
+          tone="default"
+          onClick={() => {
+            setStockStatus('ALL');
+            setStockSource('ALL');
+            setStockMainGroup('');
+            setStockSearch('');
+            setStockPage(1);
+            setActiveSubTab(config.subTabs[0].key);
+          }}
+        />
+
+        <StatTile
+          label={category === 'RM' || category === 'FG' || category === 'WIP' ? 'Live Weight' : 'Live Stock'}
+          value={
+            category === 'RM' || category === 'FG' || category === 'WIP'
+              ? `${qty(stats?.totalWeightTon ?? 0)} Ton`
+              : `${count(stats?.totalStockQty ?? 0)} Qty`
+          }
+          sub={
+            category === 'RM' || category === 'FG' || category === 'WIP'
+              ? `${qty(stats?.totalStockQty ?? 0)} Kg live stock`
+              : 'Physical inventory units'
+          }
+          tone="default"
+          onClick={() => setActiveSubTab(config.subTabs[0].key)}
+        />
+
+        <StatTile
+          label="Total Valuation"
+          value={moneyCompact(stats?.totalValuation ?? 0)}
+          sub={`Exact: ${money(stats?.totalValuation ?? 0)}`}
+          tone="default"
+          onClick={() => {
+            setStockStatus('POSITIVE_STOCK');
+            setActiveSubTab(config.subTabs[0].key);
+            setStockPage(1);
+          }}
+        />
+
+        <StatTile
+          label="Positive Stock"
+          value={count(stats?.positiveStockCount ?? 0)}
+          sub="Items currently in store"
+          tone="success"
+          onClick={() => {
+            setStockStatus('POSITIVE_STOCK');
+            setActiveSubTab(config.subTabs[0].key);
+            setStockPage(1);
+          }}
+        />
+
+        <StatTile
+          label="Zero Stock"
+          value={count(stats?.zeroStockCount ?? 0)}
+          sub="No stock in store"
+          tone="danger"
+          onClick={() => {
+            setStockStatus('CRITICAL');
+            setActiveSubTab(config.subTabs[0].key);
+            setStockPage(1);
+          }}
+        />
+
+        <StatTile
+          label="Below Reorder"
+          value={count(stats?.belowReorderCount ?? 0)}
+          sub="Reorder threshold reached"
+          tone="warning"
+          onClick={() => {
+            setStockStatus('BELOW_REORDER');
+            setActiveSubTab(config.subTabs[0].key);
+            setStockPage(1);
+          }}
+        />
+
+        <StatTile
+          label="Inward Receipts"
+          value={count(stats?.inwardTxnCount ?? 0)}
+          sub={`Qty: +${qty(stats?.inwardTxnQty ?? 0)}`}
+          tone="success"
+          onClick={() => {
+            const inTab = config.subTabs.find((t) => t.type === 'inward');
+            if (inTab) setActiveSubTab(inTab.key);
+          }}
+        />
+
+        <StatTile
+          label="Outward Issues"
+          value={count(stats?.outwardTxnCount ?? 0)}
+          sub={`Qty: -${qty(stats?.outwardTxnQty ?? 0)}`}
+          tone="warning"
+          onClick={() => {
+            const outTab = config.subTabs.find((t) => t.type === 'outward');
+            if (outTab) setActiveSubTab(outTab.key);
+          }}
+        />
+
+        <StatTile
+          label="Quarantined"
+          value={count(stats?.quarantinedCount ?? 0)}
+          sub={stats?.quarantinedCount ? 'Click to inspect errors' : '0 invalid rows'}
+          tone={stats?.quarantinedCount ? 'danger' : 'default'}
+          onClick={() => setIsQuarantineModalOpen(true)}
+        />
+      </div>
+
+      {/* ── 3. Source-Sheet Sub-Tabs (Clean Spreadsheet Style) ──────────── */}
       <div
         style={{
           display: 'flex',
@@ -743,12 +921,12 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         })}
       </div>
 
-      {/* ── 3. Sub-Tab Content ─────────────────────────────────────────── */}
+      {/* ── 4. Sub-Tab Content ─────────────────────────────────────────── */}
       {currentSubTabDef.type === 'stock' ? (
         /* LIVE STOCK TAB */
         <Card>
           <CardBody flush>
-            {/* Minimal Filter Bar */}
+            {/* Enhanced Multi-Source Filter Bar */}
             <div style={{ padding: 'var(--sp-2) var(--sp-3)', borderBottom: '1px solid var(--border-subtle)', display: 'flex', gap: 'var(--sp-2)', alignItems: 'center', flexWrap: 'wrap' }}>
               <div style={{ flex: '1 1 200px' }}>
                 <Input
@@ -761,7 +939,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                 />
               </div>
 
-              <div style={{ width: '160px' }}>
+              <div style={{ width: '150px' }}>
                 <Select
                   value={stockStatus}
                   onChange={(e) => {
@@ -770,24 +948,60 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                   }}
                 >
                   <option value="ALL">All Statuses</option>
-                  <option value="NORMAL">Normal</option>
+                  <option value="POSITIVE_STOCK">Positive Stock (&gt; 0)</option>
+                  <option value="NORMAL">Normal / Healthy</option>
                   <option value="BELOW_REORDER">Below Reorder</option>
                   <option value="CRITICAL">Critical / Zero</option>
                   <option value="EXCESS">Excess</option>
                 </Select>
               </div>
 
-              {(stockSearch || stockStatus !== 'ALL') && (
+              <div style={{ width: '150px' }}>
+                <Select
+                  value={stockSource}
+                  onChange={(e) => {
+                    setStockSource(e.target.value as any);
+                    setStockPage(1);
+                  }}
+                >
+                  <option value="ALL">All Sources</option>
+                  <option value="LIVE_SHEET">Google Sheet Synced</option>
+                  <option value="ERP_ONLY">ERP Catalog Only</option>
+                </Select>
+              </div>
+
+              {summaryData?.mainGroups && summaryData.mainGroups.length > 0 && (
+                <div style={{ width: '170px' }}>
+                  <Select
+                    value={stockMainGroup}
+                    onChange={(e) => {
+                      setStockMainGroup(e.target.value);
+                      setStockPage(1);
+                    }}
+                  >
+                    <option value="">All Main Groups</option>
+                    {summaryData.mainGroups.map((mg) => (
+                      <option key={mg.name} value={mg.name}>
+                        {mg.name} ({mg.count})
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              )}
+
+              {(stockSearch || stockStatus !== 'ALL' || stockSource !== 'ALL' || stockMainGroup) && (
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => {
                     setStockSearch('');
                     setStockStatus('ALL');
+                    setStockSource('ALL');
+                    setStockMainGroup('');
                     setStockPage(1);
                   }}
                 >
-                  Clear
+                  Clear Filters
                 </Button>
               )}
 
@@ -990,6 +1204,93 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
               </Button>
             </div>
           </form>
+        </Modal>
+      )}
+
+      {/* ── 5. Quarantined Records Modal ───────────────────────────────── */}
+      {isQuarantineModalOpen && (
+        <Modal
+          title={`${category} Quarantined Records`}
+          subtitle="Invalid or negative rows from the Google Sheet quarantined to protect inventory ledger integrity."
+          open={isQuarantineModalOpen}
+          onClose={() => setIsQuarantineModalOpen(false)}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
+            <div
+              style={{
+                padding: 'var(--sp-2) var(--sp-3)',
+                backgroundColor: 'var(--warning-50, #fef3c7)',
+                borderRadius: 'var(--radius-sm)',
+                border: '1px solid var(--warning-200, #fde68a)',
+                fontSize: 'var(--text-xs)',
+                color: 'var(--warning-900, #78350f)',
+              }}
+            >
+              <strong>Data Integrity Protection:</strong> These entries in the Google Sheet have negative stock quantities or invalid identifiers. They are quarantined with their original spreadsheet row number and excluded from live stock balance so double-entry accounting remains true.
+            </div>
+
+            {quarantineLoading ? (
+              <div style={{ textAlign: 'center', padding: 'var(--sp-4)', color: 'var(--text-muted)' }}>
+                Loading quarantined records...
+              </div>
+            ) : (!quarantineData?.data || quarantineData.data.length === 0) ? (
+              <div style={{ textAlign: 'center', padding: 'var(--sp-4)', color: 'var(--success-700)' }}>
+                ✓ No quarantined records found for {category}. All rows imported cleanly!
+              </div>
+            ) : (
+              <div style={{ maxHeight: '380px', overflowY: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-xs)' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid var(--border)', textAlign: 'left' }}>
+                      <th style={{ padding: '6px 8px' }}>Row #</th>
+                      <th style={{ padding: '6px 8px' }}>Sheet Tab</th>
+                      <th style={{ padding: '6px 8px' }}>Quarantine Reason</th>
+                      <th style={{ padding: '6px 8px' }}>Data Summary</th>
+                      <th style={{ padding: '6px 8px' }}>Detected At</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {quarantineData.data.map((q: any) => {
+                      let rawDesc = '';
+                      try {
+                        const parsed = typeof q.raw_record_json === 'string' ? JSON.parse(q.raw_record_json) : q.raw_record_json;
+                        rawDesc = parsed.ItemCode
+                          ? `${parsed.ItemCode} - ${parsed.Description || ''} (Qty: ${parsed.StockQty || parsed.ClosingStock || ''})`
+                          : JSON.stringify(parsed).slice(0, 80);
+                      } catch {
+                        rawDesc = String(q.raw_record_json).slice(0, 80);
+                      }
+                      return (
+                        <tr key={q.id} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                          <td style={{ padding: '6px 8px' }}>
+                            <Badge tone="neutral" plain>
+                              Row {q.source_row_index ?? '—'}
+                            </Badge>
+                          </td>
+                          <td style={{ padding: '6px 8px', fontWeight: 500 }}>{q.source_tab}</td>
+                          <td style={{ padding: '6px 8px', color: 'var(--danger-700)', fontWeight: 500 }}>
+                            {q.reason}
+                          </td>
+                          <td style={{ padding: '6px 8px', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+                            {rawDesc}
+                          </td>
+                          <td style={{ padding: '6px 8px', color: 'var(--text-faint)' }}>
+                            {formatDate(q.created_at)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 'var(--sp-2)' }}>
+              <Button variant="secondary" onClick={() => setIsQuarantineModalOpen(false)}>
+                Close
+              </Button>
+            </div>
+          </div>
         </Modal>
       )}
     </div>

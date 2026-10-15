@@ -45,7 +45,9 @@ router.get(
       SELECT
         COUNT(*)::int AS total_items,
         COALESCE(SUM(i.live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
-        COALESCE(SUM(i.live_stock_qty * COALESCE(i.standard_rate, 0)), 0)::numeric(18, 2) AS total_valuation,
+        (SELECT COALESCE(SUM(live_stock_qty * COALESCE(unit_price, 0)), 0)::numeric(18, 2) FROM inventory_items WHERE deleted_at IS NULL) AS total_valuation,
+        COUNT(CASE WHEN i.live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
+        COUNT(CASE WHEN i.live_stock_qty > 0 THEN 1 END)::int AS positive_stock_count,
         COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
                      OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
                    THEN 1 END)::int AS critical_stock,
@@ -75,35 +77,46 @@ router.get(
     `;
     const stats = await queryOne<Record<string, unknown>>(statsSql);
 
-    // 2. Category distribution
+    // 2. Unit Breakdown (no mixed units)
+    const unitsSummary = await query<{ primary_uom: string; item_count: number; total_qty: string }>(
+      `SELECT primary_uom, COUNT(*)::int AS item_count, COALESCE(SUM(live_stock_qty), 0)::numeric(18, 4) AS total_qty
+         FROM inventory_items
+        WHERE deleted_at IS NULL
+        GROUP BY primary_uom
+        ORDER BY item_count DESC`,
+    );
+
+    // 3. Category distribution from dedicated inventory_items
     const catSql = `
       SELECT
-        i.inventory_category AS category,
+        ii.category,
         COUNT(*)::int AS item_count,
-        COALESCE(SUM(i.live_stock_qty), 0)::numeric(18, 4) AS stock_qty,
-        COALESCE(SUM(i.live_stock_qty * COALESCE(i.standard_rate, 0)), 0)::numeric(18, 2) AS valuation,
-        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                     OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
-                   THEN 1 END)::int AS critical_count,
-        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
-                     AND COALESCE(i.reorder_level, 0) > 0
-                   THEN 1 END)::int AS below_reorder_count
-        FROM items i
-        LEFT JOIN (
-          SELECT rl.item_id, SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) AS allocated_qty
-            FROM requisition_lines rl
-            JOIN requisition_headers rh ON rh.id = rl.requisition_id
-            JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
-           WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
-           GROUP BY rl.item_id
-        ) req ON req.item_id = i.id
-       WHERE i.deleted_at IS NULL AND i.is_active = TRUE
-       GROUP BY i.inventory_category
-       ORDER BY i.inventory_category
+        COUNT(CASE WHEN ii.source_spreadsheet_id IS NOT NULL THEN 1 END)::int AS sheet_items_count,
+        COUNT(CASE WHEN ii.source_spreadsheet_id IS NULL THEN 1 END)::int AS unsynced_items_count,
+        COALESCE(SUM(ii.live_stock_qty), 0)::numeric(18, 4) AS stock_qty,
+        COALESCE(SUM(CASE WHEN ii.source_spreadsheet_id IS NOT NULL THEN ii.live_stock_qty ELSE 0 END), 0)::numeric(18, 4) AS sheet_stock_qty,
+        COALESCE(SUM(ii.live_weight_kg), 0)::numeric(18, 4) AS total_weight_kg,
+        ROUND(COALESCE(SUM(ii.live_weight_kg), 0) / 1000, 2)::numeric(18, 2) AS weight_ton,
+        COALESCE(SUM(ii.live_stock_qty * COALESCE(ii.unit_price, 0)), 0)::numeric(18, 2) AS valuation,
+        COUNT(CASE WHEN ii.live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
+        COUNT(CASE WHEN ii.live_stock_qty > 0 THEN 1 END)::int AS positive_stock_count,
+        COUNT(CASE WHEN ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 1 END)::int AS critical_count,
+        COUNT(CASE WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 AND NOT (ii.available_qty < ii.min_stock_level) THEN 1 END)::int AS below_reorder_count,
+        COALESCE(q.quarantined_count, 0)::int AS quarantined_count
+      FROM inventory_items ii
+      LEFT JOIN (
+        SELECT category, COUNT(*)::int AS quarantined_count
+        FROM inventory_quarantine
+        WHERE resolution_status = 'PENDING'
+        GROUP BY category
+      ) q ON q.category = ii.category
+      WHERE ii.deleted_at IS NULL
+      GROUP BY ii.category, q.quarantined_count
+      ORDER BY ii.category
     `;
     const catRows = await query<Record<string, unknown>>(catSql);
 
-    // 3. Pipeline activity
+    // 4. Pipeline activity
     const indentsSummary = await queryOne<{ count: string; qty: string }>(
       `SELECT COUNT(DISTINCT indent_id)::int AS count, COALESCE(SUM(pending_qty), 0)::numeric(18, 4) AS qty
          FROM v_indent_line_balance WHERE indent_status IN ('APPROVED', 'PENDING_APPROVAL')`,
@@ -120,7 +133,7 @@ router.get(
         WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')`,
     );
 
-    // 4. Today's movement
+    // 5. Today's movement
     const todayMovements = await queryOne<{ inward_qty: string; outward_qty: string; txns_count: string }>(
       `SELECT
          COALESCE(SUM(inward_qty), 0)::numeric(18, 4) AS inward_qty,
@@ -130,7 +143,15 @@ router.get(
        WHERE txn_date = CURRENT_DATE`,
     );
 
-    // 5. Recent 10 ledger movements
+    // 6. Quarantine & Unsynced Discrepancies
+    const quarantineSummary = await queryOne<{ count: string }>(
+      `SELECT COUNT(*)::int AS count FROM inventory_quarantine WHERE resolution_status = 'PENDING'`,
+    );
+    const unsyncedSummary = await queryOne<{ count: string }>(
+      `SELECT COUNT(*)::int AS count FROM inventory_items WHERE source_spreadsheet_id IS NULL AND deleted_at IS NULL`,
+    );
+
+    // 7. Recent 10 ledger movements
     const recentLedger = await query<Record<string, unknown>>(
       `SELECT sl.id, sl.item_id, i.item_code, i.item_description, i.inventory_category AS category,
               COALESCE(u.code, '') AS uom_code,
@@ -150,6 +171,8 @@ router.get(
         totalItems: Number(stats?.total_items ?? 0),
         totalStockQty: Number(stats?.total_stock_qty ?? 0),
         totalValuation: Number(stats?.total_valuation ?? 0),
+        zeroStockCount: Number(stats?.zero_stock_count ?? 0),
+        positiveStockCount: Number(stats?.positive_stock_count ?? 0),
         normalStock: Number(stats?.normal_stock ?? 0),
         belowReorder: Number(stats?.below_reorder ?? 0),
         criticalStock: Number(stats?.critical_stock ?? 0),
@@ -163,7 +186,14 @@ router.get(
         todayInwardQty: Number(todayMovements?.inward_qty ?? 0),
         todayOutwardQty: Number(todayMovements?.outward_qty ?? 0),
         todayTxnsCount: Number(todayMovements?.txns_count ?? 0),
+        quarantinedCount: Number(quarantineSummary?.count ?? 0),
+        unsyncedCount: Number(unsyncedSummary?.count ?? 0),
       },
+      unitsSummary: unitsSummary.map((u) => ({
+        uom: u.primary_uom,
+        itemCount: Number(u.item_count),
+        totalQty: Number(u.total_qty),
+      })),
       categoryBreakdown: catRows,
       recentMovements: recentLedger.map((r) => ({
         ...r,
@@ -1436,7 +1466,9 @@ router.get(
     const category = parseCat.data;
 
     const q = listQuerySchema.extend({
-      status: z.enum(['ALL', 'NORMAL', 'BELOW_REORDER', 'CRITICAL', 'EXCESS']).default('ALL'),
+      status: z.enum(['ALL', 'NORMAL', 'BELOW_REORDER', 'CRITICAL', 'EXCESS', 'ZERO_STOCK', 'POSITIVE_STOCK']).default('ALL'),
+      source: z.enum(['ALL', 'LIVE_SHEET', 'ERP_ONLY']).default('ALL'),
+      mainGroup: z.string().trim().optional(),
     }).parse(req.query);
 
     const b = new SqlBuilder();
@@ -1448,6 +1480,17 @@ router.get(
       whereClause += ` AND (ii.item_code ILIKE ${s} OR ii.item_description ILIKE ${s} OR ii.rack_id ILIKE ${s})`;
     }
 
+    if (q.source === 'LIVE_SHEET') {
+      whereClause += ` AND ii.source_spreadsheet_id IS NOT NULL`;
+    } else if (q.source === 'ERP_ONLY') {
+      whereClause += ` AND ii.source_spreadsheet_id IS NULL`;
+    }
+
+    if (q.mainGroup) {
+      const mg = b.push(q.mainGroup);
+      whereClause += ` AND ii.main_group = ${mg}`;
+    }
+
     if (q.status !== 'ALL') {
       if (q.status === 'CRITICAL') {
         whereClause += ` AND (ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0))`;
@@ -1457,6 +1500,10 @@ router.get(
         whereClause += ` AND (ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2))`;
       } else if (q.status === 'NORMAL') {
         whereClause += ` AND (ii.available_qty > ii.reorder_point OR (ii.reorder_point = 0 AND ii.available_qty > ii.min_stock_level))`;
+      } else if (q.status === 'ZERO_STOCK') {
+        whereClause += ` AND ii.live_stock_qty = 0`;
+      } else if (q.status === 'POSITIVE_STOCK') {
+        whereClause += ` AND ii.live_stock_qty > 0`;
       }
     }
 
@@ -1533,9 +1580,14 @@ router.get(
     const sql = `
       SELECT
         COUNT(*)::int AS total_items,
+        COUNT(CASE WHEN source_spreadsheet_id IS NOT NULL THEN 1 END)::int AS sheet_items_count,
+        COUNT(CASE WHEN source_spreadsheet_id IS NULL THEN 1 END)::int AS unsynced_items_count,
         COALESCE(SUM(live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
+        COALESCE(SUM(CASE WHEN source_spreadsheet_id IS NOT NULL THEN live_stock_qty ELSE 0 END), 0)::numeric(18, 4) AS sheet_stock_qty,
         COALESCE(SUM(live_weight_kg), 0)::numeric(18, 4) AS total_weight_kg,
         COALESCE(SUM(live_stock_qty * COALESCE(unit_price, 0)), 0)::numeric(18, 2) AS total_valuation,
+        COUNT(CASE WHEN live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
+        COUNT(CASE WHEN live_stock_qty > 0 THEN 1 END)::int AS positive_stock_count,
         COUNT(CASE WHEN available_qty < min_stock_level OR (min_stock_level > 0 AND available_qty = 0) THEN 1 END)::int AS critical_count,
         COUNT(CASE WHEN available_qty <= reorder_point AND reorder_point > 0 AND NOT (available_qty < min_stock_level) THEN 1 END)::int AS below_reorder_count,
         COUNT(CASE WHEN allocated_qty > 0 THEN 1 END)::int AS reserved_items_count,
@@ -1553,24 +1605,193 @@ router.get(
       [category],
     );
 
+    // Check quarantined count
+    const quarantineCount = await queryOne<{ count: string }>(
+      `SELECT COUNT(*)::int AS count FROM inventory_quarantine WHERE category = $1 AND resolution_status = 'PENDING'`,
+      [category],
+    );
+
+    // Check transaction counts
+    const txnStats = await queryOne<any>(
+      `SELECT
+         COUNT(CASE WHEN direction = 'IN' THEN 1 END)::int AS inward_count,
+         COALESCE(SUM(CASE WHEN direction = 'IN' THEN quantity ELSE 0 END), 0)::numeric(18, 4) AS inward_qty,
+         COUNT(CASE WHEN direction = 'OUT' THEN 1 END)::int AS outward_count,
+         COALESCE(SUM(CASE WHEN direction = 'OUT' THEN quantity ELSE 0 END), 0)::numeric(18, 4) AS outward_qty,
+         COUNT(CASE WHEN txn_type = 'PRODUCTION_INWARD' THEN 1 END)::int AS prod_inward_count,
+         COALESCE(SUM(CASE WHEN txn_type = 'PRODUCTION_INWARD' THEN quantity ELSE 0 END), 0)::numeric(18, 4) AS prod_inward_qty
+       FROM inventory_transactions
+       WHERE category = $1`,
+      [category],
+    );
+
+    // Main groups breakdown
+    const mainGroups = await query<{ main_group: string; count: number; total_qty: string }>(
+      `SELECT main_group, COUNT(*)::int AS count, COALESCE(SUM(live_stock_qty), 0)::numeric(18, 4) AS total_qty
+       FROM inventory_items
+       WHERE category = $1 AND deleted_at IS NULL AND main_group IS NOT NULL AND main_group <> ''
+       GROUP BY main_group
+       ORDER BY count DESC
+       LIMIT 10`,
+      [category],
+    );
+
     sendOk(res, {
       category,
       stats: {
         totalItems: stats?.total_items || 0,
+        sheetItemsCount: stats?.sheet_items_count || 0,
+        unsyncedItemsCount: stats?.unsynced_items_count || 0,
         totalStockQty: Number(stats?.total_stock_qty || 0),
+        sheetStockQty: Number(stats?.sheet_stock_qty || 0),
         totalWeightKg: Number(stats?.total_weight_kg || 0),
         totalWeightTon: Number((Number(stats?.total_weight_kg || 0) / 1000).toFixed(2)),
         totalValuation: Number(stats?.total_valuation || 0),
         valuationLakhs: Number((Number(stats?.total_valuation || 0) / 100000).toFixed(2)),
         valuationCr: Number((Number(stats?.total_valuation || 0) / 10000000).toFixed(2)),
+        zeroStockCount: stats?.zero_stock_count || 0,
+        positiveStockCount: stats?.positive_stock_count || 0,
         criticalCount: stats?.critical_count || 0,
         belowReorderCount: stats?.below_reorder_count || 0,
         reservedItemsCount: stats?.reserved_items_count || 0,
         totalAllocatedQty: Number(stats?.total_allocated_qty || 0),
+        quarantinedCount: Number(quarantineCount?.count || 0),
+        inwardTxnCount: txnStats?.inward_count || 0,
+        inwardTxnQty: Number(txnStats?.inward_qty || 0),
+        outwardTxnCount: txnStats?.outward_count || 0,
+        outwardTxnQty: Number(txnStats?.outward_qty || 0),
+        prodInwardTxnCount: txnStats?.prod_inward_count || 0,
+        prodInwardTxnQty: Number(txnStats?.prod_inward_qty || 0),
         lastSyncAt: stats?.last_sync_at,
       },
+      mainGroups: mainGroups.map((m) => ({
+        name: m.main_group,
+        count: m.count,
+        totalQty: Number(m.total_qty),
+      })),
       lastSync: lastCheck || null,
     });
+  }),
+);
+
+// 2b. GET /inventory/categories/:category/export - Export Category Register to CSV
+router.get(
+  '/categories/:category/export',
+  requirePermission('inventory.view'),
+  asyncHandler(async (req, res) => {
+    const rawCategory = (req.params.category || '').toUpperCase();
+    const parseCat = categoryParam.safeParse(rawCategory);
+    if (!parseCat.success) {
+      throw ValidationError(`Invalid inventory category "${req.params.category}".`);
+    }
+    const category = parseCat.data;
+
+    const rows = await query<any>(
+      `SELECT
+         ii.item_code,
+         ii.item_description,
+         ii.main_group,
+         ii.primary_uom,
+         ii.rack_id,
+         ii.live_stock_qty,
+         ii.live_weight_kg,
+         ii.weight_per_1000pc_kg,
+         ii.unit_price,
+         ROUND((ii.live_stock_qty * COALESCE(ii.unit_price, 0)), 2) AS valuation,
+         CASE
+           WHEN ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
+           WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 THEN 'BELOW_REORDER'
+           WHEN ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2) THEN 'EXCESS'
+           ELSE 'NORMAL'
+         END AS stock_status,
+         CASE WHEN ii.source_spreadsheet_id IS NOT NULL THEN 'LIVE_SHEET' ELSE 'ERP_ONLY' END AS origin,
+         ii.source_tab,
+         ii.source_row_index,
+         ii.last_sync_at
+       FROM inventory_items ii
+       WHERE ii.category = $1 AND ii.deleted_at IS NULL
+       ORDER BY ii.item_code ASC`,
+      [category],
+    );
+
+    const headers = [
+      'Item Code', 'Description', 'Main Group', 'UOM', 'Rack ID',
+      'Live Stock Qty', 'Live Weight (Kg)', '1000pc Wt (Kg)', 'Unit Rate (Rs)',
+      'Valuation (Rs)', 'Stock Status', 'Data Source', 'Source Tab', 'Source Row', 'Last Sync At'
+    ];
+
+    const lines = [headers.join(',')];
+    for (const r of rows) {
+      lines.push([
+        `"${(r.item_code || '').replace(/"/g, '""')}"`,
+        `"${(r.item_description || '').replace(/"/g, '""')}"`,
+        `"${(r.main_group || '').replace(/"/g, '""')}"`,
+        `"${r.primary_uom || ''}"`,
+        `"${(r.rack_id || '').replace(/"/g, '""')}"`,
+        r.live_stock_qty ?? 0,
+        r.live_weight_kg ?? '',
+        r.weight_per_1000pc_kg ?? '',
+        r.unit_price ?? 0,
+        r.valuation ?? 0,
+        r.stock_status,
+        r.origin,
+        `"${r.source_tab || ''}"`,
+        r.source_row_index || '',
+        r.last_sync_at ? new Date(r.last_sync_at).toISOString() : '',
+      ].join(','));
+    }
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="inventory_${category.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(lines.join('\r\n'));
+  }),
+);
+
+// 2c. GET /inventory/quarantine - View Quarantined Data Records
+router.get(
+  '/quarantine',
+  requirePermission('inventory.view'),
+  asyncHandler(async (req, res) => {
+    const q = listQuerySchema.extend({
+      category: categoryParam.optional(),
+      status: z.enum(['PENDING', 'RESOLVED', 'IGNORED', 'ALL']).default('ALL'),
+    }).parse(req.query);
+
+    const b = new SqlBuilder();
+    let whereClause = '1=1';
+
+    if (q.category) {
+      const c = b.push(q.category);
+      whereClause += ` AND category = ${c}`;
+    }
+
+    if (q.status !== 'ALL') {
+      const s = b.push(q.status);
+      whereClause += ` AND resolution_status = ${s}`;
+    }
+
+    if (q.search) {
+      const s = b.push(`%${q.search}%`);
+      whereClause += ` AND (quarantine_reason ILIKE ${s} OR raw_data::text ILIKE ${s})`;
+    }
+
+    const countSql = `SELECT COUNT(*)::int AS count FROM inventory_quarantine WHERE ${whereClause}`;
+    const totalRow = await queryOne<{ count: number }>(countSql, b.params);
+    const total = totalRow?.count || 0;
+
+    const limitParam = b.push(q.pageSize);
+    const offsetParam = b.push(offsetOf(q));
+
+    const rowsSql = `
+      SELECT id, category, source_tab, source_row_index, raw_data, quarantine_reason, resolution_status, created_at
+      FROM inventory_quarantine
+      WHERE ${whereClause}
+      ORDER BY id DESC
+      LIMIT ${limitParam} OFFSET ${offsetParam}
+    `;
+
+    const rows = await query<any>(rowsSql, b.params);
+    sendPage(res, rows, total, q.page, q.pageSize);
   }),
 );
 

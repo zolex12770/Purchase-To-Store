@@ -39,6 +39,11 @@ export const SHEET_SOURCES: Record<
     uomCol?: number;
     rackCol?: number;
     rateCol?: number;
+    amountCol?: number;
+    mainGroupCol?: number;
+    weight1000pcCol?: number;
+    markingCol?: number;
+    seriesCol?: number;
     headerRow: number;
   }
 > = {
@@ -46,12 +51,14 @@ export const SHEET_SOURCES: Record<
     spreadsheetId: '1smKiS3li81F7aH2pQ0JGgDLp7302d48FJkvWefRf8R4',
     stockTab: 'RM Stock Live',
     stockRange: "'RM Stock Live'!A9:Z",
-    codeCol: 1, // Item Code
-    descCol: 2, // Item Name
-    qtyCol: 6, // Live Stock KG
+    codeCol: 1, // Item Code (Col B)
+    descCol: 2, // Item Name (Col C)
+    mainGroupCol: 4, // Main Group (Col E)
+    rackCol: 5, // Rack ID (Col F)
+    qtyCol: 6, // Live Stock KG (Col G)
     weightCol: 6, // KG
+    amountCol: 7, // Amount (Col H)
     uomCol: -1, // default KG
-    rackCol: 5,
     rateCol: -1,
     headerRow: 1,
   },
@@ -59,12 +66,15 @@ export const SHEET_SOURCES: Record<
     spreadsheetId: '1mA5il8Jqjgal9g20o-UzqQGv3y-mgPHpjl9KU-XomyQ',
     stockTab: 'FG  Stock Live',
     stockRange: "'FG  Stock Live'!A11:Z",
-    codeCol: 1, // Item Code
-    descCol: 5, // Description
-    qtyCol: 7, // Store Live Stock in Nos
-    weightCol: 8, // Store Live Stock in Kgs
+    codeCol: 1, // Item Code (Col B)
+    markingCol: 2, // Marking (Col C)
+    weight1000pcCol: 3, // 1000pc Weight (Col D)
+    seriesCol: 4, // Customer / Series Name (Col E)
+    descCol: 5, // Description (Col F)
+    rackCol: 6, // Rack Id (Col G)
+    qtyCol: 7, // Store Live Stock in Nos (Col H)
+    weightCol: 8, // Store Live Stock in Kgs (Col I)
     uomCol: -1, // default Nos
-    rackCol: 6,
     rateCol: -1,
     headerRow: 1,
   },
@@ -72,24 +82,29 @@ export const SHEET_SOURCES: Record<
     spreadsheetId: '14AHr2aSmpcCxfNhcWnjGU1DVE-BfJpLOWrnFn3bkilk',
     stockTab: 'Trading Live Stock',
     stockRange: "'Trading Live Stock'!A9:Z",
-    codeCol: 1, // Item Code
-    descCol: 2, // Item Name
-    qtyCol: 7, // Live Stock (Qty)
-    uomCol: 4, // Unit
-    rackCol: 5,
-    rateCol: 6,
+    codeCol: 1, // Item Code (Col B)
+    descCol: 2, // Item Name (Col C)
+    mainGroupCol: 3, // Group (Col D)
+    uomCol: 4, // Unit (Col E)
+    rackCol: 5, // Rack ID (Col F)
+    rateCol: 6, // Rate(Rs) (Col G)
+    qtyCol: 7, // Live Stock (Qty) (Col H)
+    amountCol: 8, // Live Stock Amount (Rs) (Col I)
     headerRow: 1,
   },
   WIP: {
     spreadsheetId: '1BirIwXOG4F604q5n1UY0r6kjet4mTdmbhC9FDbTrUXs',
     stockTab: 'WIP  Stock Live',
     stockRange: "'WIP  Stock Live'!A10:Z",
-    codeCol: 0, // Item Code
-    descCol: 8, // Description
-    qtyCol: 10, // Store Live Stock in Nos
-    weightCol: 11, // Store Live Stock in Kgs
+    codeCol: 0, // Item Code (Col A)
+    markingCol: 5, // Marking (Col F)
+    weight1000pcCol: 6, // 1000pc Weight (Col G)
+    seriesCol: 7, // Series (Col H)
+    descCol: 8, // Description (Col I)
+    rackCol: 9, // Rack Id (Col J)
+    qtyCol: 10, // Store Live Stock in Nos (Col K)
+    weightCol: 11, // Store Live Stock in Kgs (Col L)
     uomCol: -1, // default Nos
-    rackCol: 9,
     rateCol: -1,
     headerRow: 1,
   },
@@ -97,13 +112,15 @@ export const SHEET_SOURCES: Record<
     spreadsheetId: '1VnpDk6kBK2xUGJTVB1CCqlG105UX0_Gs0aAv-bnMpKY',
     stockTab: 'General Item Live Stock',
     stockRange: "'General Item Live Stock'!A7:Z",
-    codeCol: 1, // Item Code
-    descCol: 2, // Item Name
-    qtyCol: 7, // Live Stock Qty
-    uomCol: 4, // Unit
-    rackCol: 6,
+    codeCol: 1, // Item Code (Col B)
+    descCol: 2, // Item Name (Col C)
+    mainGroupCol: 3, // Main Group (Col D)
+    uomCol: 4, // Unit (Col E)
+    rackCol: 6, // Rack ID (Col G)
+    qtyCol: 7, // Live Stock Qty (Col H)
+    amountCol: 8, // Live Stock Amount (Rs) (Col I)
     rateCol: -1,
-    headerRow: 3, // row 9 is header, data starts at index 3
+    headerRow: 1, // row 7 is header, data starts at index 1 (row 8)
   },
 };
 
@@ -178,7 +195,7 @@ export async function syncCategoryFromSheet(category: InventoryCategory): Promis
         await tx.query('SAVEPOINT row_sp');
         try {
           if (isNaN(parsedQty) || parsedQty < 0) {
-            // Quarantine invalid or negative quantities to prevent constraint violation
+            // Quarantine invalid or negative quantities to protect ledger integrity
             await tx.query(
               `INSERT INTO inventory_quarantine (category, source_tab, source_row_index, raw_data, quarantine_reason)
                VALUES ($1, $2, $3, $4::jsonb, $5)`,
@@ -202,6 +219,27 @@ export async function syncCategoryFromSheet(category: InventoryCategory): Promis
             if (!isNaN(w)) parsedWeight = w;
           }
 
+          let parsedWeight1000pc: number = 0;
+          if (cfg.weight1000pcCol !== undefined && cfg.weight1000pcCol >= 0 && row[cfg.weight1000pcCol]) {
+            const rawW1000 = String(row[cfg.weight1000pcCol]).replace(/,/g, '').trim();
+            const w1000 = parseFloat(rawW1000);
+            if (!isNaN(w1000) && w1000 > 0) parsedWeight1000pc = w1000;
+          }
+
+          let unitPrice: number = 0;
+          if (cfg.rateCol !== undefined && cfg.rateCol >= 0 && row[cfg.rateCol]) {
+            const rawR = String(row[cfg.rateCol]).replace(/,/g, '').trim();
+            const r = parseFloat(rawR);
+            if (!isNaN(r) && r > 0) unitPrice = r;
+          } else if (cfg.amountCol !== undefined && cfg.amountCol >= 0 && row[cfg.amountCol]) {
+            const rawA = String(row[cfg.amountCol]).replace(/,/g, '').trim();
+            const a = parseFloat(rawA);
+            if (!isNaN(a) && a > 0 && parsedQty > 0) {
+              unitPrice = parseFloat((a / parsedQty).toFixed(4));
+            }
+          }
+
+          const mainGroup = cfg.mainGroupCol !== undefined && cfg.mainGroupCol >= 0 && row[cfg.mainGroupCol] ? String(row[cfg.mainGroupCol]).trim() : null;
           const rackId = cfg.rackCol !== undefined && cfg.rackCol >= 0 && row[cfg.rackCol] ? String(row[cfg.rackCol]).trim() : null;
           const primaryUom = cfg.uomCol !== undefined && cfg.uomCol >= 0 && row[cfg.uomCol] ? String(row[cfg.uomCol]).trim() : (category === 'RM' ? 'Kg' : 'Nos');
 
@@ -240,11 +278,13 @@ export async function syncCategoryFromSheet(category: InventoryCategory): Promis
             `INSERT INTO inventory_items (
                item_id, item_code, item_description, category, primary_uom,
                opening_stock_qty, live_stock_qty, live_weight_kg, available_qty,
-               rack_id, source_spreadsheet_id, source_tab, source_row_index, last_sync_at
+               rack_id, main_group, weight_per_1000pc_kg, unit_price,
+               source_spreadsheet_id, source_tab, source_row_index, last_sync_at
              ) VALUES (
                $1, $2, $3, $4, $5,
                $6, $7, $8, $9,
-               $10, $11, $12, $13, now()
+               $10, $11, $12, $13,
+               $14, $15, $16, now()
              )
              ON CONFLICT (item_code, category)
              DO UPDATE SET
@@ -252,6 +292,10 @@ export async function syncCategoryFromSheet(category: InventoryCategory): Promis
                live_weight_kg = COALESCE(EXCLUDED.live_weight_kg, inventory_items.live_weight_kg),
                available_qty = GREATEST(EXCLUDED.live_stock_qty - inventory_items.allocated_qty, 0),
                rack_id = COALESCE(EXCLUDED.rack_id, inventory_items.rack_id),
+               main_group = COALESCE(EXCLUDED.main_group, inventory_items.main_group),
+               weight_per_1000pc_kg = CASE WHEN EXCLUDED.weight_per_1000pc_kg > 0 THEN EXCLUDED.weight_per_1000pc_kg ELSE inventory_items.weight_per_1000pc_kg END,
+               unit_price = CASE WHEN EXCLUDED.unit_price > 0 THEN EXCLUDED.unit_price ELSE inventory_items.unit_price END,
+               item_description = EXCLUDED.item_description,
                source_spreadsheet_id = EXCLUDED.source_spreadsheet_id,
                source_tab = EXCLUDED.source_tab,
                source_row_index = EXCLUDED.source_row_index,
@@ -268,6 +312,9 @@ export async function syncCategoryFromSheet(category: InventoryCategory): Promis
               parsedWeight,
               parsedQty,
               rackId,
+              mainGroup,
+              parsedWeight1000pc,
+              unitPrice,
               cfg.spreadsheetId,
               cfg.stockTab,
               i + cfg.headerRow + 1,
