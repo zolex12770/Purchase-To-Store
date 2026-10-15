@@ -14,9 +14,9 @@ import { useNavigate, useSearchParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Zap, Download, CheckCircle2, XCircle, FileText,
-  Boxes, ArrowRight, History, ClipboardCheck,
-  PackageSearch, Plus, LayoutDashboard, PackageMinus, Package,
-  RefreshCw, Layers, PackageCheck, Tag,
+  ArrowRight, ClipboardCheck,
+  PackageSearch, Plus, PackageMinus,
+  RefreshCw,
 } from 'lucide-react';
 import { api, downloadFile, qs, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
@@ -27,7 +27,7 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { StatTile } from '../../components/KpiCard';
 import {
-  Button, Card, CardBody, CardHeader, Badge, StatusBadge, Tabs,
+  Button, Card, CardBody, CardHeader, Badge, StatusBadge,
   Modal, Field, Textarea, Select, Input,
 } from '../../components/ui';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
@@ -224,6 +224,53 @@ const CATEGORY_TONES: Record<string, 'neutral' | 'success' | 'warning' | 'info'>
   FG: 'success',
   TRADING: 'warning',
   WIP: 'neutral',
+};
+
+const PAGE_INFO: Record<string, { title: string; subtitle: string }> = {
+  overview: {
+    title: 'Inventory Overview & Analytics',
+    subtitle: 'Live stock valuation, operational KPIs, pipeline tracking and sync checkpoints',
+  },
+  rm: {
+    title: 'Raw Material (RM)',
+    subtitle: 'RM live stock, GRN inward, RM outward and production inward movements',
+  },
+  fg: {
+    title: 'Finished Goods (FG)',
+    subtitle: 'FG live stock, packing inward and sales/dispatch outward movements',
+  },
+  wip: {
+    title: 'Work in Progress (WIP)',
+    subtitle: 'WIP live stage stock, stage inward and stage outward movements',
+  },
+  trading: {
+    title: 'Trading Materials',
+    subtitle: 'Trading live stock, purchase inward and trading outward issues',
+  },
+  general: {
+    title: 'General Stores & Spares',
+    subtitle: 'General consumables live stock, GRN inward register and issue outward register',
+  },
+  stock: {
+    title: 'Unified Stock Register',
+    subtitle: 'Authoritative stock balances across all materials and finished goods',
+  },
+  ledger: {
+    title: 'Stock Movement Ledger',
+    subtitle: 'Complete chronological audit trail of inward receipts, store issues and adjustments',
+  },
+  adjustments: {
+    title: 'Physical Count Adjustments',
+    subtitle: 'Cycle count physical reconciliation, variance tracking and findings audit',
+  },
+  'requisition-queue': {
+    title: 'Store Requisition Queue',
+    subtitle: 'Approved material requisitions awaiting issue from stores with real-time stock availability',
+  },
+  'auto-indent': {
+    title: 'Auto Indent Replenishment',
+    subtitle: 'Automated replenishment recommendations based on min/max and reorder thresholds',
+  },
 };
 
 export default function InventoryStockPage() {
@@ -1117,10 +1164,22 @@ export default function InventoryStockPage() {
   return (
     <div>
       <PageHeader
-        title="Enterprise Inventory & Stock"
-        subtitle="Operational inventory register, material balance ledger, physical count reconciliation & automated replenishment"
+        title={PAGE_INFO[currentTab]?.title || 'Inventory Management'}
+        subtitle={PAGE_INFO[currentTab]?.subtitle || 'Operational material management'}
         actions={
           <div className="row" style={{ gap: 'var(--sp-2)' }}>
+            {currentTab === 'overview' && can('inventory.adjust') && (
+              <Button
+                variant="primary"
+                size="sm"
+                icon={<RefreshCw size={14} className={syncAllMutation.isPending ? 'spin' : ''} />}
+                loading={syncAllMutation.isPending}
+                onClick={() => syncAllMutation.mutate()}
+              >
+                Sync All 5 Google Sheets
+              </Button>
+            )}
+
             {currentTab === 'stock' && can('inventory.export') && (
               <Button variant="secondary" size="sm" icon={<Download size={14} />} onClick={() => void exportStockCsv()}>
                 Export Register CSV
@@ -1133,9 +1192,9 @@ export default function InventoryStockPage() {
               </Button>
             )}
 
-            {can('inventory.adjust') && (
+            {currentTab === 'adjustments' && can('inventory.adjust') && (
               <Button
-                variant="secondary"
+                variant="primary"
                 size="sm"
                 icon={<Plus size={14} />}
                 onClick={() => {
@@ -1145,11 +1204,11 @@ export default function InventoryStockPage() {
                   setIsAdjModalOpen(true);
                 }}
               >
-                Adjust Stock Count
+                Record Physical Count Adjustment
               </Button>
             )}
 
-            {can('auto_indent.config') && (
+            {currentTab === 'auto-indent' && can('auto_indent.config') && (
               <Button
                 variant="primary"
                 size="sm"
@@ -1163,36 +1222,6 @@ export default function InventoryStockPage() {
           </div>
         }
       />
-
-      <div style={{ marginBottom: 'var(--sp-4)' }}>
-        <Tabs
-          tabs={[
-            { key: 'overview', label: 'Overview & Analytics', icon: <LayoutDashboard size={16} /> },
-            { key: 'rm', label: 'Raw Material (RM)', icon: <Layers size={16} /> },
-            { key: 'fg', label: 'Finished Goods (FG)', icon: <PackageCheck size={16} /> },
-            { key: 'wip', label: 'Work in Progress (WIP)', icon: <Boxes size={16} /> },
-            { key: 'trading', label: 'Trading Materials', icon: <Tag size={16} /> },
-            { key: 'general', label: 'General Stores & Spares', icon: <Package size={16} /> },
-            { key: 'stock', label: 'Unified Stock Register', icon: <Boxes size={16} /> },
-            { key: 'ledger', label: 'Movement Ledger', icon: <History size={16} /> },
-            { key: 'adjustments', label: 'Physical Adjustments', icon: <ClipboardCheck size={16} /> },
-            {
-              key: 'requisition-queue',
-              label: 'Requisition Queue',
-              icon: <PackageSearch size={16} />,
-              count: reqQueueData?.length ?? undefined,
-            },
-            {
-              key: 'auto-indent',
-              label: 'Auto Indent Replenish',
-              icon: <Zap size={16} />,
-              count: autoIndentStats?.pending ?? undefined,
-            },
-          ]}
-          active={currentTab}
-          onChange={setTab}
-        />
-      </div>
 
       {/* ── 1. OVERVIEW & ANALYTICS TAB ────────────────────────────────────────── */}
       {currentTab === 'overview' && (
@@ -1241,195 +1270,6 @@ export default function InventoryStockPage() {
               sub="Above maximum inventory limit"
             />
           </div>
-
-          {/* Factory Store Quick Action Hub */}
-          <Card>
-            <CardHeader
-              title="Factory Store Quick Action Hub"
-              subtitle="Direct operational access to category workspaces, rapid store issues, physical counts, and live sheet synchronization"
-              actions={
-                can('inventory.adjust') && (
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    icon={<RefreshCw size={13} className={syncAllMutation.isPending ? 'spin' : ''} />}
-                    loading={syncAllMutation.isPending}
-                    onClick={() => syncAllMutation.mutate()}
-                  >
-                    Sync All 5 Google Sheets
-                  </Button>
-                )
-              }
-            />
-            <CardBody>
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-                  gap: 'var(--sp-3)',
-                }}
-              >
-                <div
-                  onClick={() => setTab('rm')}
-                  style={{
-                    padding: 'var(--sp-3)',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                    backgroundColor: 'var(--surface)',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                  }}
-                >
-                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
-                    <Layers size={18} color="var(--brand-600)" />
-                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Raw Material (RM)</span>
-                  </div>
-                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
-                    Ton & Kg dual-units, Copper / Aluminium stock & sheet sync
-                  </span>
-                </div>
-
-                <div
-                  onClick={() => setTab('fg')}
-                  style={{
-                    padding: 'var(--sp-3)',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                    backgroundColor: 'var(--surface)',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                  }}
-                >
-                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
-                    <PackageCheck size={18} color="var(--success-600)" />
-                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Finished Goods (FG)</span>
-                  </div>
-                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
-                    Nos & Weight dual-units, series tags & dispatch availability
-                  </span>
-                </div>
-
-                <div
-                  onClick={() => setTab('wip')}
-                  style={{
-                    padding: 'var(--sp-3)',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                    backgroundColor: 'var(--surface)',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                  }}
-                >
-                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
-                    <Boxes size={18} color="var(--neutral-600)" />
-                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Work in Progress (WIP)</span>
-                  </div>
-                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
-                    Sheet Metal, Plating, Assembly intermediate stages
-                  </span>
-                </div>
-
-                <div
-                  onClick={() => setTab('trading')}
-                  style={{
-                    padding: 'var(--sp-3)',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                    backgroundColor: 'var(--surface)',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                  }}
-                >
-                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
-                    <Tag size={18} color="var(--warning-600)" />
-                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Trading Materials</span>
-                  </div>
-                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
-                    Resale materials, purchase rates & reorder tracking
-                  </span>
-                </div>
-
-                <div
-                  onClick={() => setTab('general')}
-                  style={{
-                    padding: 'var(--sp-3)',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                    backgroundColor: 'var(--surface)',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                  }}
-                >
-                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
-                    <Package size={18} color="var(--neutral-800)" />
-                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>General Stores & Spares</span>
-                  </div>
-                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
-                    Packaging (Bag/Box), Hardware, Safety, Electrical & Consumables
-                  </span>
-                </div>
-
-                <div
-                  onClick={() => navigate('/inventory/direct-issue')}
-                  style={{
-                    padding: 'var(--sp-3)',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                    backgroundColor: 'var(--surface)',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                  }}
-                >
-                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
-                    <PackageMinus size={18} color="var(--danger-600)" />
-                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Direct Store Issue</span>
-                  </div>
-                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
-                    Urgent counter issue directly without prior requisition
-                  </span>
-                </div>
-
-                <div
-                  onClick={() => {
-                    setSelectedAdjItem(null);
-                    setAdjItemSearch('');
-                    setAdjActualCount('');
-                    setIsAdjModalOpen(true);
-                  }}
-                  style={{
-                    padding: 'var(--sp-3)',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                    backgroundColor: 'var(--surface)',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                  }}
-                >
-                  <div className="row" style={{ alignItems: 'center', gap: 8 }}>
-                    <ClipboardCheck size={18} color="var(--brand-600)" />
-                    <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Physical Count Audit</span>
-                  </div>
-                  <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
-                    Cycle count physical reconciliation & variance audit
-                  </span>
-                </div>
-              </div>
-            </CardBody>
-          </Card>
 
           {/* Operational Pipeline & Day Movements */}
           <div
@@ -1537,17 +1377,6 @@ export default function InventoryStockPage() {
                         </div>
                       )}
                     </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      style={{ marginTop: 12, width: '100%' }}
-                      onClick={() => {
-                        setStockCategory(cat.category);
-                        setTab('stock');
-                      }}
-                    >
-                      Open {cat.category} Register →
-                    </Button>
                   </div>
                 ))}
               </div>

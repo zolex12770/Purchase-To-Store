@@ -5,7 +5,7 @@
  * The header carries the Zolex brand, global search, the Google Sheets Live Sync
  * toggle, notifications and the user menu, exactly as §29 of the brief requires.
  */
-import { useState, useEffect, useRef, type ReactNode } from 'react';
+import { useState, useEffect, useRef, useMemo, type ReactNode } from 'react';
 import { NavLink, useNavigate, useLocation, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -307,12 +307,45 @@ const NAV_HOVER = 'rgba(255,255,255,0.09)';
 const NAV_ACTIVE = 'linear-gradient(100deg, rgba(255,255,255,0.20), rgba(255,255,255,0.08))';
 
 function SidebarLink({ item, collapsed, nested }: { item: NavItem; collapsed: boolean; nested?: boolean }) {
+  const location = useLocation();
+  const [targetPath, targetSearch] = item.to.split('?');
+
+  const isActive = useMemo(() => {
+    // 1. Path check
+    const pathMatch = item.end
+      ? location.pathname === targetPath
+      : location.pathname === targetPath || location.pathname.startsWith(`${targetPath}/`);
+    if (!pathMatch) return false;
+
+    // 2. Query check (handles /inventory?tab=rm vs /inventory?tab=overview etc.)
+    if (targetSearch) {
+      const targetParams = new URLSearchParams(targetSearch);
+      const currentParams = new URLSearchParams(location.search);
+      for (const [key, expectedVal] of targetParams.entries()) {
+        const actualVal = currentParams.get(key) || (targetPath === '/inventory' && key === 'tab' ? 'overview' : null);
+        if (actualVal !== expectedVal) return false;
+      }
+      return true;
+    }
+
+    // 3. If target has NO search params, ensure no conflicting tab is active
+    if (location.search && targetPath === '/inventory') {
+      const currentParams = new URLSearchParams(location.search);
+      if (currentParams.has('tab') && currentParams.get('tab') !== 'overview') {
+        return false;
+      }
+    }
+
+    return true;
+  }, [item.to, item.end, location.pathname, location.search, targetPath, targetSearch]);
+
   return (
     <NavLink
       to={item.to}
       end={item.end}
       title={collapsed ? item.label : undefined}
-      style={({ isActive }) => ({
+      aria-current={isActive ? 'page' : undefined}
+      style={() => ({
         display: 'flex', alignItems: 'center', gap: 10,
         padding: nested ? '7px 12px 7px 34px' : '9px 12px',
         borderRadius: 'var(--radius-sm)',
@@ -332,11 +365,10 @@ function SidebarLink({ item, collapsed, nested }: { item: NavItem; collapsed: bo
           : undefined,
       })}
       onMouseEnter={(e) => {
-        if (e.currentTarget.getAttribute('aria-current') !== 'page') e.currentTarget.style.background = NAV_HOVER;
+        if (!isActive) e.currentTarget.style.background = NAV_HOVER;
       }}
       onMouseLeave={(e) => {
-        const active = e.currentTarget.getAttribute('aria-current') === 'page';
-        e.currentTarget.style.background = active ? NAV_ACTIVE : NAV_IDLE;
+        e.currentTarget.style.background = isActive ? NAV_ACTIVE : NAV_IDLE;
       }}
     >
       <span

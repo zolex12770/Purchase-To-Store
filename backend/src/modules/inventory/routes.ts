@@ -1587,6 +1587,7 @@ router.get(
     const category = parseCat.data;
 
     const q = listQuerySchema.extend({
+      direction: z.enum(['IN', 'OUT', 'ADJUST']).optional(),
       txnType: z.string().trim().optional(),
       itemCode: z.string().trim().optional(),
       dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -1596,6 +1597,11 @@ router.get(
     const b = new SqlBuilder();
     const catP = b.push(category);
     let whereClause = `category = ${catP}`;
+
+    if (q.direction) {
+      const dp = b.push(q.direction);
+      whereClause += ` AND direction = ${dp}`;
+    }
 
     if (q.search) {
       const s = b.push(`%${q.search}%`);
