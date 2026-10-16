@@ -41,7 +41,7 @@ marked ✅ were **executed**, not merely read.
 | Brute force | Lockout after `MAX_FAILED_LOGINS`, for `ACCOUNT_LOCK_MINUTES` | Integration test |
 | Failed-attempt auditing | Every failure recorded with IP and user agent | E2E |
 | Bootstrap rotation | `must_change_password` forces a change before anything else | ✅ Verified: business routes return **403** until rotated |
-| Password policy | ≥8 chars, upper, lower, digit, symbol; ≤128 | `checkPasswordStrength` |
+| Password policy | ≥8 chars, upper, lower, digit, symbol; ≤128; not a published password; not containing the Employee ID | `checkPasswordStrength`; `security.test.ts` |
 | Timing | bcrypt compare runs even on the failure path | Constant work regardless of outcome |
 
 **Measured cost of bcrypt-12 on this host: ~750 ms per sign-in** (§13). That is
@@ -274,8 +274,9 @@ to ship it.
 
 ## 15. Pre-production checklist
 
-- [ ] Rotate `10221` and `10422` away from `Admin@12345`
-      *(the software forces this at first sign-in; confirm it was done)*
+- [ ] `10221` and `10422` have replaced their first-sign-in password, and
+      `bootstrap-admin-password.txt` is deleted from the data root
+      *(the software forces the change at first sign-in; confirm it was done)*
 - [ ] Generate fresh `AUTH_SECRET` and `AUTH_REFRESH_SECRET`
       *(`deploy/install.sh` does this)*
 - [ ] `NODE_ENV=production`

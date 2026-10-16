@@ -125,8 +125,11 @@ server {
 }
 ```
 
-The backend sets `trust proxy` to exactly one hop in production, so `req.ip` is the
-real client for rate limiting and audit without allowing header spoofing.
+The backend trusts `X-Forwarded-For` only from loopback (`trust proxy = loopback`), so
+behind this nginx on the same host `req.ip` is the real client for rate limiting and
+audit, and a client reaching the API port directly cannot spoof the header. A proxy
+on another host (or in another container) is not trusted: the API would see the
+proxy's own address.
 
 ---
 

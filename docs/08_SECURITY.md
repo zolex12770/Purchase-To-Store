@@ -23,7 +23,7 @@ at admin endpoints and asserts 403 on each.
 | Control | Implementation |
 |---|---|
 | Password storage | **bcryptjs**, cost 12. Plaintext is never stored or logged. Pure JS — no native build step. |
-| Password policy | ≥ 8 chars with lower, upper, digit and symbol; enforced on every set and change |
+| Password policy | ≥ 8 chars with lower, upper, digit and symbol; never a published password (compared by SHA-256 digest, so the list does not republish them) and never one containing the account's Employee ID; enforced on every set and change |
 | Access token | JWT, 8-hour default, issuer/audience bound, held **in memory** in the browser so an XSS payload cannot read it out of storage |
 | Refresh token | Opaque 48-byte random value, stored **HMAC-hashed** in `user_sessions` — a database leak cannot mint sessions |
 | Refresh cookie | `httpOnly`, `sameSite=strict`, `secure` in production, scoped to `path=/api/v1/auth` |
@@ -31,7 +31,8 @@ at admin endpoints and asserts 403 on each.
 | Revocation | Logout, password change and user deactivation revoke sessions **server-side**, not just client-side |
 | Failed-login protection | 5 consecutive failures lock the account for 15 minutes; the counter resets on success |
 | Enumeration resistance | "No such user" and "wrong password" return the *same* message and status |
-| Bootstrap credentials | `10221` / `10422` seeded with `must_change_password = true`; the API refuses every non-auth route until rotation |
+| Bootstrap credentials | No default password: a new database gives `10221` / `10422` `BOOTSTRAP_ADMIN_PASSWORD` or a random password written once to `bootstrap-admin-password.txt` in the data root (never the log), with `must_change_password = true` |
+| Forced password change | While `must_change_password` is set — a bootstrap account, a new account or an administrator's reset, both of which default to it — the API answers only `/auth/me`, change-password, refresh and logout; everything else is 403 `PASSWORD_CHANGE_REQUIRED`, judged on the account's live flag, and the web client shows only the change-password screen |
 
 **Rate limiting is split by purpose.** `/auth/login` gets a tight budget counting
 **failed attempts only**; the other auth routes get a far larger one. Counting failed
@@ -92,9 +93,12 @@ Verified by `workflow.test.ts › input hardening`, which fires
 
 `helmet` sets the standard protective headers; HSTS is enabled in production. CORS
 is an **allow-list** of known origins with credentials enabled — not a wildcard.
-`x-powered-by` is disabled. `trust proxy` is exactly one hop in production so `req.ip`
-is the real client for rate limiting and audit without allowing `X-Forwarded-For`
-spoofing.
+`x-powered-by` is disabled. `trust proxy` is `loopback`: only a reverse proxy on the
+same machine (the vite server on 8080, whose `/api` proxy sets `xfwd`, or a local
+nginx) may name the client in `X-Forwarded-For`, so `req.ip` is the real client for
+rate limiting and audit, while a LAN client calling the API port directly is
+identified by its own address whatever header it sends. (It was one hop of any
+origin, which let such a client pick a fresh rate-limit bucket per request.)
 
 ---
 
@@ -172,7 +176,7 @@ Stated plainly rather than omitted:
 
 ## 10. Pre-production checklist
 
-- [ ] Rotate `10221` and `10422` away from `Admin@12345`, or deactivate them in favour of named administrators
+- [ ] Confirm `10221` and `10422` replaced their first-sign-in password (the software forces it) and `bootstrap-admin-password.txt` is gone from the data root — or deactivate them in favour of named administrators
 - [ ] Set `AUTH_SECRET` and `AUTH_REFRESH_SECRET` to fresh 48-byte random values
 - [ ] Set `NODE_ENV=production` (enables `secure` cookies and HSTS, disables `db:reset`)
 - [ ] Point `DB_DRIVER=pg` at a real PostgreSQL server with least-privilege credentials
