@@ -1811,6 +1811,7 @@ router.get(
       direction: z.enum(['IN', 'OUT', 'ADJUST']).optional(),
       txnType: z.string().trim().optional(),
       itemCode: z.string().trim().optional(),
+      sourceTab: z.string().trim().optional(),
       dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
       dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     }).parse(req.query);
@@ -1822,6 +1823,11 @@ router.get(
     if (q.direction) {
       const dp = b.push(q.direction);
       whereClause += ` AND direction = ${dp}`;
+    }
+
+    if (q.sourceTab) {
+      const st = b.push(q.sourceTab.trim());
+      whereClause += ` AND (TRIM(source_tab) = ${st} OR source_tab ILIKE ${st} OR TRIM(source_tab) ILIKE '%' || ${st} || '%')`;
     }
 
     if (q.search) {
@@ -1859,6 +1865,7 @@ router.get(
         balance_qty_after, balance_weight_after,
         reference_doc_type, reference_doc_no,
         from_location, to_location, department,
+        source_tab,
         status, notes, created_by_name, txn_date, created_at
       FROM inventory_transactions
       WHERE ${whereClause}

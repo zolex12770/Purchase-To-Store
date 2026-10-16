@@ -67,6 +67,7 @@ interface CategoryTxnRow {
   from_location: string | null;
   to_location: string | null;
   department: string | null;
+  source_tab: string | null;
   status: string;
   notes: string | null;
   created_by_name: string;
@@ -258,6 +259,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     search: txnSearch || undefined,
     direction: currentSubTabDef.type === 'inward' || currentSubTabDef.type === 'prod_inward' ? 'IN' : 'OUT',
     txnType: currentSubTabDef.type === 'prod_inward' ? 'PRODUCTION_INWARD' : undefined,
+    sourceTab: currentSubTabDef.sheetTabName,
   };
 
   const { data: txnsData, isLoading: txnsLoading } = useQuery({
@@ -608,13 +610,28 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
       {
         key: 'txn_no',
         header: 'Document / Txn No',
-        width: '150px',
+        width: '180px',
         render: (r) => (
           <div>
-            <span className="cell-code font-medium">{r.txn_no}</span>
-            {r.reference_doc_no && (
+            <span className="cell-code font-medium">{r.reference_doc_no || r.txn_no}</span>
+            {r.reference_doc_no && r.reference_doc_no !== r.txn_no && (
               <div style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                Ref: {r.reference_doc_no}
+                {r.txn_no}
+              </div>
+            )}
+            {r.notes && (
+              <div
+                style={{
+                  fontSize: '10px',
+                  color: 'var(--text-faint)',
+                  maxWidth: '180px',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}
+                title={r.notes}
+              >
+                {r.notes}
               </div>
             )}
           </div>
@@ -632,7 +649,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         render: (r) => (
           <div>
             <Badge tone={r.direction === 'IN' ? 'success' : 'neutral'} plain>
-              {r.txn_type.replace('_', ' ')}
+              {r.txn_type.replace(/_/g, ' ')}
             </Badge>
             {r.department && (
               <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginLeft: 6 }}>
@@ -657,6 +674,22 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         header: 'Weight (Kg)',
         align: 'right',
         render: (r) => (r.weight_kg ? <span className="num">{qty(r.weight_kg)} Kg</span> : <span className="cell-muted">—</span>),
+      },
+      {
+        key: 'rate_amount',
+        header: 'Rate / Amount',
+        align: 'right',
+        render: (r) => {
+          const rateVal = Number(r.rate || 0);
+          const amtVal = Number(r.amount || 0);
+          if (rateVal === 0 && amtVal === 0) return <span className="cell-muted">—</span>;
+          return (
+            <div>
+              {amtVal > 0 && <div className="num font-medium">{money(amtVal)}</div>}
+              {rateVal > 0 && <div style={{ fontSize: '10px', color: 'var(--text-muted)' }}>@{money(rateVal)}</div>}
+            </div>
+          );
+        },
       },
       {
         key: 'balance_qty_after',
@@ -896,7 +929,11 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
             <button
               key={tab.key}
               type="button"
-              onClick={() => setActiveSubTab(tab.key)}
+              onClick={() => {
+                setActiveSubTab(tab.key);
+                setTxnPage(1);
+                setTxnSearch('');
+              }}
               style={{
                 display: 'flex',
                 alignItems: 'center',
