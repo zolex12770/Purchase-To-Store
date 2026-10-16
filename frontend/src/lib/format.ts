@@ -6,6 +6,8 @@
  * a float and sent back to the server.
  */
 
+import { KNOWN_STATUSES, statusMeta, type Tone } from './status';
+
 export type Numeric = string | number | null | undefined;
 
 const toNum = (v: Numeric): number => {
@@ -137,20 +139,55 @@ export function startOfMonth(monthsBack = 0): string {
   return toDateInput(d);
 }
 
-/** `just now` / `3 h ago` / `12 Aug 2026` — for audit and activity feeds. */
+/**
+ * `just now` / `3 h ago` / `12 Aug 2026` — for audit and activity feeds.
+ * A future time reads `in 3 h` / `in 4 d`, never a negative age.
+ */
 export function relativeTime(value: string | Date | null | undefined): string {
   const d = parseDate(value);
   if (!d) return '—';
-  const seconds = Math.floor((Date.now() - d.getTime()) / 1000);
+  const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+  const future = diff < 0;
+  const seconds = Math.abs(diff);
   if (seconds < 45) return 'just now';
-  if (seconds < 90) return 'a minute ago';
+  const phrase = (amount: string) => (future ? `in ${amount}` : `${amount} ago`);
+  if (seconds < 90) return future ? 'in a minute' : 'a minute ago';
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 60) return phrase(`${minutes} min`);
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} h ago`;
+  if (hours < 24) return phrase(`${hours} h`);
   const days = Math.floor(hours / 24);
-  if (days < 7) return `${days} d ago`;
+  if (days < 7) return phrase(`${days} d`);
   return formatDate(d);
+}
+
+/**
+ * Age of a document in whole days, as a list shows it: `today`, `3 d ago`,
+ * and `in 55 d` for a date that is still ahead. The requisition list printed
+ * "10 Dec 2026 · −55d ago" on 16 Oct 2026 (audit UI-025) because pages
+ * rendered `${age_days}d ago` without guarding the sign.
+ */
+export function ageLabel(days: number | string | null | undefined): string {
+  if (days === null || days === undefined || days === '') return '—';
+  const n = Math.round(Number(days));
+  if (!Number.isFinite(n)) return '—';
+  if (n === 0) return 'today';
+  return n > 0 ? `${n} d ago` : `in ${Math.abs(n)} d`;
+}
+
+/** Whole days from today to `value`: negative in the past, positive ahead. */
+export function daysFromToday(value: string | Date | null | undefined): number | null {
+  const d = parseDate(value);
+  if (!d) return null;
+  const startOf = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  return Math.round((startOf(d) - startOf(new Date())) / 86_400_000);
+}
+
+/** `16 Oct 2026` for the past and today, `10 Dec 2026 (in 55 d)` for a future date. */
+export function formatDateWithFuture(value: string | Date | null | undefined): string {
+  const ahead = daysFromToday(value);
+  const base = formatDate(value);
+  return ahead !== null && ahead > 0 ? `${base} (in ${ahead} d)` : base;
 }
 
 /** `0-7` bucket key → readable label used across ageing views. */
@@ -165,73 +202,24 @@ export function bucketLabel(key: string): string {
   return map[key] ?? key;
 }
 
-/* ── Status presentation (mirrors backend domain/status.ts) ──────────────── */
+/* ── Status presentation ─────────────────────────────────────────────────────
+   The tone/icon/label map lives in lib/status.ts (one source for every screen);
+   these helpers are the v2 entry points onto it. */
 
-export type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'progress';
+export type { Tone } from './status';
 
-export const STATUS_TONE: Record<string, Tone> = {
-  DRAFT: 'neutral',
-  PENDING_APPROVAL: 'warning',
-  APPROVED: 'success',
-  REJECTED: 'danger',
-  RETURNED: 'warning',
-  PARTIALLY_ISSUED: 'progress',
-  FULLY_ISSUED: 'success',
-  CANCELLED: 'danger',
-  // Bare HOD Status / Store Status values (Requisition Data Table's two
-  // independent status columns) — deliberately distinct keys from the
-  // underscored workflow statuses above, never merged with them.
-  PENDING: 'warning',
-  ISSUED: 'success',
-  CLOSED: 'neutral',
-  OPEN: 'info',
-  PARTIALLY_RECEIVED: 'progress',
-  COMPLETED: 'success',
-  SHORT_CLOSED: 'warning',
-  POSTED: 'success',
-  AWAITING_RECEIPT: 'info',
-  FULLY_ORDERED: 'success',
-  PARTIALLY_ORDERED: 'progress',
-  VALID: 'success',
-  INVALID: 'danger',
-  IMPORTED: 'success',
-  SKIPPED: 'neutral',
-  SUCCESS: 'success',
-  PARTIAL: 'warning',
-  FAILED: 'danger',
-  RUNNING: 'info',
-  ERROR: 'danger',
-  WARNING: 'warning',
-  CONFLICT: 'warning',
-  VERIFIED: 'success',
-  CORRUPT: 'danger',
-  CREATED: 'info',
-  PENDING_QC: 'warning',
-  QC_IN_PROGRESS: 'info',
-  QC_PASSED: 'success',
-  ACCEPTED_WITH_DEVIATION: 'success',
-  QC_FAILED: 'danger',
-  ON_HOLD: 'warning',
-  STORE_APPROVED: 'info',
-  PURCHASE_APPROVED: 'info',
-  CONVERTED: 'success',
-  CRITICAL: 'danger',
-  BELOW_REORDER: 'warning',
-  EXCESS: 'info',
-  NORMAL: 'success',
-};
+/** Tone per known status, derived from the status map. */
+export const STATUS_TONE: Record<string, Tone> = Object.fromEntries(
+  KNOWN_STATUSES.map((s) => [s, statusMeta(s).tone]),
+);
 
+/** `PENDING_APPROVAL` → `Pending approval`; the same words StatusBadge shows. */
 export function statusLabel(status: string | null | undefined): string {
-  if (!status) return '—';
-  return status
-    .split('_')
-    .map((w) => w.charAt(0) + w.slice(1).toLowerCase())
-    .join(' ');
+  return statusMeta(status).label;
 }
 
 export function statusTone(status: string | null | undefined): Tone {
-  if (!status) return 'neutral';
-  return STATUS_TONE[status] ?? 'neutral';
+  return statusMeta(status).tone;
 }
 
 /** Blank-safe text for table cells. */

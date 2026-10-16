@@ -313,6 +313,9 @@ h1, h2, h3, h4, h5, h6 {
 .badge.has-icon::before, .badge.no-dot::before { display: none; }
 .badge .badge-icon { color: var(--b-solid); flex: none; }
 .badge-strike .badge-text { text-decoration: line-through; text-decoration-thickness: 1px; }
+.badge-text { display: inline-flex; align-items: center; gap: 5px; }
+/* Second cue for "done, with a caveat": short-closed, accepted with deviation. */
+.badge-attn { width: 6px; height: 6px; border-radius: 50%; background: var(--tone-attention-solid); flex: none; }
 
 .badge-neutral   { --b-fg: var(--tone-neutral-fg);   --b-bg: var(--tone-neutral-bg);   --b-border: var(--tone-neutral-border);   --b-solid: var(--tone-neutral-solid); }
 .badge-pending, .badge-warning
@@ -844,7 +847,8 @@ h1, h2, h3, h4, h5, h6 {
   box-shadow: var(--shadow-3), 0 0 0 1px var(--glass-stroke);
   animation: zx-scale-in var(--dur-2) var(--ease-enter);
 }
-.menu { min-width: 200px; padding: var(--space-1); display: flex; flex-direction: column; }
+.menu, .menu-list { min-width: 200px; padding: var(--space-1); display: flex; flex-direction: column; }
+.menu-list:focus { outline: none; }
 .menu-item {
   display: flex;
   align-items: center;
@@ -868,6 +872,18 @@ h1, h2, h3, h4, h5, h6 {
 .menu-sep { height: 1px; margin: var(--space-1) 0; background: var(--border-subtle); }
 .menu-label { padding: 6px var(--space-2-5) 4px; font-size: var(--fs-12); font-weight: var(--fw-semibold); color: var(--text-3); }
 
+/* Options inside a searchable select. */
+.option {
+  display: flex; align-items: center; gap: var(--space-2);
+  width: 100%; padding: 6px var(--space-2-5);
+  border-radius: var(--radius-xs);
+  text-align: left;
+  box-shadow: inset 2px 0 0 transparent;
+}
+.option.is-active { background: var(--hover-wash); }
+.option[aria-selected='true'] { box-shadow: inset 2px 0 0 var(--accent); }
+
+.tooltip-anchor { display: inline-flex; vertical-align: middle; }
 .tooltip {
   position: fixed;
   z-index: var(--z-tooltip);
