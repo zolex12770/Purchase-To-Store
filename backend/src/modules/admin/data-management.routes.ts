@@ -10,13 +10,18 @@
  * - System Super Admins (10221, 10422) can NEVER be deleted or deactivated.
  */
 import { createHash } from 'node:crypto';
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
 import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
-import { requireAnyPermission, invalidateAuthState } from '../../auth/middleware.js';
+import { requireAnyPermission, requireSuperAdmin, invalidateAuthState } from '../../auth/middleware.js';
 import { auditIn, actorFrom } from '../../core/audit.js';
+import { dec, toQty } from '../../domain/money.js';
+import { activeInventorySync } from '../inventory/sync-engine.js';
+import {
+  ALIGNMENT_COMPONENT_CODES, planAlignment, applyAlignment, undoAlignment, describePlan,
+} from './stock-alignment.js';
 
 const router = Router();
 
@@ -1289,6 +1294,110 @@ router.post(
       return { statusChanged };
     });
     sendOk(res, { dryRun: false, ...summary, poStatusesRederived: result.statusChanged, message: `Run #${jobId} reverted.` });
+  }),
+);
+
+/* ── Repair: one-time stock-ledger alignment (2026-10-16 audit, SLR-8) ────────
+   Until 2026-10-16 the inventory sync overwrote items.live_stock_qty with the
+   sheet figure and wrote no ledger row, so 2,769 items' ledgers stopped
+   explaining their stock. scripts/compute-stock-alignment.mjs collects, per item,
+   the records that do (sheet opening cell, sheet rows, existing ledger rows); this
+   route posts them as STOCK_ALIGNMENT ledger rows and never touches the live
+   stock. Super Admin only. dryRun (the default) lists the accepted and refused
+   items and returns a selectionHash; applying needs the typed confirmation and
+   that hash. The rules are in stock-alignment.ts. */
+
+/**
+ * The entries file for the 2026-10-16 snapshot is 1.1 MB for 6,557 entries;
+ * with the longest references and evidence allowed below, 7,000 entries stay
+ * under 10 MB. The global parser keeps 2 MB and leaves this one route to this
+ * parser (app.ts), which runs only after the Super Admin check.
+ */
+export const STOCK_ALIGNMENT_BODY_LIMIT = '16mb';
+
+/** A signed quantity with at most 4 decimals, as a JSON number or a numeric string. */
+const alignmentQty = z.union([z.number(), z.string().trim()])
+  .transform((v) => (typeof v === 'number' ? String(v) : v))
+  .refine((v) => /^-?\d{1,14}(\.\d{1,4})?$/.test(v), 'A quantity with at most 14 digits and 4 decimals.')
+  .refine((v) => !dec(v).isZero(), 'A zero quantity explains nothing.')
+  .transform((v) => toQty(v));
+
+const stockAlignmentSchema = z.object({
+  entries: z.array(z.object({
+    itemId: z.coerce.number().int().positive(),
+    component: z.enum(ALIGNMENT_COMPONENT_CODES),
+    qty: alignmentQty,
+    reference: z.string().trim().min(1, 'Say what the entry stands for (date, month or document).').max(300),
+    evidence: z.string().trim().min(1, 'Say where the figure is recorded (sheet cell, rows, ledger ids).').max(1000),
+  })).min(1, 'No entries to post.').max(20000, 'At most 20,000 entries per request.'),
+  dryRun: z.boolean().default(true),
+  confirm: z.string().optional(),
+  expectedHash: z.string().trim().regex(/^[0-9a-f]{64}$/, 'expectedHash is the selectionHash a dry run returned.').optional(),
+});
+
+router.post(
+  '/repair/stock-alignment',
+  requireSuperAdmin(),
+  express.json({ limit: STOCK_ALIGNMENT_BODY_LIMIT }),
+  validateBody(stockAlignmentSchema),
+  asyncHandler(async (req, res) => {
+    const { entries, dryRun, confirm, expectedHash } = req.body as z.infer<typeof stockAlignmentSchema>;
+    const running = activeInventorySync();
+    if (dryRun) {
+      const plan = await planAlignment((sql, params) => query(sql, params), entries);
+      const t = plan.totals;
+      sendOk(res, {
+        dryRun: true,
+        ...describePlan(plan),
+        message: `${t.items} item(s) would be aligned with ${t.entries} ledger entr${t.entries === 1 ? 'y' : 'ies'} (net ${t.net}); `
+          + `${t.refused} item(s) refused.${running ? ' An inventory sync is running: run the dry run again once it finishes.' : ''} Nothing was changed.`,
+      });
+      return;
+    }
+    if (confirm !== 'ALIGN STOCK LEDGER') {
+      throw ValidationError('Type "ALIGN STOCK LEDGER" to confirm. Take a verified backup first.');
+    }
+    if (!expectedHash) {
+      throw ValidationError('Run the dry run first and pass its selectionHash as expectedHash.');
+    }
+    // A sync moves live stock while it runs; the plan would be checked against figures about to change.
+    if (running) {
+      throw ConflictError(`An inventory sync is running (${running.scope}, started ${running.startedAt}). Nothing was written; run the dry run again once it finishes.`);
+    }
+    const result = await withTransaction((tx) => applyAlignment(tx, entries, {
+      expectedHash, actor: actorFrom(req), userId: req.user!.id,
+    }));
+    const t = result.plan.totals;
+    sendOk(res, {
+      dryRun: false,
+      ...describePlan(result.plan),
+      rowsPosted: result.rowsPosted,
+      date: result.date,
+      message: `${t.items} item(s) aligned with ${result.rowsPosted} ledger row(s) (net ${t.net}); ${t.refused} item(s) refused. `
+        + 'Live stock was not changed.',
+    });
+  }),
+);
+
+router.post(
+  '/repair/stock-alignment/undo',
+  requireSuperAdmin(),
+  validateBody(z.object({
+    itemIds: z.array(z.coerce.number().int().positive()).min(1, 'Name the items to undo.').max(20000),
+    reason: z.string().trim().min(5, 'Say why the alignment is undone.').max(500),
+    confirm: z.string().optional(),
+  })),
+  asyncHandler(async (req, res) => {
+    const { itemIds, reason, confirm } = req.body as { itemIds: number[]; reason: string; confirm?: string };
+    if (confirm !== 'UNDO STOCK ALIGNMENT') {
+      throw ValidationError('Type "UNDO STOCK ALIGNMENT" to confirm.');
+    }
+    const result = await withTransaction((tx) => undoAlignment(tx, itemIds, { reason, actor: actorFrom(req), userId: req.user!.id }));
+    sendOk(res, {
+      ...result,
+      message: `Alignment undone for ${result.undone.length} item(s): ${result.rowsPosted} opposite ledger row(s) appended, `
+        + `nothing deleted; live stock was not changed.${result.skipped.length ? ` ${result.skipped.length} item(s) skipped.` : ''}`,
+    });
   }),
 );
 

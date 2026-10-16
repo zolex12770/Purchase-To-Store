@@ -10,8 +10,8 @@
  * and this module posts those figures as ledger rows. It never derives a figure:
  *
  *   · an item is aligned only when its ledger balance plus its entries equals
- *     items.live_stock_qty exactly (to the 4th decimal) — a difference is never
- *     plugged, the item is refused with its figures;
+ *     items.live_stock_qty to within 0.0001 (the stock-reconciliation report's own
+ *     rule) — a difference is never plugged, the item is refused with its figures;
  *   · an item that already has an OPENING_ALIGNMENT row is refused, so running
  *     the same file again changes nothing;
  *   · items.live_stock_qty is never written;
@@ -28,6 +28,9 @@ import { auditIn, type AuditActor } from '../../core/audit.js';
 
 /** Every alignment row, and every undo of one, carries this reference type. */
 export const ALIGNMENT_REFERENCE_TYPE = 'OPENING_ALIGNMENT';
+export const ALIGNMENT_TXN_TYPE = 'STOCK_ALIGNMENT';
+/** The largest |ledger + entries − live stock| accepted: the stock-reconciliation report's mismatch rule. */
+export const ALIGNMENT_TOLERANCE = '0.0001';
 
 /** What an entry stands for; the label starts the row's remarks. */
 export const ALIGNMENT_COMPONENTS = {
@@ -44,8 +47,8 @@ export const ALIGNMENT_COMPONENT_CODES = Object.keys(ALIGNMENT_COMPONENTS) as [A
 export interface AlignmentEntry {
   itemId: number;
   component: AlignmentComponent;
-  /** Signed: inward when positive, outward when negative. */
-  qty: number;
+  /** Signed, at most 4 decimals: inward when positive, outward when negative. */
+  qty: string;
   /** The date, month or document the entry stands for, e.g. "2026-04-01". */
   reference: string;
   /** Where it is recorded, e.g. "General Item Live Stock!BI1088". */
@@ -60,6 +63,7 @@ export interface PlannedItem {
   ledgerBalance: string;
   entriesNet: string;
   liveStock: string;
+  difference: string;
   entries: AlignmentEntry[];
 }
 
@@ -67,6 +71,7 @@ export interface RefusedItem {
   itemId: number;
   itemCode: string | null;
   reason: string;
+  entries: number;
   entriesNet: string;
   ledgerBalance?: string;
   liveStock?: string;
@@ -103,15 +108,17 @@ export async function planAlignment(run: Run, entries: AlignmentEntry[], opts: {
        FROM items WHERE id = ANY($1::bigint[]) ORDER BY id${opts.lock ? ' FOR UPDATE' : ''}`,
     [ids],
   );
-  const ledger = await run<{ item_id: string; balance: string; aligned_rows: number; aligned_on: string | null }>(
+  const ledger = await run<{ item_id: string; balance: string; aligned_rows: number; aligned_on: string | null; undone_on: string | null }>(
     `SELECT item_id, SUM(inward_qty - outward_qty)::text AS balance,
-            COUNT(*) FILTER (WHERE reference_type = $2)::int AS aligned_rows,
-            MIN(txn_date) FILTER (WHERE reference_type = $2)::text AS aligned_on
+            COUNT(*) FILTER (WHERE reference_type = $2 AND reference_id IS NULL)::int AS aligned_rows,
+            MIN(txn_date) FILTER (WHERE reference_type = $2 AND reference_id IS NULL)::text AS aligned_on,
+            MAX(txn_date) FILTER (WHERE reference_type = $2 AND reference_id IS NOT NULL)::text AS undone_on
        FROM stock_ledger WHERE item_id = ANY($1::bigint[]) GROUP BY item_id`,
     [ids, ALIGNMENT_REFERENCE_TYPE],
   );
   const itemById = new Map(items.map((i) => [Number(i.id), i]));
   const ledgerById = new Map(ledger.map((l) => [Number(l.item_id), l]));
+  const tolerance = dec(ALIGNMENT_TOLERANCE);
 
   const accepted: PlannedItem[] = [];
   const refused: RefusedItem[] = [];
@@ -120,24 +127,30 @@ export async function planAlignment(run: Run, entries: AlignmentEntry[], opts: {
     const net = list.reduce((a, e) => a.plus(dec(e.qty)), dec(0));
     const item = itemById.get(itemId);
     if (!item || item.deleted) {
-      refused.push({ itemId, itemCode: item?.item_code ?? null, reason: item ? 'The item is deleted.' : 'No item has this id.', entriesNet: toQty(net) });
+      refused.push({
+        itemId, itemCode: item?.item_code ?? null, entries: list.length, entriesNet: toQty(net),
+        reason: item ? 'The item is deleted.' : 'No item has this id.',
+      });
       continue;
     }
     const led = ledgerById.get(itemId);
     const balance = dec(led?.balance ?? 0);
     const live = dec(item.live);
-    const figures = { ledgerBalance: toQty(balance), entriesNet: toQty(net), liveStock: toQty(live) };
+    const difference = live.minus(balance.plus(net));
+    const figures = {
+      entries: list.length, ledgerBalance: toQty(balance), entriesNet: toQty(net), liveStock: toQty(live), difference: toQty(difference),
+    };
     if ((led?.aligned_rows ?? 0) > 0) {
       refused.push({
         itemId, itemCode: item.item_code, ...figures,
-        reason: `Already aligned on ${led!.aligned_on} (${led!.aligned_rows} ${ALIGNMENT_REFERENCE_TYPE} ledger row(s)); it is aligned only once.`,
+        reason: `Already aligned on ${led!.aligned_on} (${led!.aligned_rows} ${ALIGNMENT_REFERENCE_TYPE} ledger row(s)` +
+          `${led!.undone_on ? `, undone on ${led!.undone_on}` : ''}); an item is aligned once only.`,
       });
       continue;
     }
-    const difference = live.minus(balance.plus(net));
-    if (!difference.isZero()) {
+    if (difference.abs().greaterThan(tolerance)) {
       refused.push({
-        itemId, itemCode: item.item_code, ...figures, difference: toQty(difference),
+        itemId, itemCode: item.item_code, ...figures,
         reason: `Ledger ${toQty(balance)} + entries ${toQty(net)} = ${toQty(balance.plus(net))}, but the live stock is ${toQty(live)} ` +
           `(difference ${toQty(difference)}). Only entries that close the gap exactly are posted; a difference is never plugged.`,
       });
@@ -169,6 +182,16 @@ export async function planAlignment(run: Run, entries: AlignmentEntry[], opts: {
   };
 }
 
+/** The plan as a response: per-item figures, without echoing every entry back. */
+export function describePlan(plan: AlignmentPlan) {
+  return {
+    selectionHash: plan.selectionHash,
+    totals: plan.totals,
+    accepted: plan.accepted.map(({ entries, uomId: _uomId, ...a }) => ({ ...a, entries: entries.length })),
+    refused: plan.refused,
+  };
+}
+
 /** Runs `sql` with `$1` = a JSON array of row objects, in chunks. */
 async function jsonBatch(tx: Queryable, sql: string, rows: object[], extra: unknown[] = [], chunk = 1000): Promise<void> {
   for (let i = 0; i < rows.length; i += chunk) {
@@ -179,7 +202,7 @@ async function jsonBatch(tx: Queryable, sql: string, rows: object[], extra: unkn
 const INSERT_ROWS = `
   INSERT INTO stock_ledger (item_id, txn_type, reference_type, reference_id, reference_no,
                             inward_qty, outward_qty, balance_qty, uom_id, remarks, txn_date, created_by)
-  SELECT v.item_id, 'STOCK_ALIGNMENT', $2, v.reference_id, v.reference_no,
+  SELECT v.item_id, '${ALIGNMENT_TXN_TYPE}', $2, v.reference_id, v.reference_no,
          v.inward, v.outward, v.balance, v.uom_id, v.remarks, $3::date, $4
     FROM jsonb_to_recordset($1::jsonb) AS v(item_id bigint, reference_id bigint, reference_no text,
                                             inward numeric, outward numeric, balance numeric, uom_id bigint, remarks text)`;
@@ -223,14 +246,15 @@ export async function applyAlignment(
   }
   await jsonBatch(tx, INSERT_ROWS, rows, [ALIGNMENT_REFERENCE_TYPE, today, ctx.userId]);
 
-  // The whole point, checked by the database before anything commits.
+  // The whole point, checked by the database before anything commits — with the
+  // same rule as the stock-reconciliation report, so no aligned item is listed there.
   const off = await run<{ item_code: string; live: string; ledger: string }>(
     `SELECT i.item_code, i.live_stock_qty::text AS live, COALESCE(SUM(l.inward_qty - l.outward_qty), 0)::text AS ledger
        FROM items i LEFT JOIN stock_ledger l ON l.item_id = i.id
       WHERE i.id = ANY($1::bigint[])
       GROUP BY i.id, i.item_code, i.live_stock_qty
-     HAVING COALESCE(SUM(l.inward_qty - l.outward_qty), 0) <> i.live_stock_qty`,
-    [plan.accepted.map((a) => a.itemId)],
+     HAVING abs(COALESCE(SUM(l.inward_qty - l.outward_qty), 0) - i.live_stock_qty) > $2::numeric`,
+    [plan.accepted.map((a) => a.itemId), ALIGNMENT_TOLERANCE],
   );
   if (off.length > 0) {
     throw ConflictError(
@@ -239,6 +263,7 @@ export async function applyAlignment(
     );
   }
 
+  // One audit row per item, holding its entries; one for the run as a whole.
   for (const item of plan.accepted) {
     const n = item.entries.length;
     await auditIn(tx, {
@@ -251,13 +276,22 @@ export async function applyAlignment(
       after: {
         referenceNos: `ALN-${stamp}-${item.itemId}-001…${String(n).padStart(3, '0')}`,
         entries: item.entries.map(({ component, qty, reference, evidence }) => ({ component, qty, reference, evidence })),
-        ledgerBalance: item.liveStock,
+        ledgerBalance: toQty(dec(item.ledgerBalance).plus(dec(item.entriesNet))),
         selectionHash: plan.selectionHash,
       },
       message: `Opening alignment of ${item.itemCode}: ${n} ledger entr${n === 1 ? 'y' : 'ies'} (net ${item.entriesNet}) posted from sheet evidence; ` +
-        `the ledger now equals the live stock ${item.liveStock}, which was not changed.`,
+        `the ledger now explains the live stock ${item.liveStock}, which was not changed.`,
     });
   }
+  await auditIn(tx, {
+    actor: ctx.actor,
+    action: 'POST',
+    entity: 'stock_alignment',
+    entityLabel: `alignment run ${plan.selectionHash.slice(0, 12)}`,
+    after: { ...plan.totals, rowsPosted: rows.length, date: today, selectionHash: plan.selectionHash },
+    message: `One-time stock-ledger alignment: ${plan.totals.items} item(s) aligned with ${rows.length} ledger row(s) ` +
+      `(net ${plan.totals.net}); ${plan.totals.refused} item(s) refused. Live stock was not changed.`,
+  });
   return { plan, rowsPosted: rows.length, date: today };
 }
 
@@ -271,7 +305,8 @@ export interface UndoResult {
 /**
  * Takes alignments back by appending the opposite of each alignment row; the
  * original rows stay. Each undo row points at the row it reverses (reference_id),
- * so a row is never reversed twice. items.live_stock_qty is not touched.
+ * so a row is never reversed twice. items.live_stock_qty is not touched, and the
+ * item stays aligned-once: the alignment is not offered for it again.
  * MUST run inside a transaction.
  */
 export async function undoAlignment(
@@ -287,7 +322,7 @@ export async function undoAlignment(
     tx,
     `SELECT l.id, l.item_id, (l.inward_qty - l.outward_qty)::text AS net, l.reference_no, l.uom_id
        FROM stock_ledger l
-      WHERE l.item_id = ANY($1::bigint[]) AND l.txn_type = 'STOCK_ALIGNMENT' AND l.reference_type = $2
+      WHERE l.item_id = ANY($1::bigint[]) AND l.txn_type = '${ALIGNMENT_TXN_TYPE}' AND l.reference_type = $2
         AND l.reference_id IS NULL
         AND NOT EXISTS (SELECT 1 FROM stock_ledger u WHERE u.reference_type = $2 AND u.reference_id = l.id)
       ORDER BY l.item_id, l.id`,
