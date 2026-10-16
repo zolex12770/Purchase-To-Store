@@ -1131,4 +1131,109 @@ router.post(
   }),
 );
 
+/* ── Repair: undo the indent / PO lines one Google sync run inserted ───────────
+   For a run that inserted lines it should not have (2026-10-16 05:33: a defective
+   build matched existing lines too narrowly and re-inserted 293 PO + 51 indent
+   lines). Removes exactly the indent and PO lines created inside that run's time
+   window, the PO-to-indent links the run made for them and the GRN links it set
+   on them, then re-derives the affected POs' status. It refuses when
+     · the number of lines in the window differs from what the run recorded
+       (someone else may have created lines at the same moment),
+     · the run also created document headers (needs a person to review), or
+     · anything made AFTER the run refers to those lines (a later GRN or PO).
+   dryRun (default) only reports; applying needs a Super Admin and the typed
+   confirmation "REVERT JOB <id>", and every removed row is kept in the audit log. */
+
+router.post(
+  '/repair/revert-google-sync-job',
+  validateBody(z.object({
+    jobId: z.coerce.number().int().positive(),
+    dryRun: z.boolean().default(true),
+    confirm: z.string().optional(),
+  })),
+  asyncHandler(async (req, res) => {
+    const { jobId, dryRun, confirm } = req.body as { jobId: number; dryRun: boolean; confirm?: string };
+    const job = await queryOne<{ id: number; started_at: string; finished_at: string | null; detail: unknown; status: string }>(
+      'SELECT id, started_at, finished_at, detail, status FROM google_sync_jobs WHERE id = $1', [jobId],
+    );
+    if (!job) throw NotFoundError('Google sync run');
+    if (!job.finished_at) throw BusinessRuleError('That run has not finished.');
+    const detail = Array.isArray(job.detail) ? (job.detail as Array<{ sheet: string; inserted?: number }>) : [];
+    const recorded = (sheet: string) => Number(detail.find((d) => d.sheet === sheet)?.inserted ?? 0);
+    const win = [job.started_at, job.finished_at];
+
+    const inspect = async (run: <T>(sql: string, p?: unknown[]) => Promise<T[]>) => {
+      const poLines = await run<Record<string, unknown> & { id: number; po_id: number }>(
+        'SELECT * FROM purchase_order_lines WHERE created_at BETWEEN $1 AND $2 ORDER BY id', win);
+      const indentLines = await run<Record<string, unknown> & { id: number }>(
+        'SELECT * FROM purchase_indent_lines WHERE created_at BETWEEN $1 AND $2 ORDER BY id', win);
+      const poIds = poLines.map((l) => l.id);
+      const indentIds = indentLines.map((l) => l.id);
+      const sources = await run<Record<string, unknown> & { id: number; created_at: string }>(
+        'SELECT * FROM po_indent_sources WHERE po_line_id = ANY($1::bigint[]) OR indent_line_id = ANY($2::bigint[]) ORDER BY id',
+        [poIds, indentIds]);
+      const grnLinks = await run<{ id: number; po_line_id: number; grn_no: string; grn_created: string }>(
+        `SELECT gl.id, gl.po_line_id, gh.grn_no, gh.created_at AS grn_created
+           FROM grn_lines gl JOIN grn_headers gh ON gh.id = gl.grn_id
+          WHERE gl.po_line_id = ANY($1::bigint[]) ORDER BY gl.id`, [poIds]);
+      const headers = await run<{ kind: string; n: number }>(
+        `SELECT 'purchase_order_headers' AS kind, COUNT(*)::int AS n FROM purchase_order_headers WHERE created_at BETWEEN $1 AND $2
+         UNION ALL
+         SELECT 'purchase_indent_headers', COUNT(*)::int FROM purchase_indent_headers WHERE created_at BETWEEN $1 AND $2`, win);
+      const blockers: string[] = [];
+      if (poLines.length !== recorded('Purchase Order')) blockers.push(`${poLines.length} PO line(s) were created in the run's window but the run recorded ${recorded('Purchase Order')}.`);
+      if (indentLines.length !== recorded('Purchase Indent')) blockers.push(`${indentLines.length} indent line(s) were created in the run's window but the run recorded ${recorded('Purchase Indent')}.`);
+      for (const h of headers) if (h.n > 0) blockers.push(`The run also created ${h.n} row(s) in ${h.kind}; review those by hand.`);
+      const later = sources.filter((s) => s.created_at > job.finished_at!);
+      if (later.length) blockers.push(`${later.length} PO-to-indent link(s) made after the run refer to these lines.`);
+      const laterGrn = grnLinks.filter((g) => g.grn_created > job.finished_at!);
+      if (laterGrn.length) blockers.push(`GRN(s) ${laterGrn.map((g) => g.grn_no).join(', ')} were made after the run against these lines.`);
+      return { poLines, indentLines, sources, grnLinks, blockers };
+    };
+
+    const found = await inspect((sql, p) => query(sql, p ?? []));
+    const summary = {
+      jobId, window: win,
+      poLines: found.poLines.length, indentLines: found.indentLines.length,
+      poIndentLinks: found.sources.length, grnLinksToClear: found.grnLinks.length,
+      affectedPOs: [...new Set(found.poLines.map((l) => l.po_id))].length,
+      blockers: found.blockers,
+    };
+    if (dryRun) {
+      sendOk(res, { dryRun: true, ...summary, message: found.blockers.length ? 'Cannot be reverted automatically — see blockers.' : 'Nothing was changed.' });
+      return;
+    }
+    if (!req.user!.roles.includes('SUPER_ADMIN')) throw BusinessRuleError('Only a Super Admin can revert a sync run.');
+    if (confirm !== `REVERT JOB ${jobId}`) throw ValidationError(`Type "REVERT JOB ${jobId}" to confirm. Take a backup first.`);
+    if (found.blockers.length) throw BusinessRuleError(`This run cannot be reverted automatically: ${found.blockers.join(' ')}`);
+
+    const { recomputePoStatuses } = await import('../google-sync/engine.js');
+    const result = await withTransaction(async (tx) => {
+      const again = await inspect((sql, p) => txQuery(tx, sql, p ?? []));
+      if (again.blockers.length || again.poLines.length !== found.poLines.length || again.indentLines.length !== found.indentLines.length) {
+        throw BusinessRuleError('The data changed while preparing the revert; nothing was changed. Try again.');
+      }
+      const poIds = again.poLines.map((l) => l.id);
+      const indentIds = again.indentLines.map((l) => l.id);
+      await tx.query('DELETE FROM po_indent_sources WHERE id = ANY($1::bigint[])', [again.sources.map((s) => s.id)]);
+      await tx.query('UPDATE grn_lines SET po_line_id = NULL WHERE id = ANY($1::bigint[])', [again.grnLinks.map((g) => g.id)]);
+      await tx.query('DELETE FROM purchase_order_lines WHERE id = ANY($1::bigint[])', [poIds]);
+      await tx.query('DELETE FROM purchase_indent_lines WHERE id = ANY($1::bigint[])', [indentIds]);
+      const statusChanged = await recomputePoStatuses(tx, [...new Set(again.poLines.map((l) => Number(l.po_id)))]);
+      await auditIn(tx, {
+        actor: actorFrom(req),
+        action: 'DELETE',
+        entity: 'google_sync_job',
+        entityId: jobId,
+        entityLabel: `revert of Google sync run #${jobId}`,
+        before: { poLines: again.poLines, indentLines: again.indentLines, poIndentSources: again.sources, grnLinks: again.grnLinks },
+        after: { removedPoLines: poIds.length, removedIndentLines: indentIds.length, clearedGrnLinks: again.grnLinks.length, poStatusesRederived: statusChanged },
+        message: `Reverted Google sync run #${jobId}: removed ${poIds.length} PO line(s) and ${indentIds.length} indent line(s) it inserted, ${again.sources.length} PO-to-indent link(s) and ${again.grnLinks.length} GRN link(s) it made; re-derived ${statusChanged} PO status(es). Every removed row is stored in this audit entry.`,
+      });
+      return { statusChanged };
+    });
+    sendOk(res, { dryRun: false, ...summary, poStatusesRederived: result.statusChanged, message: `Run #${jobId} reverted.` });
+  }),
+);
+
 export default router;

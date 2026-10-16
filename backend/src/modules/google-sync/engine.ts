@@ -346,19 +346,21 @@ interface RowContext {
   seenKeys: Set<string>;
   /** Lookup ids the combined type tab listed, per category (see reconcileDocumentTypes). */
   typeIds: Map<string, Set<number>>;
-  /**
-   * Sheet rows seen so far in this run per document line key (document no + item),
-   * counted per value signature — so the rows of one document that list the same
-   * item more than once are matched to its stored lines one-for-one.
-   */
-  tally: Map<string, Map<string, number>>;
+  /** Per document line key (document no + item): see matchSheetLine. */
+  tally: Map<string, { newThisRun: boolean; seen: Map<string, number> }>;
 }
 
 /**
- * Decides what one sheet row means for the stored lines of the same document and
- * item: already present (as many stored lines carry its values as rows seen so far),
- * a new line (the document has fewer lines for the item than the sheet lists), or a
- * changed line (a conflict to review — the ERP value is kept).
+ * Decides what one sheet row means for the stored lines of the same document and item:
+ *
+ *  - The ERP already held line(s) for this document and item when the run began: the
+ *    row is PRESENT when any stored line carries its values, otherwise CHANGED (a
+ *    conflict to review — the ERP value is kept). Nothing is ever added to such a
+ *    document, exactly as before: a sheet that lists one item twice must not raise
+ *    the quantity of an order the ERP already holds.
+ *  - The document/item is new to the ERP in this run: its rows are imported one-for-one
+ *    (an indent may list one item twice, e.g. ZI/RM/0005 at 150 and 300 Kg), and a
+ *    later run finds every one of them PRESENT.
  */
 function matchSheetLine(
   ctx: RowContext,
@@ -366,14 +368,14 @@ function matchSheetLine(
   signature: string,
   stored: string[],
 ): 'PRESENT' | 'NEW' | 'CHANGED' {
-  const perKey = ctx.tally.get(key) ?? new Map<string, number>();
-  ctx.tally.set(key, perKey);
-  perKey.set(signature, (perKey.get(signature) ?? 0) + 1);
-  const seenSame = perKey.get(signature)!;
-  const seenAll = [...perKey.values()].reduce((a, b) => a + b, 0);
+  const state = ctx.tally.get(key) ?? { newThisRun: stored.length === 0, seen: new Map<string, number>() };
+  ctx.tally.set(key, state);
+  const seenSame = (state.seen.get(signature) ?? 0) + 1;
+  state.seen.set(signature, seenSame);
+  if (!state.newThisRun) return stored.includes(signature) ? 'PRESENT' : 'CHANGED';
+  const seenAll = [...state.seen.values()].reduce((a, b) => a + b, 0);
   if (stored.filter((s) => s === signature).length >= seenSame) return 'PRESENT';
-  if (stored.length < seenAll) return 'NEW';
-  return 'CHANGED';
+  return stored.length < seenAll ? 'NEW' : 'CHANGED';
 }
 
 /**
@@ -1116,14 +1118,17 @@ async function syncPurchaseIndentRow(ctx: RowContext): Promise<void> {
   //    such lines, and every 15-minute scheduled sync appended them again
   //    (62 lines x 38 runs in production, 2026-10-14..16).
   const sheetDesc = (ctx.values.item_description ?? '').trim();
-  const known = await findItem(ctx.tx, itemCode, sheetDesc);
+  // Some sheets carry the DESCRIPTION in the code column (Purchase Order: "Brown Corrugated
+  // Box 330X330X215 5ply PB20" with a blank description) — so, like resolveOrCreateItem,
+  // fall back to the code cell as the description.
+  const known = await findItem(ctx.tx, itemCode, sheetDesc || itemCode);
   const existingLines = await txQuery<{ id: number; indent_qty: string; status: string }>(
     ctx.tx,
     `SELECT l.id, l.indent_qty, h.status
        FROM purchase_indent_lines l
        JOIN purchase_indent_headers h ON h.id = l.indent_id
       WHERE h.indent_no = $1
-        AND (l.item_id = $2 OR upper(l.item_code) = upper($3)
+        AND (l.item_id = $2 OR upper(l.item_code) = upper($3) OR lower(l.item_description) = lower($3)
              OR ($4 <> '' AND lower(l.item_description) = lower($4)))`,
     [indentNo, known?.id ?? null, itemCode, sheetDesc],
   );
@@ -1235,14 +1240,17 @@ async function syncPurchaseOrderRow(ctx: RowContext): Promise<void> {
 
   // 1. Already in the ERP? Same matching as indent lines (see syncPurchaseIndentRow).
   const sheetDesc = (ctx.values.item_description ?? '').trim();
-  const known = await findItem(ctx.tx, itemCode, sheetDesc);
+  // Some sheets carry the DESCRIPTION in the code column (Purchase Order: "Brown Corrugated
+  // Box 330X330X215 5ply PB20" with a blank description) — so, like resolveOrCreateItem,
+  // fall back to the code cell as the description.
+  const known = await findItem(ctx.tx, itemCode, sheetDesc || itemCode);
   const existingLines = await txQuery<{ id: number; po_qty: string; rate: string; status: string }>(
     ctx.tx,
     `SELECT l.id, l.po_qty, l.rate, h.status
        FROM purchase_order_lines l
        JOIN purchase_order_headers h ON h.id = l.po_id
       WHERE h.po_no = $1
-        AND (l.item_id = $2 OR upper(l.item_code) = upper($3)
+        AND (l.item_id = $2 OR upper(l.item_code) = upper($3) OR lower(l.item_description) = lower($3)
              OR ($4 <> '' AND lower(l.item_description) = lower($4)))`,
     [poNo, known?.id ?? null, itemCode, sheetDesc],
   );
@@ -1376,16 +1384,31 @@ async function syncPurchaseOrderRow(ctx: RowContext): Promise<void> {
   ctx.outcome.inserted += 1;
 }
 
+/**
+ * Brings purchase_order_headers.status in line with v_po_header_balance's derived
+ * status (DRAFT / CANCELLED / SHORT_CLOSED are never changed by the view). Only the
+ * headers whose status actually differs are written — it used to rewrite every PO's
+ * updated_at on every 15-minute run. Optionally limited to some POs.
+ */
+export async function recomputePoStatuses(tx: Queryable, poIds?: number[]): Promise<number> {
+  const rows = await txQuery<{ id: number }>(
+    tx,
+    `UPDATE purchase_order_headers poh
+        SET status = hb.derived_status,
+            updated_at = now()
+       FROM v_po_header_balance hb
+      WHERE hb.po_id = poh.id
+        AND poh.status NOT IN ('CANCELLED', 'SHORT_CLOSED')
+        AND poh.status IS DISTINCT FROM hb.derived_status
+        AND ($1::bigint[] IS NULL OR poh.id = ANY($1::bigint[]))
+      RETURNING poh.id`,
+    [poIds ?? null],
+  );
+  return rows.length;
+}
+
 async function reconcilePurchaseOrdersPostSync(ctx: { tx: Queryable; outcome: SheetOutcome }): Promise<void> {
-  // Update purchase_order_headers status based on v_po_header_balance derived_status
-  await ctx.tx.query(`
-    UPDATE purchase_order_headers poh
-       SET status = hb.derived_status,
-           updated_at = now()
-      FROM v_po_header_balance hb
-     WHERE hb.po_id = poh.id
-       AND poh.status NOT IN ('CANCELLED', 'SHORT_CLOSED')
-  `);
+  await recomputePoStatuses(ctx.tx);
 }
 
 /**
@@ -1674,7 +1697,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
         const sheetErrors: ErrorRecord[] = [];
         const seenKeys = new Set<string>();
         const typeIds = new Map<string, Set<number>>();
-        const tally = new Map<string, Map<string, number>>();
+        const tally: RowContext['tally'] = new Map();
 
         for (const [i, row] of dataRows.entries()) {
           const values: Record<string, string> = {};

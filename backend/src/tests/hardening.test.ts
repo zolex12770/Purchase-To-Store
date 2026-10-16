@@ -877,3 +877,63 @@ describe('repair — indent lines the Google sync appended more than once', () =
     expect((await request(app).post(url).set(auth(adminToken)).send({})).body.data.duplicateLines).toBe(0);
   });
 });
+
+describe('Google sync — Purchase Order rows whose code column holds the description', () => {
+  // The live Purchase Order sheet carries "Brown Corrugated Box 330X330X215 5ply PB20"
+  // in Item Code with Item Description blank; the ERP line is BB5PV8. A build that
+  // stopped comparing the code cell with stored descriptions re-inserted 293 lines.
+  const header = ['PO No', 'Date', 'Item Code', 'Item Description', 'PO Qty', 'UOM', 'Rate/pc', 'Supplier Name'];
+  const row = ['THARD/PO/0001', '15 October 2026', 'Hardening Brown Box 330X330', '', '200', 'PCS', '50', 'Hardening Supplier Pvt Ltd'];
+  let grid: string[][] = [header, row];
+  const reader = async (sheet: string) => (sheet === 'Purchase Order' ? grid : []);
+  const sync = async () => (await import('../modules/google-sync/engine.js')).runSync({ trigger: 'SCHEDULED', sheets: ['Purchase Order'], reader });
+  const lines = async () => (await (await import('../db/index.js')).query<{ item_code: string; po_qty: string; id: number }>(
+    `SELECT l.id, l.item_code, l.po_qty FROM purchase_order_lines l JOIN purchase_order_headers h ON h.id = l.po_id
+      WHERE h.po_no = 'THARD/PO/0001' ORDER BY l.id`,
+  ));
+
+  it('finds the stored line through the description on every run', async () => {
+    await request(app).post(api('/items')).set(auth(adminToken))
+      .send({ itemCode: 'THARD-BB5PV8', itemDescription: 'Hardening Brown Box 330X330', uomId, standardRate: '50' });
+    expect((await sync()).totals.inserted).toBe(1);
+    for (let run = 0; run < 3; run += 1) expect((await sync()).totals.inserted).toBe(0);
+    expect((await lines()).map((l) => [l.item_code, Number(l.po_qty)])).toEqual([['THARD-BB5PV8', 200]]);
+  });
+
+  it('never raises the quantity of an order the ERP holds because the sheet lists the row twice', async () => {
+    grid = [header, row, row];
+    const r = await sync();
+    expect(r.totals.inserted).toBe(0);
+    expect((await lines()).length).toBe(1);
+  });
+
+  it('a run that inserted lines it should not have can be reverted exactly, and only when the counts agree', async () => {
+    const { query } = await import('../db/index.js');
+    const po = (await query<{ id: number }>(`SELECT id FROM purchase_order_headers WHERE po_no = 'THARD/PO/0001'`))[0]!;
+    const job = async (inserted: number, from: string, to: string) => (await query<{ id: number }>(
+      `INSERT INTO google_sync_jobs (status, trigger_source, sheet_id, started_at, finished_at, detail)
+       VALUES ('PARTIAL', 'MANUAL', 'TEST', $1, $2, $3::jsonb) RETURNING id`,
+      [from, to, JSON.stringify([{ sheet: 'Purchase Order', inserted }, { sheet: 'Purchase Indent', inserted: 0 }])],
+    ))[0]!.id;
+    const bad = await job(1, '2026-10-16T05:33:00Z', '2026-10-16T05:34:00Z');
+    await query(
+      `INSERT INTO purchase_order_lines (po_id, line_no, item_id, item_code, item_description, po_qty, uom_id, rate, created_at)
+       SELECT $1, 99, item_id, item_code, item_description, po_qty, uom_id, rate, '2026-10-16T05:33:30Z'
+         FROM purchase_order_lines WHERE po_id = $1 ORDER BY id LIMIT 1`, [po.id],
+    );
+    expect((await lines()).length).toBe(2);
+    const url = api('/admin/data-management/repair/revert-google-sync-job');
+    const miscounted = await job(5, '2026-10-16T05:33:00Z', '2026-10-16T05:34:00Z');
+    expect((await request(app).post(url).set(auth(adminToken)).send({ jobId: miscounted })).body.data.blockers.length).toBeGreaterThan(0);
+    const dry = await request(app).post(url).set(auth(adminToken)).send({ jobId: bad });
+    expect(dry.body.data).toMatchObject({ dryRun: true, poLines: 1, indentLines: 0, blockers: [] });
+    expect((await request(app).post(url).set(auth(adminToken)).send({ jobId: bad, dryRun: false })).status).toBe(422);
+    const done = await request(app).post(url).set(auth(adminToken)).send({ jobId: bad, dryRun: false, confirm: `REVERT JOB ${bad}` });
+    expect(done.status).toBe(200);
+    expect((await lines()).map((l) => Number(l.po_qty))).toEqual([200]);
+    const trail = (await query<{ before_data: { poLines: unknown[] } }>(
+      `SELECT before_data FROM audit_logs WHERE entity = 'google_sync_job' AND entity_id = $1`, [String(bad)],
+    ))[0]!;
+    expect(trail.before_data.poLines).toHaveLength(1);
+  });
+});
