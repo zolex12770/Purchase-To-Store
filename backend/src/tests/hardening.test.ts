@@ -470,7 +470,11 @@ describe('an open session follows the account as it is now', () => {
     // The token must be measurably older than the reset (token times have 1 s resolution).
     await new Promise((r) => setTimeout(r, 3200));
 
-    const reset = await request(app).post(api(`/users/${user.id}/reset-password`)).set(auth(adminToken)).send({ newPassword: 'Harden@Reset2026' });
+    // A reset now forces a change at the next sign-in unless the administrator
+    // opts out; opting out keeps this test on session revocation alone (the
+    // forced change is covered in security.test.ts).
+    const reset = await request(app).post(api(`/users/${user.id}/reset-password`)).set(auth(adminToken))
+      .send({ newPassword: 'Harden@Reset2026', mustChangePassword: false });
     expect(reset.status).toBe(200);
     const refused = await request(app).get(api('/items?pageSize=1')).set(auth(token));
     expect(refused.status).toBe(401);
