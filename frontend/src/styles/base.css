@@ -1278,7 +1278,10 @@ h1, h2, h3, h4, h5, h6 {
    light-dark() token inside it (focus colour, scrollbars) take its dark side. */
 .sidebar {
   color-scheme: dark;
-  background: var(--sidebar-bg);
+  /* A solid ink base under the glow gradients: what text sits on if the
+     gradients do not paint, and what contrast is measured against. */
+  background-color: #17151a;
+  background-image: var(--sidebar-bg);
   border-right: 1px solid var(--sidebar-edge);
   color: var(--sidebar-text);
 }

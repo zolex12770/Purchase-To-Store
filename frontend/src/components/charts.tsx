@@ -178,6 +178,13 @@ function ChartTooltip({
   );
 }
 
+/**
+ * Legend labels in ink. Recharts colours legend text with the series colour by
+ * default; the lighter slots (aqua, yellow, pink) then fall to 2.2–2.8:1 on
+ * white. Identity stays with the coloured marker beside the text.
+ */
+const legendText = (value: ReactNode) => <span style={{ color: 'var(--text-2)' }}>{value}</span>;
+
 const Line2 = ({ label, value }: { label: string; value: string }) => (
   <div className="row" style={{ gap: 10, marginTop: 2 }}>
     <span className="grow" style={{ color: 'var(--text-3)' }}>{label}</span>
@@ -292,7 +299,7 @@ export function TrendChart({
         <YAxis tick={tick} tickLine={false} axisLine={false} tickFormatter={(v) => fmt(v as number)} width={62} />
         <Tooltip content={<ChartTooltip formatter={tipFmt} />} cursor={cursor} />
         {/* A single series needs no legend: the chart title already names it. */}
-        {series.length > 1 && <Legend wrapperStyle={legend} iconType="circle" iconSize={8} />}
+        {series.length > 1 && <Legend wrapperStyle={legend} iconType="circle" iconSize={8} formatter={legendText} />}
         {series.map((s, i) => {
           const color = colors[i]!;
           if (s.type === 'bar') {
@@ -461,7 +468,7 @@ export function DonutChart({
             wrapperStyle={legend}
             iconType="circle"
             iconSize={8}
-            formatter={(v: string) => (v.length > 22 ? `${v.slice(0, 21)}…` : v)}
+            formatter={(v: string) => legendText(v.length > 22 ? `${v.slice(0, 21)}…` : v)}
           />
         </PieChart>
       </ResponsiveContainer>
