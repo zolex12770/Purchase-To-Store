@@ -218,8 +218,7 @@ router.get(
             GROUP BY item_id
          ) l ON l.item_id = i.id
          ${b.where()}
-        ORDER BY i.item_code
-        LIMIT 5000`,
+        ORDER BY i.item_code`,
       b.params,
     );
 
