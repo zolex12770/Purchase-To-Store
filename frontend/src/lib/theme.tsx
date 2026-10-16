@@ -77,9 +77,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     if (preference === 'system') root.removeAttribute('data-theme');
     else root.setAttribute('data-theme', preference);
 
-    // Keep the browser chrome (mobile address bar) in step with the surface.
+    // Keep the browser chrome (mobile address bar) in step with the canvas
+    // (--bg-canvas in tokens.css).
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', resolved === 'dark' ? '#070a12' : '#eef1f8');
+    if (meta) meta.setAttribute('content', resolved === 'dark' ? '#141210' : '#f4f1ec');
   }, [preference, resolved]);
 
   const setPreference = useCallback((next: ThemePreference) => {
