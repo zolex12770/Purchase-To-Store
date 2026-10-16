@@ -13,6 +13,7 @@ import { runMigrations } from './db/migrate.js';
 import { seedSystem, seedDemoData } from './db/seed.js';
 import { startSyncScheduler, stopSyncScheduler } from './modules/google-sync/scheduler.js';
 import { startReplicaScheduler, stopReplicaScheduler } from './modules/google-db/scheduler.js';
+import { startBackupScheduler, stopBackupScheduler } from './modules/admin/backup-scheduler.js';
 
 const BANNER = `
   ███████╗ ██████╗ ██╗     ███████╗██╗  ██╗
@@ -66,6 +67,7 @@ async function bootstrap(): Promise<void> {
 
   await startSyncScheduler();
   startReplicaScheduler();
+  startBackupScheduler();
 
   /* ── Graceful shutdown ─────────────────────────────────────────────────── */
   let shuttingDown = false;
@@ -75,6 +77,7 @@ async function bootstrap(): Promise<void> {
     logger.info(`${signal} received — shutting down.`);
     stopSyncScheduler();
   stopReplicaScheduler();
+    stopBackupScheduler();
     server.close(() => logger.info('HTTP server closed.'));
     // Let in-flight requests drain before the database goes away.
     setTimeout(() => {

@@ -196,8 +196,10 @@ const DEFAULT_SETTINGS: { key: string; value: unknown; description: string }[] =
     description: 'Company logo as a data:image/... URI, embedded on printed documents (PO, Requisition, Issue Slip). Empty shows a placeholder mark instead.',
   },
   { key: 'defaults.currency', value: 'INR', description: 'Default transaction currency.' },
-  { key: 'backup.retention_days', value: 30, description: 'Minimum age before a backup may be pruned.' },
-  { key: 'backup.retention_count', value: 50, description: 'Minimum number of backups always retained.' },
+  { key: 'backup.auto_enabled', value: true, description: 'Take automatic backups (checked every 10 minutes; a missed one is taken soon after start-up).' },
+  { key: 'backup.auto_interval_hours', value: 12, description: 'Hours between automatic backups.' },
+  { key: 'backup.retention_days', value: 30, description: 'An automatic backup may be pruned only once it is older than this many days (manual backups are never pruned).' },
+  { key: 'backup.retention_count', value: 50, description: 'The newest this many automatic backups are always kept.' },
   { key: 'po.allow_over_order', value: false, description: 'Permit PO quantity above the eligible indent quantity.' },
   { key: 'grn.allow_over_receipt', value: false, description: 'Permit GRN quantity above the outstanding PO quantity.' },
   {

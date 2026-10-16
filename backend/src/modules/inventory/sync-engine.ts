@@ -943,7 +943,23 @@ async function runCategory(category: InventoryCategory, opts: SyncOptions): Prom
   return result;
 }
 
-async function exclusive<T>(scope: string, runId: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * PGlite runs no autovacuum: every row a sync rewrites leaves a dead copy behind
+ * (the old engine's rewrite-everything runs grew `items` to 95 MB for 17k rows).
+ * A plain VACUUM after an applied run lets that space be reused. Best-effort.
+ */
+const VACUUM_AFTER_SYNC = [
+  'inventory_transactions', 'inventory_items', 'inventory_quarantine',
+  'inventory_sync_checkpoints', 'items', 'stock_ledger',
+];
+async function vacuumAfterSync(): Promise<void> {
+  for (const table of VACUUM_AFTER_SYNC) {
+    await query(`VACUUM (ANALYZE) ${table}`).catch((err) =>
+      logger.warn(`Inventory sync: VACUUM ${table} skipped`, { error: err instanceof Error ? err.message : String(err) }));
+  }
+}
+
+async function exclusive<T>(scope: string, runId: string, fn: () => Promise<T>, dryRun = false): Promise<T> {
   if (activeRun) {
     const err = new Error(`An inventory sync is already running (${activeRun.scope}, started ${activeRun.startedAt}).`);
     (err as Error & { code?: string }).code = 'SYNC_RUNNING';
@@ -951,7 +967,9 @@ async function exclusive<T>(scope: string, runId: string, fn: () => Promise<T>):
   }
   activeRun = { runId, startedAt: new Date().toISOString(), scope };
   try {
-    return await fn();
+    const result = await fn();
+    if (!dryRun) await vacuumAfterSync();
+    return result;
   } finally {
     activeRun = null;
   }
@@ -959,7 +977,7 @@ async function exclusive<T>(scope: string, runId: string, fn: () => Promise<T>):
 
 export async function syncCategoryFromSheet(category: InventoryCategory, opts: SyncOptions = {}): Promise<CategorySyncResult> {
   const runId = opts.runId ?? newRunId();
-  return exclusive(category, runId, () => runCategory(category, { ...opts, runId }));
+  return exclusive(category, runId, () => runCategory(category, { ...opts, runId }), !!opts.dryRun);
 }
 
 /** All five categories, one after another, under one run id. */
@@ -969,7 +987,7 @@ export async function syncAllInventoryCategories(opts: SyncOptions = {}): Promis
     const out: CategorySyncResult[] = [];
     for (const category of INVENTORY_CATEGORIES) out.push(await runCategory(category, { ...opts, runId }));
     return out;
-  });
+  }, !!opts.dryRun);
 }
 
 /** Column index of a stock tab's opening column — exported for tests and reports. */

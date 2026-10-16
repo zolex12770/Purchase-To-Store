@@ -23,7 +23,8 @@
     "db:purify": "tsx src/db/cli-purify.ts",
     "db:reset-transactions": "tsx src/db/cli-reset-transactions.ts",
     "sync:now": "tsx src/db/cli-sync-now.ts",
-    "db:backup": "tsx src/db/cli-backup.ts"
+    "db:backup": "tsx src/db/cli-backup.ts",
+    "db:verify-restore": "tsx src/db/cli-verify-restore.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.7",

@@ -9,8 +9,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import fs from 'node:fs';
-import path from 'node:path';
-import crypto from 'node:crypto';
 import { query, queryOne, withTransaction, txQuery } from '../../db/index.js';
 import { asyncHandler, sendOk, sendCreated, validateBody, idParam } from '../../core/http.js';
 import { NotFoundError, BusinessRuleError, ConflictError } from '../../core/errors.js';
@@ -18,7 +16,9 @@ import { requirePermission } from '../../auth/middleware.js';
 import { auditIn, audit, actorFrom } from '../../core/audit.js';
 import { paths } from '../../config/env.js';
 import { logger } from '../../core/logger.js';
-import { BACKUP_TABLES, collectBackupData, restoreFromPayload, type BackupPayload } from '../../db/restore.js';
+import { restoreFromPayload, type BackupPayload } from '../../db/restore.js';
+import { createBackup, applyRetention, isBackupRunning, backupPath, sha256 } from './backup-service.js';
+import { backupScheduleStatus } from './backup-scheduler.js';
 import exportRoutes from './export.routes.js';
 import dataAuditRoutes from './data-audit.routes.js';
 
@@ -32,16 +32,6 @@ router.use('/export', exportRoutes);
 // Demo/test data classification + purge — runs in-process against the live
 // database (no downtime), see data-audit.routes.ts.
 router.use('/data-audit', dataAuditRoutes);
-
-function backupPath(filename: string): string {
-  // Defend against traversal: only a bare filename inside the backup directory.
-  const safe = path.basename(filename);
-  return path.join(paths.backups, safe);
-}
-
-function sha256(text: string): string {
-  return crypto.createHash('sha256').update(text).digest('hex');
-}
 
 /* ── GET /backup ────────────────────────────────────────────────────────────── */
 
@@ -75,65 +65,48 @@ router.post(
   validateBody(z.object({ notes: z.string().trim().max(500).default('') })),
   asyncHandler(async (req, res) => {
     const { notes } = req.body as { notes: string };
-
-    const schemaRow = await queryOne<{ version: string }>(
-      'SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1',
-    );
-
-    const { data, counts } = await collectBackupData((sql) => query(sql));
-
-    const payload: BackupPayload = {
-      meta: {
-        product: 'ZOLEX Purchase-to-Store ERP',
-        version: '1.0.0',
-        createdAt: new Date().toISOString(),
-        schemaVersion: schemaRow?.version ?? 'unknown',
-        tableCounts: counts,
-      },
-      data,
-    };
-
-    const json = JSON.stringify(payload, null, 0);
-    const checksum = sha256(json);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `zolex-backup-${stamp}.json`;
-    const filePath = backupPath(filename);
-
-    fs.mkdirSync(paths.backups, { recursive: true });
-    fs.writeFileSync(filePath, json, 'utf8');
-    const size = fs.statSync(filePath).size;
-
-    const created = await withTransaction(async (tx) => {
-      const row = await txQuery<{ id: number }>(
-        tx,
-        `INSERT INTO backup_metadata
-           (filename, file_path, kind, status, size_bytes, checksum_sha256,
-            table_counts, schema_version, notes, created_by, verified_at)
-         VALUES ($1,$2,'MANUAL','VERIFIED',$3,$4,$5::jsonb,$6,$7,$8, now())
-         RETURNING id`,
-        [filename, filePath, size, checksum, JSON.stringify(counts),
-         schemaRow?.version ?? '', notes, req.user!.id],
-      );
-      await auditIn(tx, {
-        actor: actorFrom(req), action: 'BACKUP', entity: 'backup', entityId: row[0]?.id,
-        entityLabel: filename,
-        after: { filename, sizeBytes: size, checksum, totalRows: Object.values(counts).reduce((a, b) => a + b, 0) },
-      });
-      return row[0];
-    });
-
-    logger.info(`Backup created: ${filename} (${(size / 1024).toFixed(1)} KB)`);
-
+    let result;
+    try {
+      result = await createBackup({ kind: 'MANUAL', notes, userId: req.user!.id, actor: actorFrom(req) });
+    } catch (err) {
+      if (isBackupRunning()) throw ConflictError((err as Error).message);
+      throw err;
+    }
+    if (result.status !== 'VERIFIED') {
+      throw ConflictError(`The backup ${result.filename} was written but failed verification — do not rely on it. Try again.`);
+    }
     sendCreated(res, {
-      id: created?.id,
-      filename,
-      sizeBytes: size,
-      checksum,
-      tableCounts: counts,
-      totalRows: Object.values(counts).reduce((a, b) => a + b, 0),
-      location: paths.backups,
-      message: `Backup created outside the project folder at ${paths.backups}.`,
+      ...result,
+      message: `Backup created and verified outside the project folder at ${paths.backups}.`,
     });
+  }),
+);
+
+/* ── GET /backup/schedule — automatic backups and retention ─────────────────── */
+
+router.get(
+  '/schedule',
+  requirePermission('backup.view'),
+  asyncHandler(async (_req, res) => {
+    const status = await backupScheduleStatus();
+    const retention = await applyRetention({ dryRun: true });
+    const kinds = await query<{ kind: string; status: string; n: number; bytes: string }>(
+      `SELECT kind, status, COUNT(*)::int AS n, COALESCE(SUM(size_bytes), 0)::text AS bytes
+         FROM backup_metadata GROUP BY kind, status ORDER BY kind, status`,
+    );
+    sendOk(res, { ...status, retention, byKind: kinds, running: isBackupRunning() });
+  }),
+);
+
+/* ── POST /backup/retention — apply the retention policy now (or preview) ───── */
+
+router.post(
+  '/retention',
+  requirePermission('backup.admin'),
+  validateBody(z.object({ dryRun: z.boolean().default(true) })),
+  asyncHandler(async (req, res) => {
+    const { dryRun } = req.body as { dryRun: boolean };
+    sendOk(res, await applyRetention({ dryRun, actor: actorFrom(req) }));
   }),
 );
 
