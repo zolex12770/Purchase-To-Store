@@ -39,13 +39,26 @@ import inventoryRoutes from './modules/inventory/routes.js';
 import dataManagementRoutes from './modules/admin/data-management.routes.js';
 import { getDatabase } from './db/index.js';
 
+/**
+ * Which callers may tell us the client's address through X-Forwarded-For.
+ *
+ * The only proxy in front of this server is the vite server on the same machine
+ * (8080 in production; both of its /api entries set xfwd), so only loopback is
+ * trusted: through it, `req.ip` is the real client, which the login rate limit
+ * and the audit trail depend on, while a LAN client calling the API port
+ * directly is identified by its own socket address whatever header it sends.
+ * Production used `1` (trust one hop, whoever it is): a LAN client calling 4001
+ * directly could send its own X-Forwarded-For and get a fresh rate-limit bucket
+ * per request — shown on staging — and, with no xfwd on the proxy, every
+ * audited sign-in recorded a loopback address. Development trusted nothing,
+ * which would now share one bucket among every client of the dev server.
+ */
+export const TRUST_PROXY = 'loopback';
+
 export function createApp(): Express {
   const app = express();
 
-  // Behind a reverse proxy in production, trust exactly one hop so `req.ip` is the
-  // real client (rate limiting and audit trails depend on it) without allowing
-  // arbitrary X-Forwarded-For spoofing.
-  app.set('trust proxy', env.isProd ? 1 : false);
+  app.set('trust proxy', TRUST_PROXY);
   app.disable('x-powered-by');
 
   /* ── Request identity & timing ───────────────────────────────────────────── */

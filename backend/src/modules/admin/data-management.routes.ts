@@ -8,6 +8,8 @@
  * - Soft-Delete & Restore (deleted_at timestamp toggle).
  * - Safe Hard-Delete (Permanent Purge) strictly guarded by dependency checks.
  * - System Super Admins (10221, 10422) can NEVER be deleted or deactivated.
+ * - Any other Super Admin account is changed only by a Super Admin, and the last
+ *   active Super Admin is never deactivated or deleted (super-admin-guard.ts).
  */
 import { createHash } from 'node:crypto';
 import { Router } from 'express';
@@ -15,13 +17,16 @@ import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
 import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
-import { requireAnyPermission, invalidateAuthState } from '../../auth/middleware.js';
+import { requirePermission, invalidateAuthState } from '../../auth/middleware.js';
 import { auditIn, actorFrom } from '../../core/audit.js';
+import { assertMayChangeUsers, assertActiveSuperAdminRemains } from './super-admin-guard.js';
 
 const router = Router();
 
-// Guard all data-management operations to Super Admin or administrative authorities
-router.use(requireAnyPermission('system.admin', 'user.admin', 'role.view'));
+// Hard deletes and bulk (de)activation of users, suppliers and items are system
+// administration. This accepted role.view — a read-only right — or 'user.admin',
+// which does not exist in the permission catalogue.
+router.use(requirePermission('system.admin'));
 
 const PROTECTED_EMPLOYEE_IDS = new Set(['10221', '10422']);
 
@@ -860,8 +865,8 @@ router.post(
     if (entity === 'users') {
       // Protect super admins
       const protectedUsers = await query<{ id: number; employee_name: string }>(
-        `SELECT id, employee_name FROM users WHERE id = ANY($1) AND employee_id IN ('10221', '10422')`,
-        [ids],
+        `SELECT id, employee_name FROM users WHERE id = ANY($1) AND employee_id = ANY($2)`,
+        [ids, [...PROTECTED_EMPLOYEE_IDS]],
       );
       if (protectedUsers.length > 0) {
         if (!isActive) {
@@ -872,9 +877,16 @@ router.post(
           }
         }
       }
+      if (!isActive && filteredIds.includes(Number(req.user!.id))) {
+        throw BusinessRuleError('You cannot deactivate your own account.');
+      }
     }
 
     await withTransaction(async (tx) => {
+      if (entity === 'users') {
+        await assertMayChangeUsers(tx, req, filteredIds);
+        if (!isActive) await assertActiveSuperAdminRemains(tx, filteredIds);
+      }
       const table = entity;
       await tx.query(
         `UPDATE ${table}
@@ -925,8 +937,8 @@ router.post(
     let filteredIds = [...ids];
     if (entity === 'users' && !restore) {
       const protectedUsers = await query<{ id: number }>(
-        `SELECT id FROM users WHERE id = ANY($1) AND employee_id IN ('10221', '10422')`,
-        [ids],
+        `SELECT id FROM users WHERE id = ANY($1) AND employee_id = ANY($2)`,
+        [ids, [...PROTECTED_EMPLOYEE_IDS]],
       );
       if (protectedUsers.length > 0) {
         const protectedSet = new Set(protectedUsers.map((u) => Number(u.id)));
@@ -935,9 +947,16 @@ router.post(
           throw BusinessRuleError('Super Admin accounts (10221, 10422) cannot be soft-deleted.');
         }
       }
+      if (filteredIds.includes(Number(req.user!.id))) {
+        throw BusinessRuleError('You cannot delete your own account.');
+      }
     }
 
     await withTransaction(async (tx) => {
+      if (entity === 'users') {
+        await assertMayChangeUsers(tx, req, filteredIds);
+        if (!restore) await assertActiveSuperAdminRemains(tx, filteredIds);
+      }
       const table = entity;
       const timestamp = restore ? null : new Date().toISOString();
       await tx.query(
@@ -996,6 +1015,11 @@ router.post(
     const { entity, id, confirm } = req.body as z.infer<typeof hardDeleteSchema>;
     if (confirm !== 'DELETE') {
       throw ValidationError('Type "DELETE" in the confirmation field to authorize permanent deletion.');
+    }
+    if (entity === 'users') {
+      if (id === Number(req.user!.id)) throw BusinessRuleError('You cannot delete your own account.');
+      await assertMayChangeUsers(undefined, req, [id]);
+      await assertActiveSuperAdminRemains(undefined, [id], 'This is the last active Super Admin and cannot be deleted.');
     }
 
     const { canHardDelete, blockingReasons } = await inspectDependencies(entity, id);

@@ -13,6 +13,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { Tag, Printer, Download, Eye, X, RotateCw } from 'lucide-react';
 import { api, qs, downloadFile, fetchHtml, type PageMeta } from '../../lib/api';
+import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
 import {
@@ -56,6 +57,10 @@ function labelStatus(r: LabelRow): { label: string; tone: 'success' | 'warning' 
 
 export default function GrnLabels() {
   const toast = useToast();
+  const { can } = useAuth();
+  // Printing and the PDF count as prints (the lot's print count moves), so the
+  // server asks for grn.print; previewing needs only the view right.
+  const canPrint = can('grn.print');
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [search, setSearch] = useState('');
@@ -259,9 +264,11 @@ export default function GrnLabels() {
             <Button variant="secondary" size="sm" icon={<Eye size={13} />} disabled={selectedIds.length === 0} onClick={() => void openPreview()}>
               Generate / Preview
             </Button>
-            <Button variant="secondary" size="sm" icon={<Download size={13} />} loading={downloading} disabled={selectedIds.length === 0} onClick={() => void downloadPdf()}>
-              Download PDF
-            </Button>
+            {canPrint && (
+              <Button variant="secondary" size="sm" icon={<Download size={13} />} loading={downloading} disabled={selectedIds.length === 0} onClick={() => void downloadPdf()}>
+                Download PDF
+              </Button>
+            )}
           </div>
 
           {list.isLoading ? (
@@ -353,10 +360,12 @@ export default function GrnLabels() {
         footer={
           <>
             <Button variant="ghost" onClick={() => { setPreviewOpen(false); setPreviewHtml(null); }}>Close</Button>
-            <Button variant="primary" icon={selectedAlreadyPrinted ? <RotateCw size={14} /> : <Printer size={14} />}
-                    disabled={!previewHtml} onClick={printFromPreview}>
-              {selectedAlreadyPrinted ? 'Reprint' : 'Print'}
-            </Button>
+            {canPrint && (
+              <Button variant="primary" icon={selectedAlreadyPrinted ? <RotateCw size={14} /> : <Printer size={14} />}
+                      disabled={!previewHtml} onClick={printFromPreview}>
+                {selectedAlreadyPrinted ? 'Reprint' : 'Print'}
+              </Button>
+            )}
           </>
         }
       >
