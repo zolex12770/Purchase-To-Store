@@ -99,10 +99,13 @@ function resolveSecret(value: string | undefined, name: string): string {
 }
 
 /* ── Storage paths (must live outside the project source — SRS §19, §23) ──── */
+// A test run never shares the production root. Only the database folder used to move
+// (data-test), so test runs wrote 355 backup files and their logs into ~/ZolexERP/backups
+// beside the real recovery points (found 2026-10-16).
 const dataRoot = path.resolve(
   raw.ZOLEX_DATA_ROOT && raw.ZOLEX_DATA_ROOT.trim().length > 0
     ? raw.ZOLEX_DATA_ROOT.trim()
-    : path.join(os.homedir(), 'ZolexERP'),
+    : path.join(os.homedir(), raw.NODE_ENV === 'test' ? 'ZolexERP-test' : 'ZolexERP'),
 );
 
 export const paths = {
