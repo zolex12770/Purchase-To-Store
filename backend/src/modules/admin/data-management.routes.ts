@@ -1054,4 +1054,81 @@ router.post(
   }),
 );
 
+/* ── Repair: indent lines the Google sync appended more than once ─────────────
+   Until 2026-10-16 the scheduled Google sync failed to recognise an indent line
+   it had stored under the item master's code and appended it again on every run
+   (62 lines x ~40 runs in production). A line is listed here ONLY when
+     · the Google sync inserted it (created inside a sync job's run window), and
+     · an identical line — same indent, item and quantity — already existed before
+       that run started, and
+     · no purchase order draws on it.
+   Lines a sheet legitimately lists twice were imported in the same run, so they
+   are never listed. dryRun (the default) only lists; removing requires a Super
+   Admin, the typed confirmation, and writes every removed row in full to the
+   audit log so it can be put back. */
+
+const DUPLICATE_SYNC_LINES_SQL = `
+  SELECT l.id, l.indent_id, h.indent_no, h.status, l.line_no, l.item_id, l.item_code, l.indent_qty,
+         l.created_at, j.id AS job_id
+    FROM purchase_indent_lines l
+    JOIN purchase_indent_headers h ON h.id = l.indent_id
+    JOIN google_sync_jobs j ON l.created_at BETWEEN j.started_at AND COALESCE(j.finished_at, j.started_at + interval '15 minutes')
+   WHERE EXISTS (
+           SELECT 1 FROM purchase_indent_lines e
+            WHERE e.indent_id = l.indent_id AND e.item_id IS NOT DISTINCT FROM l.item_id
+              AND e.indent_qty = l.indent_qty AND e.id < l.id AND e.created_at < j.started_at)
+     AND NOT EXISTS (SELECT 1 FROM po_indent_sources s WHERE s.indent_line_id = l.id)
+   ORDER BY h.indent_no, l.item_code, l.id`;
+
+router.post(
+  '/repair/duplicate-indent-lines',
+  validateBody(z.object({ dryRun: z.boolean().default(true), confirm: z.string().optional() })),
+  asyncHandler(async (req, res) => {
+    const { dryRun, confirm } = req.body as { dryRun: boolean; confirm?: string };
+    const found = await query<Record<string, unknown> & { id: number; indent_no: string; item_code: string; indent_qty: string }>(DUPLICATE_SYNC_LINES_SQL);
+    const byLine = new Map<string, number>();
+    for (const r of found) {
+      const k = `${r.indent_no} | ${r.item_code} | ${Number(r.indent_qty)}`;
+      byLine.set(k, (byLine.get(k) ?? 0) + 1);
+    }
+    const summary = {
+      duplicateLines: found.length,
+      distinctLines: byLine.size,
+      duplicatedQty: found.reduce((a, r) => a + Number(r.indent_qty), 0),
+      examples: [...byLine.entries()].slice(0, 25).map(([line, copies]) => ({ line, extraCopies: copies })),
+    };
+    if (dryRun) {
+      sendOk(res, { dryRun: true, ...summary, message: `${found.length} duplicate line(s) would be removed. Nothing was changed.` });
+      return;
+    }
+    if (!req.user!.roles.includes('SUPER_ADMIN')) {
+      throw BusinessRuleError('Only a Super Admin can remove duplicate lines.');
+    }
+    if (confirm !== 'REMOVE DUPLICATES') {
+      throw ValidationError('Type "REMOVE DUPLICATES" to confirm. Take a backup first.');
+    }
+    const removed = await withTransaction(async (tx) => {
+      // Re-select inside the transaction so the rows removed are exactly the rows recorded.
+      const rows = await txQuery<Record<string, unknown> & { id: number }>(
+        tx,
+        `SELECT l.* FROM purchase_indent_lines l WHERE l.id IN (SELECT d.id FROM (${DUPLICATE_SYNC_LINES_SQL}) d)`,
+      );
+      if (rows.length > 0) {
+        await tx.query('DELETE FROM purchase_indent_lines WHERE id = ANY($1::bigint[])', [rows.map((r) => r.id)]);
+      }
+      await auditIn(tx, {
+        actor: actorFrom(req),
+        action: 'DELETE',
+        entity: 'purchase_indent_lines',
+        entityLabel: 'duplicate lines appended by the Google sync',
+        before: rows,
+        after: { removed: rows.length, distinctLines: summary.distinctLines },
+        message: `Removed ${rows.length} indent line(s) the Google sync had appended more than once (${summary.distinctLines} distinct line(s) kept once each). Every removed row is stored in this audit entry.`,
+      });
+      return rows.length;
+    });
+    sendOk(res, { dryRun: false, removed, ...summary, message: `${removed} duplicate line(s) removed; the full rows are kept in the audit log.` });
+  }),
+);
+
 export default router;

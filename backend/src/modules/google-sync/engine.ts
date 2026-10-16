@@ -28,6 +28,8 @@ export interface SyncOptions {
   sheets?: string[];
   /** Parse and validate without writing anything. */
   dryRun?: boolean;
+  /** Replaces the Google read — tests supply the sheet grid directly. */
+  reader?: (sheetName: string) => Promise<string[][]>;
 }
 
 export interface SheetOutcome {
@@ -344,6 +346,34 @@ interface RowContext {
   seenKeys: Set<string>;
   /** Lookup ids the combined type tab listed, per category (see reconcileDocumentTypes). */
   typeIds: Map<string, Set<number>>;
+  /**
+   * Sheet rows seen so far in this run per document line key (document no + item),
+   * counted per value signature — so the rows of one document that list the same
+   * item more than once are matched to its stored lines one-for-one.
+   */
+  tally: Map<string, Map<string, number>>;
+}
+
+/**
+ * Decides what one sheet row means for the stored lines of the same document and
+ * item: already present (as many stored lines carry its values as rows seen so far),
+ * a new line (the document has fewer lines for the item than the sheet lists), or a
+ * changed line (a conflict to review — the ERP value is kept).
+ */
+function matchSheetLine(
+  ctx: RowContext,
+  key: string,
+  signature: string,
+  stored: string[],
+): 'PRESENT' | 'NEW' | 'CHANGED' {
+  const perKey = ctx.tally.get(key) ?? new Map<string, number>();
+  ctx.tally.set(key, perKey);
+  perKey.set(signature, (perKey.get(signature) ?? 0) + 1);
+  const seenSame = perKey.get(signature)!;
+  const seenAll = [...perKey.values()].reduce((a, b) => a + b, 0);
+  if (stored.filter((s) => s === signature).length >= seenSame) return 'PRESENT';
+  if (stored.length < seenAll) return 'NEW';
+  return 'CHANGED';
 }
 
 /**
@@ -990,12 +1020,17 @@ function parseSheetDate(val: string | null | undefined): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function resolveOrCreateItem(
+/**
+ * The live item a sheet row refers to — by code, else by description — without
+ * creating one. A transaction sheet may use a different code for the same item
+ * (the purchase code "CCETP625075" for item "FCETP62.5 X 0.75"), so a row is
+ * often matched by its description and stored under the item master's code.
+ */
+async function findItem(
   tx: Queryable,
   code: string,
   description: string,
-  uomId: number | null,
-): Promise<{ id: number; itemCode: string; itemDescription: string }> {
+): Promise<{ id: number; item_code: string; item_description: string } | null> {
   let it = await txQueryOne<{ id: number; item_code: string; item_description: string }>(
     tx,
     'SELECT id, item_code, item_description FROM items WHERE upper(item_code) = upper($1) AND deleted_at IS NULL LIMIT 1',
@@ -1008,6 +1043,16 @@ async function resolveOrCreateItem(
       [description],
     );
   }
+  return it;
+}
+
+async function resolveOrCreateItem(
+  tx: Queryable,
+  code: string,
+  description: string,
+  uomId: number | null,
+): Promise<{ id: number; itemCode: string; itemDescription: string }> {
+  const it = await findItem(tx, code, description);
   if (!it) {
     const cleanCode = code || ('ITM_' + Math.random().toString(36).slice(2, 8).toUpperCase());
     const cleanDesc = description || cleanCode;
@@ -1064,24 +1109,44 @@ async function syncPurchaseIndentRow(ctx: RowContext): Promise<void> {
     return;
   }
 
-  // 1. Check if line already exists in ERP
-  const existingLine = await txQueryOne<{ id: number; indent_qty: string; status: string }>(
+  // 1. Already in the ERP? The line may be stored under the item master's code
+  //    rather than the sheet's (see findItem), so it is matched by the resolved
+  //    item as well as by the sheet's own code and description. Matching only the
+  //    sheet code — and comparing the stored DESCRIPTION with that code — missed
+  //    such lines, and every 15-minute scheduled sync appended them again
+  //    (62 lines x 38 runs in production, 2026-10-14..16).
+  const sheetDesc = (ctx.values.item_description ?? '').trim();
+  const known = await findItem(ctx.tx, itemCode, sheetDesc);
+  const existingLines = await txQuery<{ id: number; indent_qty: string; status: string }>(
     ctx.tx,
     `SELECT l.id, l.indent_qty, h.status
        FROM purchase_indent_lines l
        JOIN purchase_indent_headers h ON h.id = l.indent_id
-      WHERE h.indent_no = $1 AND (upper(l.item_code) = upper($2) OR lower(l.item_description) = lower($2))`,
-    [indentNo, itemCode],
+      WHERE h.indent_no = $1
+        AND (l.item_id = $2 OR upper(l.item_code) = upper($3)
+             OR ($4 <> '' AND lower(l.item_description) = lower($4)))`,
+    [indentNo, known?.id ?? null, itemCode, sheetDesc],
   );
 
-  if (existingLine) {
-    if (Number(existingLine.indent_qty) !== Number(qty)) {
+  // One indent can list the same item more than once (ZI/RM/0005: 150 and 300 Kg),
+  // so rows and stored lines are matched one-for-one by quantity.
+  const match = matchSheetLine(
+    ctx,
+    // Keyed by the sheet's own code: stable for every row of this run, even after
+    // the first row created the item.
+    `${indentNo}|${itemCode.toUpperCase()}`,
+    Number(qty).toFixed(4),
+    existingLines.map((l) => Number(l.indent_qty).toFixed(4)),
+  );
+  if (match !== 'NEW') {
+    if (match === 'CHANGED') {
+      const held = existingLines.map((l) => l.indent_qty).join(', ');
       ctx.outcome.conflicts += 1;
       ctx.errors.push({
         sheet: ctx.sheet, row: ctx.rowNumber, column: 'Indent Qty',
         businessKey: `${indentNo} / ${itemCode}`, severity: 'CONFLICT', code: 'QTY_MISMATCH',
-        message: `Indent ${indentNo} line ${itemCode}: the sheet says ${qty} but the ERP holds ${existingLine.indent_qty} (document is ${existingLine.status}). The ERP value has been kept.`,
-        existing: { indentQty: existingLine.indent_qty, status: existingLine.status },
+        message: `Indent ${indentNo} line ${itemCode}: the sheet says ${qty} but the ERP holds ${held} (document is ${existingLines[0]!.status}). The ERP value has been kept.`,
+        existing: { indentQty: held, status: existingLines[0]!.status },
         incoming: { indentQty: qty },
       });
     } else {
@@ -1168,20 +1233,33 @@ async function syncPurchaseOrderRow(ctx: RowContext): Promise<void> {
     return;
   }
 
-  // 1. Check if line already exists in ERP
-  const existingLine = await txQueryOne<{ id: number; po_qty: string; rate: string; status: string }>(
+  // 1. Already in the ERP? Same matching as indent lines (see syncPurchaseIndentRow).
+  const sheetDesc = (ctx.values.item_description ?? '').trim();
+  const known = await findItem(ctx.tx, itemCode, sheetDesc);
+  const existingLines = await txQuery<{ id: number; po_qty: string; rate: string; status: string }>(
     ctx.tx,
     `SELECT l.id, l.po_qty, l.rate, h.status
        FROM purchase_order_lines l
        JOIN purchase_order_headers h ON h.id = l.po_id
-      WHERE h.po_no = $1 AND (upper(l.item_code) = upper($2) OR lower(l.item_description) = lower($2))`,
-    [poNo, itemCode],
+      WHERE h.po_no = $1
+        AND (l.item_id = $2 OR upper(l.item_code) = upper($3)
+             OR ($4 <> '' AND lower(l.item_description) = lower($4)))`,
+    [poNo, known?.id ?? null, itemCode, sheetDesc],
   );
 
-  if (existingLine) {
+  const signature = (q: unknown, r: unknown) => `${Number(q).toFixed(4)}@${Number(r).toFixed(4)}`;
+  const match = matchSheetLine(
+    ctx,
+    `${poNo}|${itemCode.toUpperCase()}`,
+    signature(qty, rate),
+    existingLines.map((l) => signature(l.po_qty, l.rate)),
+  );
+  if (match !== 'NEW') {
+    const existingLine = existingLines.find((l) => Number(l.po_qty) === Number(qty) && Number(l.rate) === Number(rate))
+      ?? existingLines[0]!;
     const qtyDiffers = Number(existingLine.po_qty) !== Number(qty);
     const rateDiffers = Number(existingLine.rate) !== Number(rate);
-    if (qtyDiffers || rateDiffers) {
+    if (match === 'CHANGED') {
       ctx.outcome.conflicts += 1;
       ctx.errors.push({
         sheet: ctx.sheet, row: ctx.rowNumber, column: qtyDiffers ? 'Po qty' : 'Rate/pc',
@@ -1500,7 +1578,7 @@ export async function runSync(options: SyncOptions): Promise<SyncResult> {
   }
 
   const cfg = syncConfig();
-  if (!cfg.configured) {
+  if (!cfg.configured && !options.reader) {
     throw IntegrationError(cfg.reason ?? 'Google Sheets is not configured.');
   }
 
@@ -1542,7 +1620,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
     };
 
     try {
-      const grid = await readSheet(mapping.sheet_name);
+      const grid = await (options.reader ?? readSheet)(mapping.sheet_name);
       if (grid.length < 2) {
         outcome.message = 'Sheet is empty or has only a header row.';
         outcomes.push(outcome);
@@ -1596,6 +1674,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
         const sheetErrors: ErrorRecord[] = [];
         const seenKeys = new Set<string>();
         const typeIds = new Map<string, Set<number>>();
+        const tally = new Map<string, Map<string, number>>();
 
         for (const [i, row] of dataRows.entries()) {
           const values: Record<string, string> = {};
@@ -1608,7 +1687,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
 
           const ctx: RowContext = {
             tx, jobId, sheet: mapping.sheet_name, rowNumber: i + 2,
-            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds,
+            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds, tally,
           };
 
           try {

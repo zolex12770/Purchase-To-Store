@@ -796,3 +796,84 @@ describe('system roles — the start-up seed respects an administrator\'s change
     expect((await request(app).post(api('/purchase-orders')).set(auth(buyerToken)).send(poBody(1))).status).toBe(201);
   });
 });
+
+/* ── 11. The scheduled Google sync does not append the same indent line again ── */
+
+describe('Google sync — a sheet row already imported is never inserted again', () => {
+  // Production, 2026-10-14..16: the Purchase Indent sheet names items by their
+  // purchase code ("CCETP625075"); the ERP item is "FCETP62.5 X 0.75" with the
+  // same description. The line was stored under the item-master code, the next
+  // run looked for the sheet code only, and every 15-minute run appended it again.
+  const grid = [
+    ['Indent No', 'Date', 'Indent Type', 'Item Code', 'Item Description', 'Indent Qty', 'UOM'],
+    ['THARD/IND/0001', '3-Apr-2026', 'Non Consumable', 'THARD-CCETP625075', 'Hardening Copper Coil 62.5 X 0.75 MM', '100', 'KG'],
+    ['THARD/IND/0002', '5-Apr-2026', 'Non Consumable', 'THARD-CCETP44115', 'Hardening Copper Coil 44 X 1.15 MM', '150', 'KG'],
+    ['THARD/IND/0002', '5-Apr-2026', 'Non Consumable', 'THARD-CCETP44115', 'Hardening Copper Coil 44 X 1.15 MM', '300', 'KG'],
+  ];
+  const reader = async (sheet: string) => (sheet === 'Purchase Indent' ? grid : []);
+  const lines = async (indentNo: string) => (await (await import('../db/index.js')).query<{ item_code: string; indent_qty: string }>(
+    `SELECT l.item_code, l.indent_qty FROM purchase_indent_lines l JOIN purchase_indent_headers h ON h.id = l.indent_id
+      WHERE h.indent_no = $1 ORDER BY l.line_no`, [indentNo],
+  ));
+  const sync = async (trigger: 'MANUAL' | 'SCHEDULED') =>
+    (await import('../modules/google-sync/engine.js')).runSync({ trigger, sheets: ['Purchase Indent'], reader });
+
+  it('a line stored under the item master code is found again on every scheduled run', async () => {
+    await request(app).post(api('/items')).set(auth(adminToken))
+      .send({ itemCode: 'THARD-FCETP62.5', itemDescription: 'Hardening Copper Coil 62.5 X 0.75 MM', uomId, standardRate: '10' });
+    await sync('MANUAL');
+    for (let run = 0; run < 3; run += 1) await sync('SCHEDULED');
+    const stored = await lines('THARD/IND/0001');
+    expect(stored.map((l) => [l.item_code, Number(l.indent_qty)])).toEqual([['THARD-FCETP62.5', 100]]);
+  });
+
+  it('an indent listing the same item twice keeps exactly both lines', async () => {
+    const stored = await lines('THARD/IND/0002');
+    expect(stored.map((l) => Number(l.indent_qty))).toEqual([150, 300]);
+    expect((await sync('SCHEDULED')).totals.inserted).toBe(0);
+    expect((await lines('THARD/IND/0002')).length).toBe(2);
+  });
+});
+
+describe('repair — indent lines the Google sync appended more than once', () => {
+  it('lists only sync-appended repeats, removes them on confirmation, and records every removed row', async () => {
+    const { query } = await import('../db/index.js');
+    const one = async <T,>(sql: string, p: unknown[] = []) => (await query<T>(sql, p))[0]!;
+    const job = async (from: string, to: string) =>
+      (await one<{ id: number }>(
+        `INSERT INTO google_sync_jobs (status, trigger_source, sheet_id, started_at, finished_at)
+         VALUES ('PARTIAL', 'SCHEDULED', 'TEST', $1, $2) RETURNING id`, [from, to],
+      )).id;
+    const head = await one<{ id: number }>(
+      `INSERT INTO purchase_indent_headers (indent_no, indent_date, status) VALUES ('THARD/DUP/0001', '2026-10-14', 'PENDING_APPROVAL') RETURNING id`,
+    );
+    const line = (lineNo: number, qty: number, at: string) => query(
+      `INSERT INTO purchase_indent_lines (indent_id, line_no, item_id, item_code, item_description, indent_qty, uom_id, created_at)
+       VALUES ($1, $2, $3, 'THARD-ITEM', 'Hardening Item', $4, $5, $6)`, [head.id, lineNo, itemId, qty, uomId, at],
+    );
+    await job('2026-10-14T10:59:00Z', '2026-10-14T11:01:00Z');
+    await line(1, 10, '2026-10-14T11:00:00Z');   // the original import
+    await line(2, 10, '2026-10-14T11:00:01Z');   // the sheet lists it twice: same run — kept
+    await job('2026-10-15T05:00:00Z', '2026-10-15T05:01:00Z');
+    await line(3, 10, '2026-10-15T05:00:30Z');   // appended again by a later run
+    await job('2026-10-15T05:15:00Z', '2026-10-15T05:16:00Z');
+    await line(4, 10, '2026-10-15T05:15:30Z');   // and again
+    await line(5, 25, '2026-10-15T05:15:31Z');   // a different quantity — not a repeat
+
+    const url = api('/admin/data-management/repair/duplicate-indent-lines');
+    const dry = await request(app).post(url).set(auth(adminToken)).send({});
+    expect(dry.status).toBe(200);
+    expect(dry.body.data).toMatchObject({ dryRun: true, duplicateLines: 2, distinctLines: 1 });
+    expect((await request(app).post(url).set(auth(adminToken)).send({ dryRun: false })).status).toBe(422);
+    const applied = await request(app).post(url).set(auth(adminToken)).send({ dryRun: false, confirm: 'REMOVE DUPLICATES' });
+    expect(applied.status).toBe(200);
+    expect(applied.body.data.removed).toBe(2);
+    const left = await query<{ line_no: number }>(`SELECT line_no FROM purchase_indent_lines WHERE indent_id = $1 ORDER BY line_no`, [head.id]);
+    expect(left.map((l) => l.line_no)).toEqual([1, 2, 5]);
+    const trail = await one<{ before_data: unknown[] }>(
+      `SELECT before_data FROM audit_logs WHERE entity = 'purchase_indent_lines' AND action = 'DELETE' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(trail.before_data).toHaveLength(2);
+    expect((await request(app).post(url).set(auth(adminToken)).send({})).body.data.duplicateLines).toBe(0);
+  });
+});
