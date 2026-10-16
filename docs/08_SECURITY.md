@@ -93,12 +93,17 @@ Verified by `workflow.test.ts › input hardening`, which fires
 
 `helmet` sets the standard protective headers; HSTS is enabled in production. CORS
 is an **allow-list** of known origins with credentials enabled — not a wildcard.
-`x-powered-by` is disabled. `trust proxy` is `loopback`: only a reverse proxy on the
-same machine (the vite server on 8080, whose `/api` proxy sets `xfwd`, or a local
-nginx) may name the client in `X-Forwarded-For`, so `req.ip` is the real client for
-rate limiting and audit, while a LAN client calling the API port directly is
-identified by its own address whatever header it sends. (It was one hop of any
-origin, which let such a client pick a fresh rate-limit bucket per request.)
+`x-powered-by` is disabled. `trust proxy` comes from `TRUST_PROXY` and is `loopback`
+when unset: only a reverse proxy on the same machine (the vite server on 8080, whose
+`/api` proxy sets `xfwd`, or a local nginx) may name the client in `X-Forwarded-For`,
+so `req.ip` is the real client for rate limiting and audit, while a LAN client calling
+the API port directly is identified by its own address whatever header it sends. (It
+was one hop of any origin, which let such a client pick a fresh rate-limit bucket per
+request.) A proxy elsewhere must be named — its address or subnet, or the hop count
+where nothing else can reach the API port: the docker stack sets `1` for its nginx
+container, which connects from the compose network. Left at `loopback` there, every
+user would share nginx's address and one sign-in budget. `true` is refused at boot,
+and the value in force is logged at start-up (`Trust proxy  :`).
 
 ---
 

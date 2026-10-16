@@ -147,6 +147,7 @@ The settings that matter most:
 | `DATABASE_URL` | Connection string when `DB_DRIVER=pg` |
 | `AUTH_SECRET`, `AUTH_REFRESH_SECRET` | Required in production; auto-generated in development |
 | `BOOTSTRAP_ADMIN_PASSWORD` | Optional first-sign-in password (12+ characters) for the bootstrap administrators a new database creates; without it a random one is written to `bootstrap-admin-password.txt` in the data root |
+| `TRUST_PROXY` | Which proxies may name the client's address, which sign-in rate limits and the audit trail key on. Unset means loopback, right for a proxy on the same machine; a proxy elsewhere must be named (the docker stack sets `1`) — see [docs/09_DEPLOYMENT.md](docs/09_DEPLOYMENT.md) §4 |
 | `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` | Path to a service-account key, stored outside the repository |
 
 **Production runs on a real PostgreSQL server.** See

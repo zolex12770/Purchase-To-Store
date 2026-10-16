@@ -10,7 +10,8 @@
  *   3. Data management needs system.admin (it accepted role.view).
  *   4. Only a Super Admin may reset, edit, re-role, unlock or deactivate a Super
  *      Admin account.
- *   5. Only the proxy on this machine may name the client's address.
+ *   5. By default only the proxy on this machine may name the client's address
+ *      (TRUST_PROXY values other than the default: trust-proxy.test.ts).
  *   6. Viewer's default is four view rights, and a restart never re-grants a
  *      right an administrator removed from it.
  *   7. The last active Super Admin can be neither deactivated nor demoted.
@@ -22,6 +23,8 @@ import type { Express } from 'express';
 process.env.NODE_ENV = 'test';
 process.env.SEED_DEMO_DATA = 'false';
 process.env.LOG_LEVEL = 'silent';
+// §5 is about the default, whatever the shell or a .env sets.
+process.env.TRUST_PROXY = '';
 
 type Q = <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T[]>;
 let app: Express;
@@ -316,8 +319,8 @@ describe('a Super Admin account', () => {
 
 describe('the client address', () => {
   it('may be named only by the proxy on this machine', async () => {
-    const { TRUST_PROXY } = await import('../app.js');
-    expect(TRUST_PROXY).toBe('loopback');
+    const { env } = await import('../config/env.js');
+    expect(env.TRUST_PROXY).toBe('loopback');
     expect(app.get('trust proxy')).toBe('loopback');
 
     // req.ip exactly as Express resolves it for a connection from `remoteAddress`.

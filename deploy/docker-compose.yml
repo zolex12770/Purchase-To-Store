@@ -58,6 +58,14 @@ services:
       AUTH_SECRET: ${AUTH_SECRET:?generate with openssl rand -base64 48}
       AUTH_REFRESH_SECRET: ${AUTH_REFRESH_SECRET:?generate with openssl rand -base64 48}
       ZOLEX_DATA_ROOT: /data
+      # nginx (web) is the one proxy in front of the API and connects from this
+      # network, not from loopback (the API's default), so without this every user
+      # would share nginx's address — and one sign-in rate-limit budget for the
+      # whole site. Trusting one hop is safe only because the API port below is
+      # `expose`d, never published: no client reaches it except through nginx.
+      # Publish it, or put another proxy in front of nginx, and this must change
+      # (backend/src/config/env.ts, TRUST_PROXY).
+      TRUST_PROXY: "1"
       # Demo data is refused in production regardless, but be explicit.
       SEED_DEMO_DATA: "false"
       GOOGLE_SHEET_ID: ${GOOGLE_SHEET_ID:-}

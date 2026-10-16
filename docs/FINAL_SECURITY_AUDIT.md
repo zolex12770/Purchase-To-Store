@@ -127,7 +127,7 @@ Verified `git check-ignore` behaviour:
 | Versioning | `/api/v1` |
 | Error responses | Centralised. Stack traces never reach the client |
 | Request IDs | Every request carries `x-request-id` for traceability |
-| Trust proxy | `trust proxy = 1` in production, so rate limiting keys on the **real** client IP rather than nginx's |
+| Trust proxy | `TRUST_PROXY`: `loopback` by default (the proxy on the same machine), `1` in the docker stack (its nginx container), so rate limiting keys on the **real** client IP rather than the proxy's, and a client calling the API port directly cannot choose its own; `true` is refused (`trust-proxy.test.ts`) |
 
 ---
 

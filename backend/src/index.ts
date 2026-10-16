@@ -52,6 +52,8 @@ async function bootstrap(): Promise<void> {
     logger.info(`API ready    : http://localhost:${env.PORT}/api/v1`);
     logger.info(`Health       : http://localhost:${env.PORT}/api/v1/health`);
     logger.info(`Frontend     : ${env.FRONTEND_URL}`);
+    // A wrong value here is otherwise silent: every user keyed on one proxy address.
+    logger.info(`Trust proxy  : ${String(env.TRUST_PROXY)}`);
     // No password or bootstrap secret is ever logged: logs are copied and read far
     // more widely than the data root. This line used to print the bootstrap
     // password on every non-production start. A newly created bootstrap account's
