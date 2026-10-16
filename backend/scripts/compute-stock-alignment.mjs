@@ -43,9 +43,26 @@
  *
  * Tiers. A: the records close the gap exactly — emitted. B: they would, but the sheet
  * counts the item in another unit than the Item Master; correct items.uom_id, re-run,
- * and the item is then A. C: an owner decision or a correction is needed first.
+ * and the item is then A. C: an owner decision or a correction is needed first
+ * (ERP receipts or issues the sheets do not have, a sheet that does not add up, an
+ * item already aligned). An ERP document taken back with its supported reversal
+ * (same document number, net 0) changed nothing and is left out of the comparison.
  *
- * Needs Node 22.18 or later: it loads the sync's TypeScript sheet rules directly.
+ * Procedure: take a verified backup with no inventory sync running, right after a
+ * sync; run this with --sheets backup; POST the entries file (dryRun defaults to true);
+ * review accepted and refused; POST again with dryRun false, confirm
+ * "ALIGN STOCK LEDGER" and expectedHash = the dry run's selectionHash.
+ *
+ * Checked against the 2026-10-16 07:15 UTC backup (audit A4): A4's Tier A — 2,653 items,
+ * 6,545 entries, net +792,890.32 — is reproduced entry for entry, from the backup's own
+ * sheet reading and equally from raw reads of the five sheets taken at 07:23 UTC. This
+ * script adds 4 items (PTC2, PTC2/0, PTC4, PTC6; 12 entries, net −271): A4 held all 8
+ * PTC codes back because the sync added their WIP pieces to their RM kilograms (SLR-4);
+ * with the sync counting the Item Master's unit only, these 4 — whose WIP figure is
+ * 0 — close exactly from their RM records.
+ *
+ * Needs Node 22.18 or later: it loads the sync's TypeScript sheet rules directly
+ * (on an older Node: node --import tsx scripts/compute-stock-alignment.mjs …).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -61,9 +78,24 @@ const RECEIPT_TYPE = { RM: 'GRN_INWARD', TRADING: 'PURCHASE_INWARD', GENERAL: 'G
 const ISSUE_TYPES = new Set(['REQUISITION_ISSUE', 'DIRECT_ISSUE']);
 /** An ERP issue is the same as a sheet issue row of the same quantity at most this many days apart. */
 const DATE_TOLERANCE_DAYS = 7;
+/** Rows the endpoint posts carry this reference type; an item that has one is never aligned again. */
+const ALIGNMENT_REFERENCE_TYPE = 'OPENING_ALIGNMENT';
+/** The endpoint's limits on an entry's text (data-management.routes.ts). */
+const MAX_REFERENCE = 300;
+const MAX_EVIDENCE = 1000;
+
+/** Error text from Google or the file system can quote the key file's path; it is never printed. */
+function redact(message) {
+  const keyPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  let out = String(message);
+  if (keyPath) {
+    for (const form of new Set([keyPath, keyPath.replace(/\\/g, '/'), keyPath.replace(/\//g, '\\')])) out = out.split(form).join('<GOOGLE_APPLICATION_CREDENTIALS>');
+  }
+  return out;
+}
 
 function fail(message) {
-  console.error(`compute-stock-alignment: ${message}`);
+  console.error(`compute-stock-alignment: ${redact(message)}`);
   process.exit(1);
 }
 
@@ -334,6 +366,12 @@ function rowList(tab, rows) {
   return all.length <= 400 ? all : `${tab} ${nums.length} rows ${nums[0]}-${nums[nums.length - 1]}`;
 }
 
+/** "ids 27428,27433", or "ids 27428 … 31544 (37)" when the list would not fit in `max` characters. */
+function listText(label, values, max) {
+  const all = `${label} ${values.join(',')}`;
+  return all.length <= max ? all : `${label} ${values[0]} … ${values[values.length - 1]} (${values.length})`;
+}
+
 /* ── Per item ───────────────────────────────────────────────────────────────── */
 
 function analyse(backup, sheets) {
@@ -362,9 +400,19 @@ function analyse(backup, sheets) {
     const sheetSum = listed.reduce((a, r) => a + r.L, 0);
     const target = Math.max(0, sheetSum);
 
-    const grnRows = rows.filter((l) => l.txn_type === 'GRN_INWARD');
-    const syncRows = rows.filter((l) => l.txn_type === 'SHEET_SYNC');
-    const otherRows = rows.filter((l) => l.txn_type !== 'GRN_INWARD' && l.txn_type !== 'SHEET_SYNC');
+    // Rows an earlier alignment posted: the item is not aligned twice.
+    const alignedRows = rows.filter((l) => l.reference_type === ALIGNMENT_REFERENCE_TYPE);
+    // An ERP document posted and then taken back with its supported reversal (the
+    // reversal carries the same document number) changed nothing for this item, so it
+    // needs no sheet counterpart — e.g. the 2026-10-14 test records once reversed.
+    const byDoc = group(rows.filter((l) => l.reference_type !== ALIGNMENT_REFERENCE_TYPE && l.txn_type !== 'SHEET_SYNC' && l.reference_no),
+      (l) => l.reference_no);
+    const reversedDocs = new Set([...byDoc].filter(([, list]) => list.some((l) => l.txn_type.endsWith('_REVERSAL'))
+      && list.reduce((a, l) => a + S(l.inward_qty) - S(l.outward_qty), 0) === 0).map(([no]) => no));
+    const counted = rows.filter((l) => l.reference_type !== ALIGNMENT_REFERENCE_TYPE && !reversedDocs.has(l.reference_no));
+    const grnRows = counted.filter((l) => l.txn_type === 'GRN_INWARD');
+    const syncRows = counted.filter((l) => l.txn_type === 'SHEET_SYNC');
+    const otherRows = counted.filter((l) => l.txn_type !== 'GRN_INWARD' && l.txn_type !== 'SHEET_SYNC');
     const netOf = (list) => list.reduce((a, l) => a + S(l.inward_qty) - S(l.outward_qty), 0);
     const G = netOf(grnRows);
     const SS = netOf(syncRows);
@@ -425,9 +473,15 @@ function analyse(backup, sheets) {
     }
     for (const r of leftOut) warnings.push(`${r.category} sheet counts it in ${r.uom}: not part of the Purchase stock (Item Master ${itemUom ?? '(none)'})`);
     if (!it.is_active) warnings.push('inactive in the Item Master');
+    if (reversedDocs.size) warnings.push(`ERP ${[...reversedDocs].join(', ')} posted and reversed (net 0): left out of the comparison`);
 
     // Reasons that need a person first (Tier C).
     const reasons = [];
+    if (alignedRows.length) {
+      const undone = alignedRows.some((l) => l.reference_id !== null && l.reference_id !== undefined);
+      reasons.push(`already aligned on ${day(alignedRows[0].txn_date)} (${alignedRows.length} ${ALIGNMENT_REFERENCE_TYPE} ledger row(s)` +
+        `${undone ? ', since undone' : ''}); an item is aligned once only`);
+    }
     if (listed.length === 0) reasons.push('not listed in any inventory sheet');
     else if (sheetSum < 0) reasons.push(`the sheet shows negative stock ${q(sheetSum)}, held at zero`);
     else if (cats.length > 1) {
@@ -493,11 +547,19 @@ function analyse(backup, sheets) {
     // SHEET_SYNC entries measured the sheet's changes from the un-ledgered figure the old sync
     // wrote; the opening and the rows above now explain the stock from the start, so they are reversed.
     if (SS !== 0) {
+      // Remarks read "Reversal of sheet sync run INV-20261016-052733-bdc4 - stock_ledger id 27436".
+      const runs = [...new Set(syncRows.map((l) => l.reference_no))];
       entries.push({
         component: 'SHEET_SYNC_REVERSAL', qty: -SS,
-        reference: [...new Set(syncRows.map((l) => l.reference_no))].join(', '),
-        evidence: `stock_ledger id${syncRows.length > 1 ? 's' : ''} ${syncRows.map((l) => l.id).join(',')}`,
+        reference: listText(runs.length > 1 ? 'runs' : 'run', runs, MAX_REFERENCE),
+        evidence: listText(`stock_ledger id${syncRows.length > 1 ? 's' : ''}`, syncRows.map((l) => l.id), MAX_EVIDENCE),
       });
+    }
+    for (const e of entries) {
+      if (e.reference.length > MAX_REFERENCE || e.evidence.length > MAX_EVIDENCE) {
+        reasons.push(`an entry's text is longer than the endpoint accepts (${e.component} ${e.reference.slice(0, 40)}…)`);
+        break;
+      }
     }
     const entriesNet = entries.reduce((a, e) => a + e.qty, 0);
     const closes = entriesNet === gap;
