@@ -68,7 +68,7 @@ export default function StockReconciliation() {
         <StatTile
           label="Mismatches"
           value={String(meta?.mismatchCount ?? 0)}
-          sub={meta ? `${meta.activeMismatchCount} active · ${meta.inactiveMismatchCount} inactive` : undefined}
+          sub={meta?.activeMismatchCount !== undefined ? `${meta.activeMismatchCount} active · ${meta.inactiveMismatchCount} inactive` : undefined}
           tone={(meta?.mismatchCount ?? 0) > 0 ? 'danger' : 'success'}
           onClick={() => setMismatchOnly(true)}
         />
