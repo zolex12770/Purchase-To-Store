@@ -378,8 +378,8 @@ interface RowContext {
   docRows: Map<string, Array<{ code: string; desc: string }>>;
   /** replacedLines' answer per document, worked out once per run. */
   replaced: Map<string, Array<{ id: number; item_code: string; qty: string }>>;
-  /** GRN tab: total received per GRN number + item code over all of the sheet's rows. */
-  grnSheetQty: Map<string, number>;
+  /** GRN and Requisition tabs: the quantity per document number + item code, summed over the sheet's rows. */
+  sheetTotals: Map<string, number>;
 }
 
 /**
@@ -1546,12 +1546,20 @@ async function reconcileTransactionalSheet(
     // message only — never written back into that derivation.
     const requisitionNo = (ctx.values.requisition_no ?? '').trim();
     const itemCode = (ctx.values.item_code ?? '').trim();
-    const qty = parseNumericInput(ctx.values.requisition_qty);
     if (!requisitionNo || !itemCode) { ctx.outcome.skipped += 1; return; }
+    // One verdict per requisition + item: the rows of an item listed twice are summed
+    // (sheetTotals) and compared with the ERP's lines together. Comparing each row with
+    // the first matching line flagged RN-0034 SA005 (48 and 12 on both sides) as 12 vs 48.
+    const key = `${requisitionNo.toUpperCase()}|${itemCode.toUpperCase()}`;
+    if (ctx.seenKeys.has(`req|${key}`)) { ctx.outcome.skipped += 1; return; }
+    ctx.seenKeys.add(`req|${key}`);
+    const total = ctx.sheetTotals.get(key);
+    const qty = total === undefined ? null : Number(total.toFixed(4));
 
-    const line = await txQueryOne<{ requested_qty: string; issued_qty: string; hod_status: string; status: string }>(
+    const line = await txQueryOne<{ lines: number; requested_qty: string; issued_qty: string; hod_status: string; status: string }>(
       ctx.tx,
-      `SELECT v.requested_qty, v.issued_qty, hb.hod_status, h.status
+      `SELECT COUNT(*)::int AS lines, SUM(v.requested_qty) AS requested_qty, SUM(v.issued_qty) AS issued_qty,
+              MIN(hb.hod_status) AS hod_status, MIN(h.status) AS status
          FROM requisition_lines l
          JOIN requisition_headers h ON h.id = l.requisition_id
          JOIN v_requisition_line_balance v ON v.requisition_line_id = l.id
@@ -1560,7 +1568,7 @@ async function reconcileTransactionalSheet(
       [requisitionNo, itemCode],
     );
 
-    if (!line) {
+    if (!line || Number(line.lines) === 0) {
       ctx.outcome.conflicts += 1;
       ctx.errors.push({
         sheet: ctx.sheet, row: ctx.rowNumber, column: 'Requisition No',
@@ -1570,12 +1578,12 @@ async function reconcileTransactionalSheet(
       });
       return;
     }
-    if (qty !== null && Number(line.requested_qty) !== Number(qty)) {
+    if (qty !== null && Math.abs(Number(line.requested_qty) - qty) > 0.0001) {
       ctx.outcome.conflicts += 1;
       ctx.errors.push({
         sheet: ctx.sheet, row: ctx.rowNumber, column: 'Requisition Qty',
         businessKey: `${requisitionNo} / ${itemCode}`, severity: 'CONFLICT', code: 'QTY_MISMATCH',
-        message: `Requisition ${requisitionNo} line ${itemCode}: the sheet says ${qty} but the ERP holds ${line.requested_qty} ` +
+        message: `Requisition ${requisitionNo} line ${itemCode}: the sheet asks for ${qty} in total but the ERP holds ${Number(line.requested_qty)} over ${line.lines} line(s) ` +
           `(HOD status ${line.hod_status}, document is ${line.status}). The ERP value has been kept — requested quantity is never overwritten by a spreadsheet.`,
         existing: { requestedQty: line.requested_qty, issuedQty: line.issued_qty, hodStatus: line.hod_status, status: line.status },
         incoming: { requisitionQty: qty },
@@ -1700,7 +1708,7 @@ async function reconcileTransactionalSheet(
                OR ($4 <> '' AND lower(gl.item_description) = lower($4)))`,
       [grnNo, known?.id ?? null, itemCode, sheetDesc],
     );
-    const sheetQty = ctx.grnSheetQty.get(key) ?? Number(qty ?? 0);
+    const sheetQty = ctx.sheetTotals.get(key) ?? Number(qty ?? 0);
     if (!held || Number(held.lines) === 0) {
       ctx.outcome.conflicts += 1;
       ctx.errors.push({
@@ -1872,7 +1880,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
         // the rows its document's old lines still have (replacedLines).
         const docRows: RowContext['docRows'] = new Map();
         const replaced: RowContext['replaced'] = new Map();
-        const grnSheetQty: RowContext['grnSheetQty'] = new Map();
+        const sheetTotals: RowContext['sheetTotals'] = new Map();
         const cell = (row: string[], field: string) => {
           const idx = colIndex.get(field);
           return idx === undefined ? '' : (row[idx] ?? '').trim();
@@ -1888,15 +1896,18 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
             docRows.set(doc, list);
           }
         }
-        // A GRN may list one item on several rows; the ERP total is compared with their sum.
-        if (mapping.target_entity === 'grns') {
+        // A GRN or a requisition may list one item on several rows (RN-0034: SA005 48 and
+        // 12); the ERP total is compared with their sum, never one row with one line.
+        const totalOf = mapping.target_entity === 'grns' ? { doc: 'grn_no', qty: 'grn_qty' }
+          : mapping.target_entity === 'requisitions' ? { doc: 'requisition_no', qty: 'requisition_qty' } : null;
+        if (totalOf) {
           for (const row of dataRows) {
-            const grnNo = cell(row, 'grn_no');
+            const doc = cell(row, totalOf.doc);
             const code = cell(row, 'item_code');
-            const qty = parseNumericInput(cell(row, 'grn_qty'));
-            if (!grnNo || !code || qty === null) continue;
-            const key = `${grnNo.toUpperCase()}|${code.toUpperCase()}`;
-            grnSheetQty.set(key, (grnSheetQty.get(key) ?? 0) + Number(qty));
+            const qty = parseNumericInput(cell(row, totalOf.qty));
+            if (!doc || !code || qty === null) continue;
+            const key = `${doc.toUpperCase()}|${code.toUpperCase()}`;
+            sheetTotals.set(key, (sheetTotals.get(key) ?? 0) + Number(qty));
           }
         }
 
@@ -1911,7 +1922,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
 
           const ctx: RowContext = {
             tx, jobId, sheet: mapping.sheet_name, rowNumber: i + 2,
-            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds, tally, docRows, replaced, grnSheetQty,
+            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds, tally, docRows, replaced, sheetTotals,
           };
 
           try {

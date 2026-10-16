@@ -1026,4 +1026,32 @@ describe('Google sync — GRN rows are reconciled by GRN number, and issues that
     );
     expect(closed[0]!.resolution).toMatch(/No longer reported by sync run/);
   });
+
+  it("compares a requisition item listed on several rows by its total, not one row with the first line", async () => {
+    const { query } = await import("../db/index.js");
+    const admin = (await query<{ id: number }>("SELECT id FROM users WHERE employee_id = '10221'"))[0]!;
+    const h = (await query<{ id: number }>(
+      "INSERT INTO requisition_headers (requisition_no, requisition_date, requester_user_id, status) VALUES ('THARD/RN/0034', '2026-10-01', $1, 'APPROVED') RETURNING id",
+      [admin.id],
+    ))[0]!;
+    await query(
+      "INSERT INTO requisition_lines (requisition_id, line_no, item_id, item_code, item_description, requested_qty, uom_id) VALUES ($1, 1, $2, 'THARD-ITEM', 'Hardening Item', 48, $3), ($1, 2, $2, 'THARD-ITEM', 'Hardening Item', 12, $3)",
+      [h.id, itemId, uomId],
+    );
+    const reqHeader = ["Requisition No", "Item code", "Requisition Qty"];
+    let reqGrid: string[][] = [reqHeader, ["THARD/RN/0034", "THARD-ITEM", "48"], ["THARD/RN/0034", "THARD-ITEM", "12"]];
+    const reqSync = async () => (await import("../modules/google-sync/engine.js")).runSync({
+      trigger: "SCHEDULED", sheets: ["Requisition"], reader: async (sheet: string) => (sheet === "Requisition" ? reqGrid : []),
+    });
+    const reqOpen = async () => query<{ error_code: string }>(
+      "SELECT error_code FROM google_sync_errors WHERE sheet_name = 'Requisition' AND resolved_at IS NULL AND business_key LIKE 'THARD/RN/%'",
+    );
+    expect((await reqSync()).sheets[0]!.conflicts).toBe(0);
+    reqGrid = [reqHeader, ["THARD/RN/0034", "THARD-ITEM", "48"], ["THARD/RN/0034", "THARD-ITEM", "10"]];
+    await reqSync();
+    expect((await reqOpen()).map((i) => i.error_code)).toEqual(["QTY_MISMATCH"]);
+    reqGrid = [reqHeader, ["THARD/RN/0034", "THARD-ITEM", "48"], ["THARD/RN/0034", "THARD-ITEM", "12"]];
+    await reqSync();
+    expect(await reqOpen()).toEqual([]);
+  });
 });
