@@ -538,6 +538,12 @@ h1, h2, h3, h4, h5, h6 {
 .th-inner { position: relative; display: flex; align-items: center; gap: 4px; min-height: 34px; }
 .table thead th.right .th-inner { justify-content: flex-end; }
 .table thead th.center .th-inner { justify-content: center; }
+.th-sort {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  font: inherit; color: inherit; text-align: inherit; padding: 0; border-radius: var(--radius-2xs);
+}
+.th-sort:focus-visible { outline-offset: 1px; }
+.table.is-resizing, .table.is-resizing * { user-select: none; cursor: col-resize; }
 .col-resizer { position: absolute; top: 0; bottom: 0; right: -10px; width: 9px; cursor: col-resize; user-select: none; z-index: 2; }
 .col-resizer:hover, .col-resizer.is-active { background: linear-gradient(90deg, transparent 4px, var(--accent) 4px, var(--accent) 5px, transparent 5px); }
 
