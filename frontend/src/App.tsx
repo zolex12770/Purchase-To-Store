@@ -68,7 +68,12 @@ function RequireAuth({ children }: { children: ReactNode }) {
   const location = useLocation();
 
   if (loading) return <FullPageLoader />;
-  if (!user) return <Navigate to="/login" state={{ from: location.pathname + location.search }} replace />;
+  // A user who owes a password change gets no shell at all — the API answers
+  // nothing else until they change it — only the change-password step of the
+  // sign-in screen, which then continues to the page they asked for.
+  if (!user || user.mustChangePassword) {
+    return <Navigate to="/login" state={{ from: location.pathname + location.search }} replace />;
+  }
 
   return <AppShell>{children}</AppShell>;
 }

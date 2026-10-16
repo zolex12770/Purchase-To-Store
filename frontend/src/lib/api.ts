@@ -57,6 +57,7 @@ export class ApiError extends Error {
 
 let accessToken: string | null = null;
 let onUnauthenticated: (() => void) | null = null;
+let onPasswordChangeRequired: (() => void) | null = null;
 
 export function setAccessToken(token: string | null): void {
   accessToken = token;
@@ -66,6 +67,10 @@ export function getAccessToken(): string | null {
 }
 export function setUnauthenticatedHandler(fn: (() => void) | null): void {
   onUnauthenticated = fn;
+}
+/** Called when the server refuses a request because this account owes a password change. */
+export function setPasswordChangeRequiredHandler(fn: (() => void) | null): void {
+  onPasswordChangeRequired = fn;
 }
 
 /* ── Refresh coordination ────────────────────────────────────────────────────
@@ -161,6 +166,10 @@ async function toApiError(res: Response): Promise<ApiError> {
     /* non-JSON error body */
   }
   const e = payload.error;
+  // Until an owed password change is made the server answers nothing but the
+  // auth routes, whichever screen asked — so the change-password screen takes
+  // over instead of that screen showing the refusal.
+  if (res.status === 403 && e?.code === 'PASSWORD_CHANGE_REQUIRED') onPasswordChangeRequired?.();
   return new ApiError(
     res.status,
     e?.code ?? 'SERVER_ERROR',
