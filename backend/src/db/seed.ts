@@ -414,8 +414,11 @@ const SHEET_MAPPINGS = [
     notes: 'Final Rate/pc and Amount in the sheet are DERIVED columns here and never imported (ADR-004). Supplier Code / Delivery Date / Terms are captured for display only — reconciliation still checks qty and rate.',
   },
   {
-    sheet: 'GRN', entity: 'grns', order: 60, keys: ['po_no', 'item_code', 'date'],
+    sheet: 'GRN', entity: 'grns', order: 60, keys: ['grn_no', 'item_code'],
     columns: [
+      // The store's own GRN number: the ERP holds those GRNs under the same number,
+      // mostly without a PO link, so this is what a row is reconciled against.
+      { field: 'grn_no', headers: ['GRN No', 'Grn no', 'GRN No.', 'GRN Number'] },
       { field: 'po_no', headers: ['Po no', 'PO No'], required: true },
       { field: 'po_type', headers: ['Po type', 'PO Type'], lookup: 'PO_TYPE' },
       { field: 'item_code', headers: ['Item code', 'Item Code'], required: true },
@@ -431,7 +434,7 @@ const SHEET_MAPPINGS = [
       { field: 'remarks', headers: ['Remarks'] },
       { field: 'qc_status', headers: ['QC Status', 'QC status', 'QC_Status'] },
     ],
-    notes: 'GRN number is issued by the ERP (ADR-008); Pending GRN qty is derived, never imported. Accepted/Rejected Qty and Receipt Location (Set B) are captured for reconciliation display only — grn_qty (Received Qty) keeps its existing meaning for stock and pending-PO everywhere it is already used.',
+    notes: 'Rows are reconciled against the ERP GRN of the same GRN No (the store GRNs imported from this tab), or by PO + item when a row has no GRN No. GRNs raised in the ERP get ERP-issued numbers (ADR-008); Pending GRN qty is derived, never imported. Accepted/Rejected Qty and Receipt Location (Set B) are captured for reconciliation display only — grn_qty (Received Qty) keeps its existing meaning for stock and pending-PO everywhere it is already used.',
   },
   {
     // Requisition (Purchase Module tab 4) — reconciled exactly like Purchase

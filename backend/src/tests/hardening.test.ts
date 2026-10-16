@@ -978,3 +978,52 @@ describe('Google sync — Purchase Order rows whose code column holds the descri
     expect(trail.before_data.poLines).toHaveLength(1);
   });
 });
+
+describe('Google sync — GRN rows are reconciled by GRN number, and issues that no longer occur close themselves', () => {
+  // Production, 2026-10-16: the store's GRNs were imported from the GRN tab under their own
+  // numbers, almost all without a PO link. Matching rows only through PO lines reported
+  // 6,486 of 6,953 rows as missing from the ERP on every run, and 18,800 stale issues
+  // from 2026-10-14 were still open because nothing ever closed an issue.
+  const header = ['GRN No', 'GRN Date', 'Supplier Name', 'Item Code', 'Item Name', 'Unit', 'Recieved Qty', 'Po No'];
+  const row = (grn: string, qty: string) => [grn, '01-Oct-2026', 'Hardening Supplier Pvt Ltd', 'THARD-ITEM', 'Hardening Item', 'NOS', qty, '-'];
+  let grid: string[][] = [header];
+  const reader = async (sheet: string) => (sheet === 'GRN' ? grid : []);
+  const sync = async () => (await import('../modules/google-sync/engine.js')).runSync({ trigger: 'SCHEDULED', sheets: ['GRN'], reader });
+  const open = async () => (await (await import('../db/index.js')).query<{ error_code: string; business_key: string }>(
+    `SELECT error_code, business_key FROM google_sync_errors
+      WHERE sheet_name = 'GRN' AND resolved_at IS NULL AND business_key LIKE 'THARD/ZG/%' ORDER BY id`,
+  ));
+
+  it('matches an imported GRN without a PO link, sums repeated rows, flags real differences, and closes them once fixed', async () => {
+    const { query } = await import('../db/index.js');
+    const g = (await query<{ id: number }>(
+      `INSERT INTO grn_headers (grn_no, grn_date, supplier_id, status) VALUES ('THARD/ZG/0001', '2026-10-01', $1, 'POSTED') RETURNING id`,
+      [supplierId],
+    ))[0]!;
+    await query(
+      `INSERT INTO grn_lines (grn_id, line_no, item_id, item_code, item_description, grn_qty, uom_id, rate)
+       VALUES ($1, 1, $2, 'THARD-ITEM', 'Hardening Item', 6, $3, 10)`, [g.id, itemId, uomId],
+    );
+
+    grid = [header, row('THARD/ZG/0001', '6')];
+    expect((await sync()).sheets[0]!.conflicts).toBe(0);
+    grid = [header, row('THARD/ZG/0001', '4'), row('THARD/ZG/0001', '2')];
+    expect((await sync()).sheets[0]!.conflicts).toBe(0);
+
+    grid = [header, row('THARD/ZG/0001', '4'), row('THARD/ZG/0001', '3'), row('THARD/ZG/0002', '5')];
+    await sync();
+    expect((await open()).map((i) => [i.error_code, i.business_key])).toEqual([
+      ['QTY_MISMATCH', 'THARD/ZG/0001 / THARD-ITEM'],
+      ['MISSING_IN_ERP', 'THARD/ZG/0002 / THARD-ITEM'],
+    ]);
+
+    grid = [header, row('THARD/ZG/0001', '6')];
+    const fixed = await sync();
+    expect(fixed.sheets[0]!.issuesResolved).toBeGreaterThanOrEqual(2);
+    expect(await open()).toEqual([]);
+    const closed = await query<{ resolution: string }>(
+      `SELECT resolution FROM google_sync_errors WHERE sheet_name = 'GRN' AND business_key = 'THARD/ZG/0002 / THARD-ITEM'`,
+    );
+    expect(closed[0]!.resolution).toMatch(/No longer reported by sync run/);
+  });
+});

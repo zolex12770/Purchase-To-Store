@@ -41,6 +41,8 @@ export interface SheetOutcome {
   skipped: number;
   rejected: number;
   conflicts: number;
+  /** Open issues this run no longer reports, closed automatically (see resolveVanishedIssues). */
+  issuesResolved?: number;
   message?: string;
 }
 
@@ -253,6 +255,30 @@ async function onlyNewIssues(tx: Queryable, sheet: string, errors: ErrorRecord[]
   return fresh;
 }
 
+/**
+ * Closes the open issues of a sheet that a complete run of it no longer reports: the
+ * sheet row or the ERP record has changed since. Without this an issue stayed open for
+ * good — on 2026-10-16, 18,800 of 19,483 open issues described indent, PO and GRN rows
+ * that had been imported two days earlier. Only called after the sheet's transaction
+ * has evaluated every row; an issue that comes back is simply recorded again.
+ */
+async function resolveVanishedIssues(tx: Queryable, sheet: string, current: ErrorRecord[], jobId: number): Promise<number> {
+  const still = new Set(current.map((e) => issueKey(e.code, e.row, e.businessKey)));
+  const open = await txQuery<{ id: number; error_code: string; row_number: number | null; business_key: string | null }>(
+    tx,
+    'SELECT id, error_code, row_number, business_key FROM google_sync_errors WHERE sheet_name = $1 AND resolved_at IS NULL',
+    [sheet],
+  );
+  const gone = open.filter((o) => !still.has(issueKey(o.error_code, o.row_number, o.business_key))).map((o) => Number(o.id));
+  if (gone.length > 0) {
+    await tx.query(
+      'UPDATE google_sync_errors SET resolved_at = now(), resolution = $2 WHERE id = ANY($1::bigint[])',
+      [gone, `No longer reported by sync run #${jobId}: the sheet row or the ERP record has changed.`],
+    );
+  }
+  return gone.length;
+}
+
 async function recordErrors(tx: Queryable, jobId: number, errors: ErrorRecord[]): Promise<void> {
   for (const e of errors) {
     await tx.query(
@@ -352,6 +378,8 @@ interface RowContext {
   docRows: Map<string, Array<{ code: string; desc: string }>>;
   /** replacedLines' answer per document, worked out once per run. */
   replaced: Map<string, Array<{ id: number; item_code: string; qty: string }>>;
+  /** GRN tab: total received per GRN number + item code over all of the sheet's rows. */
+  grnSheetQty: Map<string, number>;
 }
 
 /**
@@ -1642,9 +1670,62 @@ async function reconcileTransactionalSheet(
   }
 
   // GRN
+  const grnNo = (ctx.values.grn_no ?? '').trim();
   const poNo = (ctx.values.po_no ?? '').trim();
   const itemCode = (ctx.values.item_code ?? '').trim();
   const qty = parseNumericInput(ctx.values.grn_qty);
+
+  // The store's GRNs were imported from this very tab under their own numbers
+  // (ZG/SS/0001 ...), and almost none carries a PO link: their POs are not in the
+  // ERP, and many rows say '-' for the PO. Matching only through PO lines reported
+  // 6,486 of the tab's 6,953 rows as 'missing in the ERP' on every run (2026-10-16),
+  // receipts the ERP does hold. So a row with a GRN number is compared with the ERP
+  // GRN of that number, the item matched as on the indent and PO tabs; only a row
+  // without a GRN number falls back to PO + item below.
+  if (grnNo && itemCode) {
+    const key = `${grnNo.toUpperCase()}|${itemCode.toUpperCase()}`;
+    if (ctx.seenKeys.has(`grn|${key}`)) { ctx.outcome.skipped += 1; return; }
+    ctx.seenKeys.add(`grn|${key}`);
+    const sheetDesc = (ctx.values.item_description ?? '').trim();
+    const known = await findItem(ctx.tx, itemCode, sheetDesc || itemCode);
+    const held = await txQueryOne<{ lines: number; posted_qty: string; statuses: string | null }>(
+      ctx.tx,
+      `SELECT COUNT(*)::int AS lines,
+              COALESCE(SUM(gl.grn_qty) FILTER (WHERE g.status = 'POSTED'), 0) AS posted_qty,
+              string_agg(DISTINCT g.status, ', ') AS statuses
+         FROM grn_lines gl
+         JOIN grn_headers g ON g.id = gl.grn_id
+        WHERE upper(g.grn_no) = upper($1)
+          AND (gl.item_id = $2 OR upper(gl.item_code) = upper($3) OR lower(gl.item_description) = lower($3)
+               OR ($4 <> '' AND lower(gl.item_description) = lower($4)))`,
+      [grnNo, known?.id ?? null, itemCode, sheetDesc],
+    );
+    const sheetQty = ctx.grnSheetQty.get(key) ?? Number(qty ?? 0);
+    if (!held || Number(held.lines) === 0) {
+      ctx.outcome.conflicts += 1;
+      ctx.errors.push({
+        sheet: ctx.sheet, row: ctx.rowNumber, column: 'GRN No',
+        businessKey: `${grnNo} / ${itemCode}`, severity: 'CONFLICT', code: 'MISSING_IN_ERP',
+        message: `GRN ${grnNo} line ${itemCode} (${sheetQty}) is in the sheet but not in the ERP. Goods receipts are not created by sync — post it through the GRN screen if it is genuine.`,
+        incoming: { grnNo, poNo, itemCode, grnQty: sheetQty },
+      });
+      return;
+    }
+    if (Math.abs(Number(held.posted_qty) - sheetQty) > 0.0001) {
+      ctx.outcome.conflicts += 1;
+      ctx.errors.push({
+        sheet: ctx.sheet, row: ctx.rowNumber, column: 'Recieved Qty',
+        businessKey: `${grnNo} / ${itemCode}`, severity: 'CONFLICT', code: 'QTY_MISMATCH',
+        message: `GRN ${grnNo} line ${itemCode}: the sheet records ${sheetQty} received but the ERP holds ${Number(held.posted_qty)} (GRN status ${held.statuses ?? 'unknown'}). The ERP value has been kept.`,
+        existing: { receivedQty: held.posted_qty, status: held.statuses },
+        incoming: { grnQty: sheetQty },
+      });
+      return;
+    }
+    ctx.outcome.skipped += 1;
+    return;
+  }
+
   if (!poNo || !itemCode) { ctx.outcome.skipped += 1; return; }
 
   // Joined through each LINE's own po_line_id, not the GRN header's po_id —
@@ -1791,19 +1872,31 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
         // the rows its document's old lines still have (replacedLines).
         const docRows: RowContext['docRows'] = new Map();
         const replaced: RowContext['replaced'] = new Map();
+        const grnSheetQty: RowContext['grnSheetQty'] = new Map();
+        const cell = (row: string[], field: string) => {
+          const idx = colIndex.get(field);
+          return idx === undefined ? '' : (row[idx] ?? '').trim();
+        };
         const docField = mapping.target_entity === 'purchase_indents' ? 'indent_no'
           : mapping.target_entity === 'purchase_orders' ? 'po_no' : null;
         if (docField) {
-          const cell = (row: string[], field: string) => {
-            const idx = colIndex.get(field);
-            return idx === undefined ? '' : (row[idx] ?? '').trim();
-          };
           for (const row of dataRows) {
             const doc = cell(row, docField);
             if (!doc) continue;
             const list = docRows.get(doc) ?? [];
             list.push({ code: cell(row, 'item_code'), desc: cell(row, 'item_description') });
             docRows.set(doc, list);
+          }
+        }
+        // A GRN may list one item on several rows; the ERP total is compared with their sum.
+        if (mapping.target_entity === 'grns') {
+          for (const row of dataRows) {
+            const grnNo = cell(row, 'grn_no');
+            const code = cell(row, 'item_code');
+            const qty = parseNumericInput(cell(row, 'grn_qty'));
+            if (!grnNo || !code || qty === null) continue;
+            const key = `${grnNo.toUpperCase()}|${code.toUpperCase()}`;
+            grnSheetQty.set(key, (grnSheetQty.get(key) ?? 0) + Number(qty));
           }
         }
 
@@ -1818,7 +1911,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
 
           const ctx: RowContext = {
             tx, jobId, sheet: mapping.sheet_name, rowNumber: i + 2,
-            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds, tally, docRows, replaced,
+            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds, tally, docRows, replaced, grnSheetQty,
           };
 
           try {
@@ -1865,6 +1958,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
         }
 
         await recordErrors(tx, jobId, await onlyNewIssues(tx, mapping.sheet_name, sheetErrors));
+        outcome.issuesResolved = await resolveVanishedIssues(tx, mapping.sheet_name, sheetErrors, jobId);
         allErrors.push(...sheetErrors);
       });
     } catch (sheetErr) {
