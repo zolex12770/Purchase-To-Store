@@ -19,7 +19,7 @@ import { requirePermission, requireAnyPermission } from '../../auth/middleware.j
 import { actorFrom, auditIn } from '../../core/audit.js';
 import { nextDocumentNumber, dateStamp, timeStamp } from '../../domain/numbering.js';
 import { toQty } from '../../domain/money.js';
-import { issueDirectStoreLine } from '../../domain/stock.js';
+import { issueDirectStoreLine, reverseDirectStoreLine } from '../../domain/stock.js';
 import { loadCompanySettings } from '../../domain/company.js';
 
 const router = Router();
@@ -38,7 +38,7 @@ const listSchema = listQuerySchema.extend({
 
 router.get(
   '/',
-  requirePermission('auto_indent.view'),
+  requirePermission('direct_issue.view'),
   validateQuery(listSchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof listSchema>>(res);
@@ -103,7 +103,7 @@ router.get(
 
 router.get(
   '/:id',
-  requirePermission('auto_indent.view'),
+  requirePermission('direct_issue.view'),
   asyncHandler(async (req, res) => {
     const id = idParam(req);
     const header = await queryOne<Record<string, unknown>>(
@@ -148,7 +148,9 @@ const createDirectIssueSchema = z.object({
 
 router.post(
   '/',
-  requireAnyPermission('auto_indent.approve', 'requisition.issue', 'item.create'),
+  // Issuing deducts stock: the Store's own right, not auto_indent.approve / item.create
+  // (which let Purchase users post issues).
+  requirePermission('direct_issue.create'),
   validateBody(createDirectIssueSchema),
   asyncHandler(async (req, res) => {
     const body = req.body as z.infer<typeof createDirectIssueSchema>;
@@ -284,11 +286,55 @@ router.post(
   }),
 );
 
+/* ── POST /inventory/direct-issues/:id/cancel ─────────────────────────────── */
+/* Returns every line's quantity to stock (DIRECT_ISSUE_REVERSAL ledger entries
+   referencing the issue) and marks the issue CANCELLED with who/when/why. The
+   issue and its original ledger entries stay as they were. */
+
+router.post(
+  '/:id/cancel',
+  requirePermission('direct_issue.create'),
+  validateBody(z.object({
+    reason: z.string().trim().min(5, 'Give the reason for cancelling (at least 5 characters).').max(500),
+  })),
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const { reason } = req.body as { reason: string };
+    const result = await withTransaction(async (tx) => {
+      const h = await txQueryOne<{ id: number; issue_no: string; status: string; total_qty: string }>(
+        tx, 'SELECT id, issue_no, status, total_qty FROM direct_issue_headers WHERE id = $1 FOR UPDATE', [id],
+      );
+      if (!h) throw NotFoundError('Direct issue');
+      if (h.status === 'CANCELLED') throw BusinessRuleError(`Direct issue ${h.issue_no} is already cancelled.`);
+      const lines = await txQuery<{ item_id: number; uom_id: number | null; issue_qty: string; item_code: string }>(
+        tx, 'SELECT item_id, uom_id, issue_qty, item_code FROM direct_issue_lines WHERE direct_issue_id = $1 ORDER BY line_no', [id],
+      );
+      const today = dateStamp(new Date());
+      for (const l of lines) {
+        await reverseDirectStoreLine(tx, { item_id: l.item_id, uom_id: l.uom_id }, l.issue_qty,
+          { directIssueId: h.id, issueNo: h.issue_no, date: today, userId: req.user!.id });
+      }
+      await tx.query(
+        `UPDATE direct_issue_headers SET status = 'CANCELLED', cancelled_at = now(), cancelled_by = $2,
+                cancel_reason = $3, updated_at = now() WHERE id = $1`,
+        [id, req.user!.id, reason],
+      );
+      await auditIn(tx, {
+        actor: actorFrom(req), action: 'CANCEL', entity: 'direct_issue', entityId: id, entityLabel: h.issue_no,
+        before: { status: h.status }, after: { status: 'CANCELLED', reason, returnedLines: lines.map((l) => ({ item: l.item_code, qty: l.issue_qty })) },
+        message: `Direct issue ${h.issue_no} cancelled — ${lines.length} line(s) returned to stock. Reason: ${reason}`,
+      });
+      return { issueNo: h.issue_no, returnedLines: lines.length, totalQty: Number(h.total_qty) };
+    });
+    sendOk(res, { ...result, message: `Direct issue ${result.issueNo} cancelled; ${result.returnedLines} line(s) returned to stock.` });
+  }),
+);
+
 /* ── GET /inventory/direct-issues/:id/print ───────────────────────────────── */
 
 router.get(
   '/:id/print',
-  requirePermission('auto_indent.view'),
+  requireAnyPermission('direct_issue.print', 'direct_issue.view'),
   asyncHandler(async (req, res) => {
     const id = idParam(req);
     const header = await queryOne<Record<string, unknown>>(

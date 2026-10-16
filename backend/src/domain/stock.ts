@@ -331,6 +331,74 @@ export async function issueDirectStoreLine(
 }
 
 /**
+ * Returns one line of a CANCELLED direct issue to stock: adds the quantity back to
+ * `items.live_stock_qty` and records a `DIRECT_ISSUE_REVERSAL` ledger entry that
+ * references the same issue — the original DIRECT_ISSUE entry is never edited.
+ */
+export async function reverseDirectStoreLine(
+  tx: Queryable,
+  line: { item_id: number; uom_id: number | null },
+  issueQty: string,
+  ctx: { directIssueId: number; issueNo: string; date: string; userId: number | null },
+): Promise<{ newBalance: string }> {
+  const item = await txQueryOne<{ id: number; live_stock_qty: string }>(
+    tx, 'SELECT id, live_stock_qty FROM items WHERE id = $1 FOR UPDATE', [line.item_id],
+  );
+  if (!item) throw new Error(`Item ${line.item_id} not found while cancelling a direct issue.`);
+  const newBalance = toQty(dec(item.live_stock_qty).plus(dec(issueQty)));
+  await tx.query('UPDATE items SET live_stock_qty = $2, updated_at = now() WHERE id = $1', [line.item_id, newBalance]);
+  await tx.query(
+    `INSERT INTO stock_ledger
+       (item_id, txn_type, reference_type, reference_id, reference_no,
+        inward_qty, outward_qty, balance_qty, uom_id, txn_date, created_by)
+     VALUES ($1,'DIRECT_ISSUE_REVERSAL','DIRECT_ISSUE',$2,$3,$4,0,$5,$6,$7,$8)`,
+    [line.item_id, ctx.directIssueId, ctx.issueNo, toQty(dec(issueQty)), newBalance, line.uom_id, ctx.date, ctx.userId],
+  );
+  return { newBalance };
+}
+
+/**
+ * Undoes a physical-count adjustment: moves the item's stock back by the
+ * adjustment's own difference and records `STOCK_ADJUSTMENT_REVERSAL`. Refuses
+ * when that would take the stock below zero (it has since been issued).
+ */
+export async function reverseStockAdjustment(
+  tx: Queryable,
+  itemRef: { item_id: number; uom_id: number | null },
+  adjustmentQty: string,
+  ctx: { adjustmentId: number; adjustmentNo: string; date: string; userId: number | null },
+): Promise<{ previousBalance: string; newBalance: string }> {
+  const item = await txQueryOne<{ id: number; item_code: string; live_stock_qty: string }>(
+    tx, 'SELECT id, item_code, live_stock_qty FROM items WHERE id = $1 FOR UPDATE', [itemRef.item_id],
+  );
+  if (!item) throw new Error(`Item ${itemRef.item_id} not found while reversing an adjustment.`);
+  const current = dec(item.live_stock_qty ?? '0');
+  const delta = dec(adjustmentQty);
+  const after = current.minus(delta);
+  if (after.isNegative()) {
+    throw BusinessRuleError(
+      `Reversing ${ctx.adjustmentNo} would take ${item.item_code}'s stock below zero (stock now ${toQty(current)}, adjustment ${toQty(delta)}).`,
+      { itemCode: item.item_code, currentStock: toQty(current), adjustmentQty: toQty(delta) },
+    );
+  }
+  const newBalance = toQty(after);
+  await tx.query('UPDATE items SET live_stock_qty = $2, updated_at = now() WHERE id = $1', [itemRef.item_id, newBalance]);
+  await tx.query(
+    `INSERT INTO stock_ledger
+       (item_id, txn_type, reference_type, reference_id, reference_no,
+        inward_qty, outward_qty, balance_qty, uom_id, txn_date, created_by)
+     VALUES ($1, 'STOCK_ADJUSTMENT_REVERSAL', 'STOCK_ADJUSTMENT', $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [
+      itemRef.item_id, ctx.adjustmentId, ctx.adjustmentNo,
+      delta.isNegative() ? toQty(delta.abs()) : 0,
+      delta.isPositive() ? toQty(delta) : 0,
+      newBalance, itemRef.uom_id, ctx.date, ctx.userId,
+    ],
+  );
+  return { previousBalance: toQty(current), newBalance };
+}
+
+/**
  * Applies a physical count audit adjustment to an item.
  * Calculates delta = actualStockQty - live_stock_qty.
  * Updates items.live_stock_qty to actualStockQty.

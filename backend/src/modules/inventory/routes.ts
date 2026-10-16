@@ -24,8 +24,8 @@ import { actorFrom, auditIn, audit } from '../../core/audit.js';
 import { nextDocumentNumber, dateStamp, timeStamp } from '../../domain/numbering.js';
 import { toQty, toRate } from '../../domain/money.js';
 import { toShortUom } from '../../domain/uom.js';
-import { adjustStockPhysicalCount } from '../../domain/stock.js';
-import { recordInventoryMovement, INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
+import { adjustStockPhysicalCount, reverseStockAdjustment } from '../../domain/stock.js';
+import { recordInventoryMovement, reverseInventoryMovement, INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
 import { syncCategoryFromSheet, syncAllInventoryCategories, activeInventorySync, type CategorySyncResult } from './sync-engine.js';
 import { EXCLUSION_TEXT } from './sheet-model.js';
 import directIssueRoutes from './direct-issue.routes.js';
@@ -814,9 +814,72 @@ const createAdjustmentSchema = z.object({
   adjustmentDate: dateStr.default(() => dateStamp(new Date())),
 });
 
+/* ── POST /inventory/adjustments/:id/reverse ────────────────────────────────── */
+/* Undoes a physical-count adjustment with a STOCK_ADJUSTMENT_REVERSAL entry; the
+   adjustment row stays, marked with who reversed it, when and why. */
+
+const reverseSchema = z.object({
+  reason: z.string().trim().min(5, 'Give the reason (at least 5 characters).').max(500),
+});
+
+router.post(
+  '/adjustments/:id/reverse',
+  requirePermission('inventory.adjust'),
+  validateBody(reverseSchema),
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const { reason } = req.body as z.infer<typeof reverseSchema>;
+    const result = await withTransaction(async (tx) => {
+      const adj = await txQueryOne<{
+        id: number; adjustment_no: string; item_id: number; item_code: string; adjustment_qty: string; reversed_at: string | null;
+      }>(tx, 'SELECT id, adjustment_no, item_id, item_code, adjustment_qty, reversed_at FROM stock_adjustments WHERE id = $1 FOR UPDATE', [id]);
+      if (!adj) throw NotFoundError('Stock adjustment');
+      if (adj.reversed_at) throw BusinessRuleError(`Adjustment ${adj.adjustment_no} is already reversed.`);
+      const item = await txQueryOne<{ uom_id: number | null }>(tx, 'SELECT uom_id FROM items WHERE id = $1', [adj.item_id]);
+      const r = await reverseStockAdjustment(tx, { item_id: adj.item_id, uom_id: item?.uom_id ?? null }, adj.adjustment_qty,
+        { adjustmentId: adj.id, adjustmentNo: adj.adjustment_no, date: dateStamp(new Date()), userId: req.user!.id });
+      await tx.query(
+        'UPDATE stock_adjustments SET reversed_at = now(), reversed_by = $2, reversal_reason = $3 WHERE id = $1',
+        [id, req.user!.id, reason],
+      );
+      await auditIn(tx, {
+        actor: actorFrom(req), action: 'CANCEL', entity: 'stock_adjustment', entityId: id, entityLabel: adj.adjustment_no,
+        before: { stock: r.previousBalance }, after: { stock: r.newBalance, reason },
+        message: `Adjustment ${adj.adjustment_no} (${adj.item_code}, ${adj.adjustment_qty}) reversed: ${r.previousBalance} -> ${r.newBalance}. Reason: ${reason}`,
+      });
+      return { adjustmentNo: adj.adjustment_no, itemCode: adj.item_code, ...r };
+    });
+    sendOk(res, { ...result, message: `Adjustment ${result.adjustmentNo} reversed. ${result.itemCode} stock is now ${result.newBalance}.` });
+  }),
+);
+
+/* ── POST /inventory/transactions/:id/reverse — undo a movement entered in the ERP ─ */
+
+router.post(
+  '/transactions/:id/reverse',
+  requirePermission('inventory.adjust'),
+  validateBody(reverseSchema),
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const { reason } = req.body as z.infer<typeof reverseSchema>;
+    const result = await withTransaction(async (tx) => {
+      const r = await reverseInventoryMovement(tx, id, { reason, userId: req.user!.id });
+      await auditIn(tx, {
+        actor: actorFrom(req), action: 'CANCEL', entity: 'inventory_movement', entityId: id, entityLabel: r.txnNo,
+        after: { reversedQty: r.reversedQty, itemStockAfter: r.itemStockAfter, reason },
+        message: `Inventory movement ${r.txnNo} (${r.itemCode}) reversed; stock change undone: ${-r.reversedQty}. Reason: ${reason}`,
+      });
+      return r;
+    });
+    sendOk(res, { ...result, message: `${result.txnNo} reversed.` });
+  }),
+);
+
 router.post(
   '/adjustments',
-  requireAnyPermission('inventory.adjust', 'auto_indent.approve'),
+  // Posting an adjustment changes stock directly: inventory.adjust only (it was
+  // also open to auto_indent.approve, i.e. Purchase Heads).
+  requirePermission('inventory.adjust'),
   validateBody(createAdjustmentSchema),
   asyncHandler(async (req, res) => {
     const body = req.body as z.infer<typeof createAdjustmentSchema>;

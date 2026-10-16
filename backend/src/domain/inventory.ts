@@ -121,6 +121,82 @@ export function classifyItemCategory(itemCode: string, mainGroup = '', descripti
   return 'GENERAL';
 }
 
+/**
+ * Reverses a movement that was entered in the ERP (never a Google Sheet row — those
+ * follow the sheet). The original row is kept and marked REVERSED with who/when/why;
+ * the Purchase item's stock and the category figure move back by the same amount,
+ * and the change is ledgered as INVENTORY_REVERSAL referencing the movement number.
+ */
+export async function reverseInventoryMovement(
+  tx: Queryable,
+  txnId: number,
+  ctx: { reason: string; userId: number | null },
+): Promise<{ txnNo: string; itemCode: string; reversedQty: number; itemStockAfter: number | null }> {
+  const t = await txQueryOne<{
+    id: number; txn_no: string; category: string; item_id: number | null; item_code: string;
+    direction: 'IN' | 'OUT' | 'ADJUST'; quantity: string; status: string; origin: string; txn_date: string;
+  }>(
+    tx,
+    `SELECT id, txn_no, category, item_id, item_code, direction, quantity, status, origin, txn_date::text AS txn_date
+       FROM inventory_transactions WHERE id = $1 FOR UPDATE`,
+    [txnId],
+  );
+  if (!t) throw ValidationError('Movement not found.');
+  if (t.origin !== 'ERP') {
+    throw ConflictError(`${t.txn_no} comes from the Google Sheet; correct the sheet row instead — the next sync follows it.`);
+  }
+  if (t.status !== 'POSTED') throw ConflictError(`${t.txn_no} is already ${t.status.toLowerCase()}.`);
+
+  // The stock change the movement made: from its own ledger entry when there is one
+  // (movements posted since 2026-10-16 reference their number); else its direction.
+  const ledger = await txQueryOne<{ net: string | null }>(
+    tx,
+    `SELECT SUM(inward_qty - outward_qty)::text AS net FROM stock_ledger
+      WHERE reference_type = 'INVENTORY' AND reference_no = $1 AND txn_type <> 'INVENTORY_REVERSAL'`,
+    [t.txn_no],
+  );
+  let applied: number;
+  if (ledger?.net !== null && ledger?.net !== undefined) applied = Number(ledger.net);
+  else if (t.direction === 'IN') applied = Number(t.quantity);
+  else if (t.direction === 'OUT') applied = -Number(t.quantity);
+  else throw ConflictError(`${t.txn_no} set the stock to a counted figure and has no ledger entry to undo; adjust the stock with a physical count instead.`);
+
+  let itemStockAfter: number | null = null;
+  if (t.item_id !== null && applied !== 0) {
+    const item = await txQueryOne<{ live_stock_qty: string; uom_id: number | null }>(
+      tx, 'SELECT live_stock_qty, uom_id FROM items WHERE id = $1 FOR UPDATE', [t.item_id],
+    );
+    if (item) {
+      const after = Math.round((Number(item.live_stock_qty) - applied) * 10000) / 10000;
+      if (after < 0) {
+        throw ConflictError(
+          `Reversing ${t.txn_no} would take ${t.item_code}'s stock below zero (stock now ${Number(item.live_stock_qty)}). Reverse the later issue first.`,
+        );
+      }
+      await tx.query('UPDATE items SET live_stock_qty = $2, updated_at = now() WHERE id = $1', [t.item_id, after]);
+      await tx.query(
+        `INSERT INTO stock_ledger (item_id, txn_type, reference_type, reference_no, inward_qty, outward_qty,
+                                   balance_qty, uom_id, location, txn_date, created_by)
+         VALUES ($1, 'INVENTORY_REVERSAL', 'INVENTORY', $2, $3, $4, $5, $6, $7, CURRENT_DATE, $8)`,
+        [t.item_id, t.txn_no, Math.max(-applied, 0), Math.max(applied, 0), after, item.uom_id, `${t.category} (reversal)`, ctx.userId],
+      );
+      itemStockAfter = after;
+    }
+  }
+  await tx.query(
+    `UPDATE inventory_items SET live_stock_qty = live_stock_qty - $3,
+            available_qty = GREATEST(live_stock_qty - $3 - allocated_qty, 0), updated_at = now()
+      WHERE category = $1 AND upper(item_code) = upper($2)`,
+    [t.category, t.item_code, applied],
+  );
+  await tx.query(
+    `UPDATE inventory_transactions SET status = 'REVERSED', reversed_at = now(), reversed_by = $2, reversal_reason = $3
+      WHERE id = $1`,
+    [t.id, ctx.userId, ctx.reason],
+  );
+  return { txnNo: t.txn_no, itemCode: t.item_code, reversedQty: applied, itemStockAfter };
+}
+
 /** Stock-ledger entry type for a movement recorded from the inventory screens. */
 const LEDGER_TYPE: Record<InventoryMovementInput['direction'], string> = {
   IN: 'INVENTORY_IN',

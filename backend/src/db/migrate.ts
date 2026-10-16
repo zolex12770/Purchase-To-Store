@@ -129,6 +129,14 @@ const POST_MIGRATION: Record<string, string[]> = {
   // 213,502 duplicate log rows are deleted by 020; rewriting the table shrinks
   // it from about 86 MB to about 7 MB (measured on a copy of the live data).
   '020_simplify_redundant_indexes_and_sync_log': ['VACUUM (FULL, ANALYZE) google_sync_errors'],
+  // PGlite runs no autovacuum. On a copy of production (2026-10-16) these tables
+  // held 418 MB, mostly dead rows left by the old inventory sync rewriting every
+  // row each run; VACUUM FULL brought them to 89 MB in 3.5 s.
+  '026_reversals_and_maintenance': [
+    'google_db_outbox', 'items', 'inventory_transactions', 'google_db_rows', 'google_sync_errors',
+    'inventory_items', 'stock_ledger', 'grn_lines', 'grn_line_mlns', 'suppliers', 'requisition_lines',
+    'grn_headers', 'purchase_indent_lines', 'inventory_quarantine', 'inventory_sync_checkpoints',
+  ].map((t) => `VACUUM (FULL, ANALYZE) ${t}`),
 };
 
 /**
