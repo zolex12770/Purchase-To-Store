@@ -1335,6 +1335,22 @@ h1, h2, h3, h4, h5, h6 {
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-1);
 }
+/* Filter pills: outline at rest; an applied pill shows its value in iris
+   with its own clear button. */
+.filter-pill {
+  display: inline-flex; align-items: stretch; flex-shrink: 0;
+  height: var(--control-h-sm); max-width: 100%;
+  border: 1px solid var(--border-control); border-radius: var(--radius-xs);
+  background: var(--surface-1); color: var(--text-1);
+  overflow: hidden;
+}
+.filter-pill-main { display: inline-flex; align-items: center; gap: 6px; padding: 0 var(--space-2-5); font-size: var(--fs-13); font-weight: var(--fw-medium); color: inherit; min-width: 0; }
+.filter-pill-main:hover { background: var(--hover-wash); }
+.filter-pill.is-applied { background: var(--accent-subtle); border-color: var(--accent-border); color: var(--accent-text); }
+.filter-pill-clear { display: grid; place-items: center; width: 26px; color: inherit; border-left: 1px solid var(--accent-border); }
+.filter-pill-clear:hover { background: var(--hover-wash); }
+.filter-pill-main:focus-visible, .filter-pill-clear:focus-visible { outline-offset: -2px; }
+
 /* The table toolbar: one row inside the table card. */
 .table-toolbar {
   display: flex;
