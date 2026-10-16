@@ -67,6 +67,16 @@ interface BackupRow {
   fileExists: boolean;
 }
 
+interface BackupSchedule {
+  enabled: boolean;
+  intervalHours: number;
+  lastScheduledAt: string | null;
+  nextDueAt: string | null;
+  due: boolean;
+  running: boolean;
+  retention: { policy: { retentionDays: number; retentionCount: number }; scheduledBackups: number; pruned: string[] };
+}
+
 const formatBytes = (b: string | number): string => {
   const n = Number(b);
   if (n < 1024) return `${n} B`;
@@ -111,6 +121,12 @@ export default function Backup() {
   const list = useQuery({
     queryKey: ['backups'],
     queryFn: () => api.getWithMeta<BackupRow[], { location: string }>('/backup'),
+  });
+
+  const schedule = useQuery({
+    queryKey: ['backup-schedule'],
+    queryFn: () => api.get<BackupSchedule>('/backup/schedule'),
+    enabled: can('backup.view'),
   });
 
   const create = useMutation({
@@ -276,6 +292,32 @@ export default function Backup() {
           </div>
         </CardBody>
       </Card>
+
+      {schedule.data && (
+        <Card style={{ marginBottom: 'var(--sp-4)' }}>
+          <CardBody style={{ padding: 'var(--sp-4)' }}>
+            <div className="row" style={{ gap: 10, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              <ShieldCheck size={16} style={{ color: schedule.data.enabled ? 'var(--success-600)' : 'var(--warning-600)', flexShrink: 0, marginTop: 2 }} />
+              <div className="grow" style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>
+                <div style={{ marginBottom: 4 }}>
+                  <strong>Automatic backups {schedule.data.enabled ? 'are on' : 'are OFF'}</strong>
+                  {schedule.data.enabled && <> — every {schedule.data.intervalHours} hours, checked every 10 minutes (a missed one is taken soon after the server starts).</>}
+                </div>
+                <div>
+                  Last automatic backup: <strong>{schedule.data.lastScheduledAt ? `${formatDateTime(schedule.data.lastScheduledAt)} (${relativeTime(schedule.data.lastScheduledAt)})` : 'none yet'}</strong>
+                  {schedule.data.enabled && <> · next due: <strong>{schedule.data.due ? 'now' : formatDateTime(schedule.data.nextDueAt)}</strong></>}
+                </div>
+                <div style={{ marginTop: 4 }}>
+                  Retention: automatic backups are removed only when older than {schedule.data.retention.policy.retentionDays} days
+                  {' '}and not among the newest {schedule.data.retention.policy.retentionCount}. Manual backups are never removed.
+                  {' '}({count(schedule.data.retention.scheduledBackups)} automatic backup(s) kept; {count(schedule.data.retention.pruned.length)} due for removal.)
+                </div>
+              </div>
+              {schedule.data.running && <Badge tone="info">Backing up…</Badge>}
+            </div>
+          </CardBody>
+        </Card>
+      )}
 
       {can('backup.create') && (
         <Card style={{ marginBottom: 'var(--sp-4)' }}>
