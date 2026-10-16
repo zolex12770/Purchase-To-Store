@@ -52,9 +52,11 @@ async function bootstrap(): Promise<void> {
     logger.info(`API ready    : http://localhost:${env.PORT}/api/v1`);
     logger.info(`Health       : http://localhost:${env.PORT}/api/v1/health`);
     logger.info(`Frontend     : ${env.FRONTEND_URL}`);
-    if (!env.isProd) {
-      logger.warn('Bootstrap credentials 10221 / 10422 with password Admin@12345 require rotation at first sign-in.');
-    }
+    // No password or bootstrap secret is ever logged: logs are copied and read far
+    // more widely than the data root. This line used to print the bootstrap
+    // password on every non-production start. A newly created bootstrap account's
+    // first password is BOOTSTRAP_ADMIN_PASSWORD, or the generated one in
+    // <data root>/bootstrap-admin-password.txt (seed.ts bootstrapPassword).
   });
 
   server.on('error', (err: NodeJS.ErrnoException) => {

@@ -10,6 +10,7 @@ export type ErrorCode =
   | 'VALIDATION_ERROR'
   | 'AUTHENTICATION_ERROR'
   | 'AUTHORIZATION_ERROR'
+  | 'PASSWORD_CHANGE_REQUIRED'
   | 'NOT_FOUND'
   | 'CONFLICT'
   | 'BUSINESS_RULE_VIOLATION'
@@ -56,6 +57,14 @@ export const AuthenticationError = (message = 'Authentication required.') =>
 
 export const AuthorizationError = (message = 'You do not have permission to perform this action.') =>
   new AppError('AUTHORIZATION_ERROR', 403, message);
+
+/**
+ * The account must replace its password before anything but the auth routes will
+ * answer. A code of its own, so the client can show the change-password screen
+ * instead of treating it as a missing permission.
+ */
+export const PasswordChangeRequiredError = (message = 'You must change your password before you can continue.') =>
+  new AppError('PASSWORD_CHANGE_REQUIRED', 403, message);
 
 export const NotFoundError = (what = 'Record') =>
   new AppError('NOT_FOUND', 404, `${what} was not found.`);
