@@ -231,8 +231,12 @@ export const IconButton = forwardRef<HTMLButtonElement, Omit<ButtonProps, 'child
  * native `title=` tooltips, which keyboard users never see.
  */
 export function Tooltip({
-  content, children, placement = 'top', delay = 400,
-}: { content: ReactNode; children: ReactElement; placement?: 'top' | 'bottom'; delay?: number }) {
+  content, children, placement = 'top', delay = 400, block,
+}: {
+  content: ReactNode; children: ReactElement; placement?: 'top' | 'bottom'; delay?: number;
+  /** Anchor fills its container (a tooltip over a whole card in a grid cell). */
+  block?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
   const anchorRef = useRef<HTMLSpanElement>(null);
@@ -273,7 +277,7 @@ export function Tooltip({
   return (
     <span
       ref={anchorRef}
-      className="tooltip-anchor"
+      className={`tooltip-anchor ${block ? 'tooltip-block' : ''}`}
       onMouseEnter={() => show(false)}
       onMouseLeave={hide}
       onFocus={(e) => { if ((e.target as HTMLElement).matches(':focus-visible')) show(true); }}
