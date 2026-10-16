@@ -348,6 +348,57 @@ interface RowContext {
   typeIds: Map<string, Set<number>>;
   /** Per document line key (document no + item): see matchSheetLine. */
   tally: Map<string, { newThisRun: boolean; seen: Map<string, number> }>;
+  /** Every row of THIS sheet per document number (code + description): see replacedLines. */
+  docRows: Map<string, Array<{ code: string; desc: string }>>;
+  /** replacedLines' answer per document, worked out once per run. */
+  replaced: Map<string, Array<{ id: number; item_code: string; qty: string }>>;
+}
+
+/**
+ * The lines a document held before this run that no row of the sheet describes any
+ * more — matched as the row lookup matches them: by the resolved item, the code, or
+ * the description. When a document gains a row for an item it does not hold while one
+ * of its old lines has lost its row, that row almost certainly REPLACES the line (its
+ * item code was edited in the sheet: ZI/RM/0156 ASB-3020 -> ASB3020 on 2026-10-16).
+ * Adding it would keep both, so the caller records a conflict instead.
+ */
+async function replacedLines(
+  ctx: RowContext,
+  kind: 'indent' | 'po',
+  docNo: string,
+): Promise<Array<{ id: number; item_code: string; qty: string }>> {
+  const cacheKey = `${kind}|${docNo}`;
+  const cached = ctx.replaced.get(cacheKey);
+  if (cached) return cached;
+  // Lines made earlier in this same transaction carry created_at = now(); only the
+  // lines held before the run count.
+  const stored = await txQuery<{ id: number; item_id: number | null; item_code: string; item_description: string; qty: string }>(
+    ctx.tx,
+    kind === 'indent'
+      ? `SELECT l.id, l.item_id, l.item_code, l.item_description, l.indent_qty AS qty
+           FROM purchase_indent_lines l JOIN purchase_indent_headers h ON h.id = l.indent_id
+          WHERE h.indent_no = $1 AND l.created_at < now()`
+      : `SELECT l.id, l.item_id, l.item_code, l.item_description, l.po_qty AS qty
+           FROM purchase_order_lines l JOIN purchase_order_headers h ON h.id = l.po_id
+          WHERE h.po_no = $1 AND l.created_at < now()`,
+    [docNo],
+  );
+  let lost: Array<{ id: number; item_code: string; qty: string }> = [];
+  if (stored.length > 0) {
+    const rows = ctx.docRows.get(docNo) ?? [];
+    const codes = new Set(rows.map((r) => r.code.toUpperCase()));
+    const texts = new Set(rows.flatMap((r) => [r.desc.toLowerCase(), r.code.toLowerCase()]).filter(Boolean));
+    const ids = new Set<number>();
+    for (const r of rows) {
+      const it = await findItem(ctx.tx, r.code, r.desc || r.code);
+      if (it) ids.add(Number(it.id));
+    }
+    lost = stored
+      .filter((l) => !(ids.has(Number(l.item_id)) || codes.has(l.item_code.toUpperCase()) || texts.has(l.item_description.toLowerCase())))
+      .map((l) => ({ id: Number(l.id), item_code: l.item_code, qty: l.qty }));
+  }
+  ctx.replaced.set(cacheKey, lost);
+  return lost;
 }
 
 /**
@@ -1160,6 +1211,25 @@ async function syncPurchaseIndentRow(ctx: RowContext): Promise<void> {
     return;
   }
 
+  // 1b. An item this indent does not hold yet. If one of its old lines has lost its
+  //     sheet row, this row most likely replaces it: hold it for review, add nothing.
+  if (existingLines.length === 0) {
+    const lost = await replacedLines(ctx, 'indent', indentNo);
+    if (lost.length > 0) {
+      ctx.outcome.conflicts += 1;
+      ctx.errors.push({
+        sheet: ctx.sheet, row: ctx.rowNumber, column: 'Item Code',
+        businessKey: `${indentNo} / ${itemCode}`, severity: 'CONFLICT', code: 'ITEM_CHANGED',
+        message: `Indent ${indentNo}: the sheet lists ${itemCode} (${qty}), which this indent does not hold, while its line(s) `
+          + `${lost.map((l) => `${l.item_code} (${Number(l.qty)})`).join(', ')} are no longer in the sheet. The item was probably `
+          + 'changed in the sheet, so nothing was added. Correct the indent in the ERP, or the sheet row.',
+        existing: { lines: lost },
+        incoming: { itemCode, indentQty: qty },
+      });
+      return;
+    }
+  }
+
   // 2. Resolve lookups
   const rawDate = ctx.values.date || ctx.values.source_date || '';
   const indentDate = parseSheetDate(rawDate);
@@ -1280,6 +1350,25 @@ async function syncPurchaseOrderRow(ctx: RowContext): Promise<void> {
       ctx.outcome.skipped += 1;
     }
     return;
+  }
+
+  // 1b. As for indents: an item this PO does not hold, while one of its old lines has
+  //     lost its sheet row, is held for review rather than added beside it.
+  if (existingLines.length === 0) {
+    const lost = await replacedLines(ctx, 'po', poNo);
+    if (lost.length > 0) {
+      ctx.outcome.conflicts += 1;
+      ctx.errors.push({
+        sheet: ctx.sheet, row: ctx.rowNumber, column: 'Item Code',
+        businessKey: `${poNo} / ${itemCode}`, severity: 'CONFLICT', code: 'ITEM_CHANGED',
+        message: `PO ${poNo}: the sheet lists ${itemCode} (${qty} @ ${rate}), which this PO does not hold, while its line(s) `
+          + `${lost.map((l) => `${l.item_code} (${Number(l.qty)})`).join(', ')} are no longer in the sheet. The item was probably `
+          + 'changed in the sheet, so nothing was added. Correct the PO in the ERP, or the sheet row.',
+        existing: { lines: lost },
+        incoming: { itemCode, poQty: qty, rate },
+      });
+      return;
+    }
   }
 
   // 2. Resolve lookups & dates
@@ -1698,6 +1787,25 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
         const seenKeys = new Set<string>();
         const typeIds = new Map<string, Set<number>>();
         const tally: RowContext['tally'] = new Map();
+        // Every document's rows up front, so a row for a new item can be checked against
+        // the rows its document's old lines still have (replacedLines).
+        const docRows: RowContext['docRows'] = new Map();
+        const replaced: RowContext['replaced'] = new Map();
+        const docField = mapping.target_entity === 'purchase_indents' ? 'indent_no'
+          : mapping.target_entity === 'purchase_orders' ? 'po_no' : null;
+        if (docField) {
+          const cell = (row: string[], field: string) => {
+            const idx = colIndex.get(field);
+            return idx === undefined ? '' : (row[idx] ?? '').trim();
+          };
+          for (const row of dataRows) {
+            const doc = cell(row, docField);
+            if (!doc) continue;
+            const list = docRows.get(doc) ?? [];
+            list.push({ code: cell(row, 'item_code'), desc: cell(row, 'item_description') });
+            docRows.set(doc, list);
+          }
+        }
 
         for (const [i, row] of dataRows.entries()) {
           const values: Record<string, string> = {};
@@ -1710,7 +1818,7 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
 
           const ctx: RowContext = {
             tx, jobId, sheet: mapping.sheet_name, rowNumber: i + 2,
-            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds, tally,
+            values, lookups, errors: sheetErrors, outcome, seenKeys, typeIds, tally, docRows, replaced,
           };
 
           try {

@@ -9,11 +9,12 @@
  * - Safe Hard-Delete (Permanent Purge) strictly guarded by dependency checks.
  * - System Super Admins (10221, 10422) can NEVER be deleted or deactivated.
  */
+import { createHash } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
-import { BusinessRuleError, NotFoundError, ValidationError } from '../../core/errors.js';
+import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { requireAnyPermission, invalidateAuthState } from '../../auth/middleware.js';
 import { auditIn, actorFrom } from '../../core/audit.js';
 
@@ -1063,42 +1064,86 @@ router.post(
        that run started, and
      · no purchase order draws on it.
    Lines a sheet legitimately lists twice were imported in the same run, so they
-   are never listed. dryRun (the default) only lists; removing requires a Super
-   Admin, the typed confirmation, and writes every removed row in full to the
-   audit log so it can be put back. */
+   are never listed. The earlier line must match in every business column, not
+   only item and quantity. A copy that someone has since acted on is HELD, listed
+   but never removed: it is on a purchase order, it is short-closed, or its indent
+   has left draft / approval. dryRun (the default) only lists, and returns a
+   selection hash. Removing requires a Super Admin, the typed confirmation and that
+   hash: if the set has changed since the dry run, nothing is removed. Every removed
+   row is written in full to the audit log so it can be put back. */
 
 const DUPLICATE_SYNC_LINES_SQL = `
-  SELECT l.id, l.indent_id, h.indent_no, h.status, l.line_no, l.item_id, l.item_code, l.indent_qty,
-         l.created_at, j.id AS job_id
+  SELECT l.id, l.indent_id, h.indent_no, h.status, l.line_no, l.item_id, l.item_code, l.indent_qty, l.created_at,
+         CASE WHEN EXISTS (SELECT 1 FROM po_indent_sources s WHERE s.indent_line_id = l.id) THEN 'ON_PURCHASE_ORDER'
+              WHEN l.is_closed THEN 'SHORT_CLOSED'
+              WHEN h.status NOT IN ('DRAFT', 'PENDING_APPROVAL') THEN 'INDENT_' || h.status
+         END AS hold_reason
     FROM purchase_indent_lines l
     JOIN purchase_indent_headers h ON h.id = l.indent_id
-    JOIN google_sync_jobs j ON l.created_at BETWEEN j.started_at AND COALESCE(j.finished_at, j.started_at + interval '15 minutes')
    WHERE EXISTS (
-           SELECT 1 FROM purchase_indent_lines e
-            WHERE e.indent_id = l.indent_id AND e.item_id IS NOT DISTINCT FROM l.item_id
-              AND e.indent_qty = l.indent_qty AND e.id < l.id AND e.created_at < j.started_at)
-     AND NOT EXISTS (SELECT 1 FROM po_indent_sources s WHERE s.indent_line_id = l.id)
+           SELECT 1 FROM google_sync_jobs j
+            WHERE l.created_at BETWEEN j.started_at AND COALESCE(j.finished_at, j.started_at + interval '15 minutes')
+              AND EXISTS (
+                    SELECT 1 FROM purchase_indent_lines e
+                     WHERE e.indent_id = l.indent_id AND e.id < l.id AND e.created_at < j.started_at
+                       AND e.item_id IS NOT DISTINCT FROM l.item_id AND e.indent_qty = l.indent_qty
+                       AND e.item_code IS NOT DISTINCT FROM l.item_code
+                       AND e.item_description IS NOT DISTINCT FROM l.item_description
+                       AND e.uom_id IS NOT DISTINCT FROM l.uom_id
+                       AND e.item_specification IS NOT DISTINCT FROM l.item_specification
+                       AND e.department_id IS NOT DISTINCT FROM l.department_id
+                       AND e.cost_centre_id IS NOT DISTINCT FROM l.cost_centre_id
+                       AND e.estimated_rate IS NOT DISTINCT FROM l.estimated_rate
+                       AND e.required_by_date IS NOT DISTINCT FROM l.required_by_date
+                       AND e.remarks IS NOT DISTINCT FROM l.remarks))
    ORDER BY h.indent_no, l.item_code, l.id`;
+
+type DuplicateLineRow = {
+  id: number; indent_no: string; item_code: string; indent_qty: string; hold_reason: string | null;
+};
+
+/** One fingerprint for a set of line ids, so an apply removes exactly the set a dry run listed. */
+const selectionHash = (ids: number[]) =>
+  createHash('sha256').update([...ids].map(Number).sort((a, b) => a - b).join(',')).digest('hex');
+
+function summariseDuplicates(found: DuplicateLineRow[]) {
+  const removable = found.filter((r) => !r.hold_reason);
+  const held = found.filter((r) => r.hold_reason);
+  const byLine = new Map<string, number>();
+  for (const r of removable) {
+    const k = `${r.indent_no} | ${r.item_code} | ${Number(r.indent_qty)}`;
+    byLine.set(k, (byLine.get(k) ?? 0) + 1);
+  }
+  const ids = removable.map((r) => Number(r.id));
+  return {
+    duplicateLines: removable.length,
+    distinctLines: byLine.size,
+    indents: new Set(removable.map((r) => r.indent_no)).size,
+    duplicatedQty: Number(removable.reduce((a, r) => a + Number(r.indent_qty), 0).toFixed(4)),
+    selectionHash: selectionHash(ids),
+    ids,
+    examples: [...byLine.entries()].slice(0, 25).map(([line, copies]) => ({ line, extraCopies: copies })),
+    held: held.map((r) => ({ id: Number(r.id), indentNo: r.indent_no, itemCode: r.item_code, qty: Number(r.indent_qty), reason: r.hold_reason })),
+  };
+}
 
 router.post(
   '/repair/duplicate-indent-lines',
-  validateBody(z.object({ dryRun: z.boolean().default(true), confirm: z.string().optional() })),
+  validateBody(z.object({
+    dryRun: z.boolean().default(true),
+    confirm: z.string().optional(),
+    expectedHash: z.string().trim().regex(/^[0-9a-f]{64}$/, 'expectedHash is the selectionHash a dry run returned.').optional(),
+  })),
   asyncHandler(async (req, res) => {
-    const { dryRun, confirm } = req.body as { dryRun: boolean; confirm?: string };
-    const found = await query<Record<string, unknown> & { id: number; indent_no: string; item_code: string; indent_qty: string }>(DUPLICATE_SYNC_LINES_SQL);
-    const byLine = new Map<string, number>();
-    for (const r of found) {
-      const k = `${r.indent_no} | ${r.item_code} | ${Number(r.indent_qty)}`;
-      byLine.set(k, (byLine.get(k) ?? 0) + 1);
-    }
-    const summary = {
-      duplicateLines: found.length,
-      distinctLines: byLine.size,
-      duplicatedQty: found.reduce((a, r) => a + Number(r.indent_qty), 0),
-      examples: [...byLine.entries()].slice(0, 25).map(([line, copies]) => ({ line, extraCopies: copies })),
-    };
+    const { dryRun, confirm, expectedHash } = req.body as { dryRun: boolean; confirm?: string; expectedHash?: string };
     if (dryRun) {
-      sendOk(res, { dryRun: true, ...summary, message: `${found.length} duplicate line(s) would be removed. Nothing was changed.` });
+      const summary = summariseDuplicates(await query<DuplicateLineRow>(DUPLICATE_SYNC_LINES_SQL));
+      sendOk(res, {
+        dryRun: true,
+        ...summary,
+        message: `${summary.duplicateLines} duplicate line(s) on ${summary.indents} indent(s) would be removed`
+          + `${summary.held.length ? `; ${summary.held.length} more are held for review` : ''}. Nothing was changed.`,
+      });
       return;
     }
     if (!req.user!.roles.includes('SUPER_ADMIN')) {
@@ -1107,14 +1152,24 @@ router.post(
     if (confirm !== 'REMOVE DUPLICATES') {
       throw ValidationError('Type "REMOVE DUPLICATES" to confirm. Take a backup first.');
     }
-    const removed = await withTransaction(async (tx) => {
-      // Re-select inside the transaction so the rows removed are exactly the rows recorded.
-      const rows = await txQuery<Record<string, unknown> & { id: number }>(
-        tx,
-        `SELECT l.* FROM purchase_indent_lines l WHERE l.id IN (SELECT d.id FROM (${DUPLICATE_SYNC_LINES_SQL}) d)`,
-      );
+    if (!expectedHash) {
+      throw ValidationError('Run the dry run first and pass its selectionHash as expectedHash.');
+    }
+    const result = await withTransaction(async (tx) => {
+      // Re-select inside the transaction: the rows removed are exactly the rows recorded,
+      // and exactly the rows the dry run listed.
+      const summary = summariseDuplicates(await txQuery<DuplicateLineRow>(tx, DUPLICATE_SYNC_LINES_SQL));
+      if (summary.selectionHash !== expectedHash) {
+        throw ConflictError(
+          `The duplicate lines have changed since the dry run (now ${summary.duplicateLines}). Nothing was removed; run the dry run again and review it.`,
+          { duplicateLines: summary.duplicateLines, selectionHash: summary.selectionHash },
+        );
+      }
+      const rows = summary.ids.length
+        ? await txQuery<Record<string, unknown>>(tx, 'SELECT * FROM purchase_indent_lines WHERE id = ANY($1::bigint[]) ORDER BY id', [summary.ids])
+        : [];
       if (rows.length > 0) {
-        await tx.query('DELETE FROM purchase_indent_lines WHERE id = ANY($1::bigint[])', [rows.map((r) => r.id)]);
+        await tx.query('DELETE FROM purchase_indent_lines WHERE id = ANY($1::bigint[])', [summary.ids]);
       }
       await auditIn(tx, {
         actor: actorFrom(req),
@@ -1122,12 +1177,13 @@ router.post(
         entity: 'purchase_indent_lines',
         entityLabel: 'duplicate lines appended by the Google sync',
         before: rows,
-        after: { removed: rows.length, distinctLines: summary.distinctLines },
-        message: `Removed ${rows.length} indent line(s) the Google sync had appended more than once (${summary.distinctLines} distinct line(s) kept once each). Every removed row is stored in this audit entry.`,
+        after: { removed: rows.length, distinctLines: summary.distinctLines, duplicatedQty: summary.duplicatedQty, selectionHash: summary.selectionHash, held: summary.held.length },
+        message: `Removed ${rows.length} indent line(s) the Google sync had appended more than once (${summary.distinctLines} distinct line(s) on ${summary.indents} indent(s) kept once each, ${summary.duplicatedQty} units). Every removed row is stored in this audit entry.`,
       });
-      return rows.length;
+      return { removed: rows.length, summary };
     });
-    sendOk(res, { dryRun: false, removed, ...summary, message: `${removed} duplicate line(s) removed; the full rows are kept in the audit log.` });
+    const { ids: _ids, ...summary } = result.summary;
+    sendOk(res, { dryRun: false, removed: result.removed, ...summary, message: `${result.removed} duplicate line(s) removed; the full rows are kept in the audit log.` });
   }),
 );
 

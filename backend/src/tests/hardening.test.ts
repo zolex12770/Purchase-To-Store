@@ -833,6 +833,25 @@ describe('Google sync — a sheet row already imported is never inserted again',
     expect((await sync('SCHEDULED')).totals.inserted).toBe(0);
     expect((await lines('THARD/IND/0002')).length).toBe(2);
   });
+
+  // Production, 2026-10-16: ZI/RM/0156 ASB-3020 was re-coded ASB3020 in the sheet, and
+  // the run added the new code as a second line while keeping the old one.
+  it('a new item on an indent is added; an item code edited in the sheet is held, not added beside the old line', async () => {
+    grid.push(['THARD/IND/0001', '3-Apr-2026', 'Non Consumable', 'THARD-NEWITEM', 'Hardening New Item', '5', 'KG']);
+    expect((await sync('SCHEDULED')).totals.inserted).toBe(1);
+    expect((await lines('THARD/IND/0001')).map((l) => l.item_code)).toEqual(['THARD-FCETP62.5', 'THARD-NEWITEM']);
+
+    grid[grid.length - 1] = ['THARD/IND/0001', '3-Apr-2026', 'Non Consumable', 'THARD-NEWITEM-B', 'Hardening New Item B', '5', 'KG'];
+    const edited = await sync('SCHEDULED');
+    expect(edited.totals.inserted).toBe(0);
+    expect((await lines('THARD/IND/0001')).map((l) => l.item_code)).toEqual(['THARD-FCETP62.5', 'THARD-NEWITEM']);
+    const issue = (await (await import('../db/index.js')).query<{ error_code: string; error_message: string }>(
+      `SELECT error_code, error_message FROM google_sync_errors WHERE business_key = 'THARD/IND/0001 / THARD-NEWITEM-B' ORDER BY id DESC LIMIT 1`,
+    ))[0]!;
+    expect(issue.error_code).toBe('ITEM_CHANGED');
+    expect(issue.error_message).toContain('THARD-NEWITEM (5)');
+    grid.pop();
+  });
 });
 
 describe('repair — indent lines the Google sync appended more than once', () => {
@@ -860,21 +879,43 @@ describe('repair — indent lines the Google sync appended more than once', () =
     await line(4, 10, '2026-10-15T05:15:30Z');   // and again
     await line(5, 25, '2026-10-15T05:15:31Z');   // a different quantity — not a repeat
 
+    await line(6, 10, '2026-10-15T05:15:32Z');   // a repeat whose remarks differ — not identical
+    await query(`UPDATE purchase_indent_lines SET remarks = 'urgent' WHERE indent_id = $1 AND line_no = 6`, [head.id]);
+    // A repeat on an indent that has since been approved is held, never removed.
+    const approved = await one<{ id: number }>(
+      `INSERT INTO purchase_indent_headers (indent_no, indent_date, status) VALUES ('THARD/DUP/0002', '2026-10-14', 'APPROVED') RETURNING id`,
+    );
+    await query(
+      `INSERT INTO purchase_indent_lines (indent_id, line_no, item_id, item_code, item_description, indent_qty, uom_id, created_at)
+       VALUES ($1, 1, $2, 'THARD-ITEM', 'Hardening Item', 7, $3, '2026-10-14T11:00:02Z'),
+              ($1, 2, $2, 'THARD-ITEM', 'Hardening Item', 7, $3, '2026-10-15T05:00:31Z')`, [approved.id, itemId, uomId],
+    );
+
     const url = api('/admin/data-management/repair/duplicate-indent-lines');
     const dry = await request(app).post(url).set(auth(adminToken)).send({});
     expect(dry.status).toBe(200);
-    expect(dry.body.data).toMatchObject({ dryRun: true, duplicateLines: 2, distinctLines: 1 });
-    expect((await request(app).post(url).set(auth(adminToken)).send({ dryRun: false })).status).toBe(422);
-    const applied = await request(app).post(url).set(auth(adminToken)).send({ dryRun: false, confirm: 'REMOVE DUPLICATES' });
+    expect(dry.body.data).toMatchObject({ dryRun: true, duplicateLines: 2, distinctLines: 1, indents: 1, duplicatedQty: 20 });
+    expect(dry.body.data.held).toEqual([expect.objectContaining({ indentNo: 'THARD/DUP/0002', qty: 7, reason: 'INDENT_APPROVED' })]);
+    expect(dry.body.data.selectionHash).toMatch(/^[0-9a-f]{64}$/);
+    const apply = (extra: Record<string, unknown>) => request(app).post(url).set(auth(adminToken)).send({ dryRun: false, ...extra });
+    expect((await apply({})).status).toBe(422);
+    expect((await apply({ confirm: 'REMOVE DUPLICATES' })).status).toBe(422);
+    // A set that is not the one the dry run listed is refused, and nothing is removed.
+    expect((await apply({ confirm: 'REMOVE DUPLICATES', expectedHash: '0'.repeat(64) })).status).toBe(409);
+    expect((await query(`SELECT 1 FROM purchase_indent_lines WHERE indent_id = $1`, [head.id])).length).toBe(6);
+    const applied = await apply({ confirm: 'REMOVE DUPLICATES', expectedHash: dry.body.data.selectionHash });
     expect(applied.status).toBe(200);
     expect(applied.body.data.removed).toBe(2);
     const left = await query<{ line_no: number }>(`SELECT line_no FROM purchase_indent_lines WHERE indent_id = $1 ORDER BY line_no`, [head.id]);
-    expect(left.map((l) => l.line_no)).toEqual([1, 2, 5]);
+    expect(left.map((l) => l.line_no)).toEqual([1, 2, 5, 6]);
+    expect((await query(`SELECT 1 FROM purchase_indent_lines WHERE indent_id = $1`, [approved.id])).length).toBe(2);
     const trail = await one<{ before_data: unknown[] }>(
       `SELECT before_data FROM audit_logs WHERE entity = 'purchase_indent_lines' AND action = 'DELETE' ORDER BY id DESC LIMIT 1`,
     );
     expect(trail.before_data).toHaveLength(2);
-    expect((await request(app).post(url).set(auth(adminToken)).send({})).body.data.duplicateLines).toBe(0);
+    const again = (await request(app).post(url).set(auth(adminToken)).send({})).body.data;
+    expect(again.duplicateLines).toBe(0);
+    expect(again.held).toHaveLength(1);
   });
 });
 
