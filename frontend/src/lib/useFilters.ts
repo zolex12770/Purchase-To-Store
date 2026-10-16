@@ -120,18 +120,25 @@ export function useFilters(defaults: FilterState = {}) {
 
 /** Builds a link that carries the current filter context into a drill-down. */
 export function drilldownLink(base: string, extra: Record<string, unknown> = {}, current?: FilterState): string {
-  const sp = new URLSearchParams();
-  const merged: Record<string, unknown> = { ...(current ?? {}), ...extra };
-  for (const [key, value] of Object.entries(merged)) {
-    if (value === undefined || value === null || value === '') continue;
-    if (NON_FILTER_KEYS.has(key)) continue;
+  // A drill target may carry its own query ('/purchase-orders?view=pending'). Appending a
+  // second '?' garbled it, and with any dashboard filter set the list showed 0 rows
+  // (2026-10-16 audit). The target's own parameters define what the number counts, so the
+  // dashboard context never overrides them; explicit extras do.
+  const [path, own = ''] = base.split('?', 2) as [string, string?];
+  const sp = new URLSearchParams(own);
+  const ownKeys = new Set(sp.keys());
+  const put = (key: string, value: unknown) => {
+    if (value === undefined || value === null || value === '') return;
+    if (NON_FILTER_KEYS.has(key)) return;
     if (Array.isArray(value)) {
-      if (value.length === 0) continue;
+      if (value.length === 0) return;
       sp.set(key, value.join(','));
     } else {
       sp.set(key, String(value));
     }
-  }
+  };
+  for (const [key, value] of Object.entries(current ?? {})) if (!ownKeys.has(key)) put(key, value);
+  for (const [key, value] of Object.entries(extra)) put(key, value);
   const q = sp.toString();
-  return q ? `${base}?${q}` : base;
+  return q ? `${path}?${q}` : path;
 }

@@ -176,15 +176,35 @@ async function toApiError(res: Response): Promise<ApiError> {
   );
 }
 
+/** Requests had no time limit: a stuck call left a spinner forever. The longest list
+    (purchase orders) answers in about 8 s, so 90 s only ever catches a dead connection. */
+const REQUEST_TIMEOUT_MS = 90_000;
+function withTimeout(signal?: AbortSignal): { signal: AbortSignal; done: () => void } {
+  // Built by hand rather than AbortSignal.any/timeout, which older shop-floor browsers lack.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(new DOMException('Request timed out', 'TimeoutError')), REQUEST_TIMEOUT_MS);
+  const forward = () => ctl.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) forward();
+    else signal.addEventListener('abort', forward, { once: true });
+  }
+  return {
+    signal: ctl.signal,
+    done: () => { clearTimeout(timer); signal?.removeEventListener('abort', forward); },
+  };
+}
+const isTimeout = (err: unknown) => err instanceof DOMException && err.name === 'TimeoutError';
+
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, signal, _retried } = options;
 
+  const limit = withTimeout(signal);
   let res: Response;
   try {
     res = await fetch(`${BASE}${path}`, {
       method,
       credentials: 'include',
-      signal,
+      signal: limit.signal,
       headers: {
         'Content-Type': 'application/json',
         ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
@@ -193,11 +213,14 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     });
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    if (isTimeout(err)) throw new ApiError(0, 'TIMEOUT', 'The server took too long to answer. Please try again.');
     throw new ApiError(
       0,
       'NETWORK_ERROR',
-      'Cannot reach the Zolex server. Check that the backend is running on port 4000.',
+      'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.',
     );
+  } finally {
+    limit.done();
   }
 
   if (res.status === 401 && !_retried && !path.startsWith('/auth/')) {
@@ -223,12 +246,13 @@ export async function requestWithMeta<T, M = Record<string, unknown>>(
 ): Promise<{ data: T; meta: M }> {
   const { method = 'GET', body, signal, _retried } = options;
 
+  const limit = withTimeout(signal);
   let res: Response;
   try {
     res = await fetch(`${BASE}${path}`, {
       method,
       credentials: 'include',
-      signal,
+      signal: limit.signal,
       headers: {
         'Content-Type': 'application/json',
         ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
@@ -237,7 +261,10 @@ export async function requestWithMeta<T, M = Record<string, unknown>>(
     });
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    throw new ApiError(0, 'NETWORK_ERROR', 'Cannot reach the Zolex server. Check that the backend is running on port 4000.');
+    if (isTimeout(err)) throw new ApiError(0, 'TIMEOUT', 'The server took too long to answer. Please try again.');
+    throw new ApiError(0, 'NETWORK_ERROR', 'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.');
+  } finally {
+    limit.done();
   }
 
   if (res.status === 401 && !_retried && !path.startsWith('/auth/')) {
