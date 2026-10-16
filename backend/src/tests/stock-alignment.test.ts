@@ -284,6 +284,14 @@ describe('Stock-ledger alignment — dry run, apply, re-run, undo', () => {
     expect(audits.map((x) => x.entity_label)).toEqual(['ALN-A', 'ALN-B', 'ALN-D', expect.stringMatching(/^alignment run [0-9a-f]{12}$/)]);
     expect(audits[0].after_data.entries).toHaveLength(3);
     expect(audits[3].after_data.items).toBe(3);
+
+    // A book entry dated today, not stock that moved today: the dashboard's "today" leaves it out.
+    const overview = await request(app).get(api('/inventory/overview')).set(auth(adminToken));
+    expect(overview.status).toBe(200);
+    expect(await count(`SELECT COUNT(*)::int AS n FROM stock_ledger WHERE txn_date = CURRENT_DATE AND reference_type = 'OPENING_ALIGNMENT'`)).toBe(7);
+    expect(overview.body.data.kpis.todayTxnsCount).toBe(
+      await count(`SELECT COUNT(*)::int AS n FROM stock_ledger WHERE txn_date = CURRENT_DATE AND reference_type <> 'OPENING_ALIGNMENT'`),
+    );
   });
 
   it('the reconciliation mismatch count falls by exactly the aligned items, active and inactive apart', async () => {
