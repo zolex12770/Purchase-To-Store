@@ -131,7 +131,7 @@
   --tracking-tight: -0.015em; --tracking-caps: 0.04em;
   --numeric: tabular-nums lining-nums;
 
-  --space-0: 0; --space-0-5: 2px; --space-1: 4px; --space-1-5: 6px; --space-2: 8px; --space-3: 12px;
+  --space-0: 0; --space-0-5: 2px; --space-1: 4px; --space-1-5: 6px; --space-2: 8px; --space-2-5: 10px; --space-3: 12px;
   --space-4: 16px; --space-5: 20px; --space-6: 24px; --space-8: 32px; --space-10: 40px; --space-12: 48px;
 
   --radius-2xs: 4px;   /* checkbox, kbd */
@@ -179,6 +179,10 @@
   --border:         light-dark(var(--stone-200), #3a352f);
   --border-strong:  light-dark(var(--stone-300), #4a443d);
   --border-control: light-dark(var(--stone-450), #7a7268);   /* inputs, selects, checkboxes ≥ 3:1 (dark 3.62) */
+  --border-hairline: light-dark(var(--stone-100), #27241f);  /* vertical table rules */
+  /* A translucent wash for ghost hovers, so it reads on any surface. */
+  --hover-wash: light-dark(rgb(28 26 23 / .06), rgb(255 255 255 / .07));
+  --press-wash: light-dark(rgb(28 26 23 / .10), rgb(255 255 255 / .11));
 
   --text-1: light-dark(var(--stone-900), #f3efe8);   /* primary: 17.36 | 14.96 */
   --text-2: light-dark(var(--stone-700), #d6cfc4);   /* secondary: 10.26 | 11.09 */
