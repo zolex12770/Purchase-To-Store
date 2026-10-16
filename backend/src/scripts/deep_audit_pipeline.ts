@@ -1,6 +1,11 @@
 import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 import { env } from '../config/env.js';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 interface CatConfig {
   category: string;
@@ -99,10 +104,10 @@ async function deepAudit() {
   const sheets = google.sheets({ version: 'v4', auth: auth as never });
 
   // Login to ERP API to get current database state
-  const loginRes = await fetch('http://localhost:4001/api/v1/auth/login', {
+  const loginRes = await fetch(`${SCRIPT_API.baseUrl}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ employeeId: '10221', password: 'Admin@12345' }),
+    body: JSON.stringify(SCRIPT_LOGIN),
   });
   const loginData = (await loginRes.json()) as any;
   const token = loginData.data?.accessToken;
@@ -233,7 +238,7 @@ async function deepAudit() {
     }
 
     // 2. Fetch ERP Database stats for this category
-    const dbSummaryRes = await fetch(`http://localhost:4001/api/v1/inventory/categories/${cfg.category}/summary`, { headers: apiHeaders });
+    const dbSummaryRes = await fetch(`${SCRIPT_API.baseUrl}/inventory/categories/${cfg.category}/summary`, { headers: apiHeaders });
     const dbSummary = (await dbSummaryRes.json()) as any;
     const dbStats = dbSummary.data?.stats;
 

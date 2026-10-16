@@ -2,6 +2,11 @@ import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 import http from 'node:http';
 import { env } from '../config/env.js';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 function apiRequest<T = any>(
   endpoint: string,
@@ -13,8 +18,8 @@ function apiRequest<T = any>(
     const dataStr = body ? JSON.stringify(body) : undefined;
     const req = http.request(
       {
-        hostname: '127.0.0.1',
-        port: 4001,
+        hostname: SCRIPT_API.hostname,
+        port: SCRIPT_API.port,
         path: `/api/v1${endpoint}`,
         method,
         headers: {
@@ -49,16 +54,16 @@ async function main() {
 
   // 1. Check API Health
   const healthRes = await apiRequest('/health');
-  console.log('1. ERP Backend API Health (port 4001):', healthRes.data?.data?.status === 'ok' ? 'ONLINE & HEALTHY' : 'ERROR', healthRes.data);
+  console.log(`1. ERP Backend API Health (${SCRIPT_API.baseUrl}):`, healthRes.data?.data?.status === 'ok' ? 'ONLINE & HEALTHY' : 'ERROR', healthRes.data);
 
   // 2. Authenticate to ERP API
-  const loginRes = await apiRequest('/auth/login', 'POST', { employeeId: '10221', password: 'Admin@123' });
+  const loginRes = await apiRequest('/auth/login', 'POST', SCRIPT_LOGIN);
   const token = loginRes.data.data.accessToken;
 
   // 3. Query ERP for October 13 Requisitions
   const erpOct13Res = await apiRequest('/requisitions?dateFrom=2026-10-13&dateTo=2026-10-13&pageSize=100', 'GET', null, token);
   const erpOct13Headers = erpOct13Res.data.data || [];
-  console.log(`\n2. Live ERP at Port 8080/4001:`);
+  console.log(`\n2. ERP at ${SCRIPT_API.baseUrl}:`);
   console.log(`   Requisition Headers filtered for 2026-10-13: ${erpOct13Headers.length}`);
   for (const h of erpOct13Headers) {
     console.log(`     ID ${h.id}: No=${h.requisition_no}, Date=${String(h.requisition_date).slice(0, 10)}, User="${h.employee_name}", Dept="${h.department_name}", Lines=${h.line_count}, Items=[${h.item_codes}]`);

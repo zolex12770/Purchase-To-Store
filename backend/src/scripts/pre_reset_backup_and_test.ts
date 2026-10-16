@@ -4,6 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { restoreFromPayload, type BackupPayload } from '../db/restore.js';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 function request(options: http.RequestOptions, body?: unknown): Promise<{ status: number; headers: http.IncomingHttpHeaders; data: any }> {
   return new Promise((resolve, reject) => {
@@ -29,28 +34,28 @@ function request(options: http.RequestOptions, body?: unknown): Promise<{ status
 async function main() {
   console.log('=== PHASE 2: BACKUP & RESTORE INTEGRITY GATE ===');
 
-  // 1. Sign in as Super Admin
+  // 1. Sign in (as the account in ZOLEX_SCRIPT_EMPLOYEE_ID; it needs sync.admin and backup.create)
   const login = await request(
-    { hostname: '127.0.0.1', port: 4001, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
-    { employeeId: '10221', password: 'Admin@123' },
+    { hostname: SCRIPT_API.hostname, port: SCRIPT_API.port, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
+    SCRIPT_LOGIN,
   );
   if (!login.data?.success) {
-    throw new Error('Failed to sign in as Super Admin: ' + JSON.stringify(login.data));
+    throw new Error('Failed to sign in: ' + JSON.stringify(login.data));
   }
   const token = login.data.data.accessToken;
   const headers = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
-  console.log('1. Authenticated as Super Admin:', login.data.data.user.employeeName);
+  console.log('1. Authenticated as:', login.data.data.user.employeeName);
 
   // 2. Fence sync: set Live Sync OFF
   const toggleRes = await request(
-    { hostname: '127.0.0.1', port: 4001, path: '/api/v1/google-sync/toggle', method: 'POST', headers },
+    { hostname: SCRIPT_API.hostname, port: SCRIPT_API.port, path: '/api/v1/google-sync/toggle', method: 'POST', headers },
     { enabled: false },
   );
   console.log('2. Fenced Google Sheets Sync (OFF):', toggleRes.data?.data?.message || toggleRes.data);
 
   // 3. Create full database backup
   const backupRes = await request(
-    { hostname: '127.0.0.1', port: 4001, path: '/api/v1/backup', method: 'POST', headers },
+    { hostname: SCRIPT_API.hostname, port: SCRIPT_API.port, path: '/api/v1/backup', method: 'POST', headers },
     { notes: 'Pre-reset master backup before live Google Sheets re-import' },
   );
   if (backupRes.status !== 201) {

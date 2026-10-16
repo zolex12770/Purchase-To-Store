@@ -2,6 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 function request(options: http.RequestOptions, body?: any): Promise<{ status: number; data: any }> {
   return new Promise((resolve, reject) => {
@@ -30,27 +35,21 @@ async function main() {
   console.log('Timestamp:', new Date().toISOString());
   console.log('========================================================================\n');
 
-  // 1. Sign in as Super Admin
-  let login = await request(
-    { hostname: '127.0.0.1', port: 4001, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
-    { employeeId: '10221', password: 'Admin@12345' },
+  // 1. Sign in (as the account in ZOLEX_SCRIPT_EMPLOYEE_ID; it needs backup.create)
+  const login = await request(
+    { hostname: SCRIPT_API.hostname, port: SCRIPT_API.port, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
+    SCRIPT_LOGIN,
   );
   if (!login.data?.success) {
-    login = await request(
-      { hostname: '127.0.0.1', port: 4001, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
-      { employeeId: '10221', password: 'Admin@123' },
-    );
-  }
-  if (!login.data?.success) {
-    throw new Error('Failed to sign in as Super Admin: ' + JSON.stringify(login.data));
+    throw new Error('Failed to sign in: ' + JSON.stringify(login.data));
   }
   const token = login.data.data.accessToken;
   const headers = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
-  console.log('✓ 1. Authenticated as Super Admin:', login.data.data.user.employeeName);
+  console.log('✓ 1. Authenticated as:', login.data.data.user.employeeName);
 
   // 2. Create full production database backup
   const backupRes = await request(
-    { hostname: '127.0.0.1', port: 4001, path: '/api/v1/backup', method: 'POST', headers },
+    { hostname: SCRIPT_API.hostname, port: SCRIPT_API.port, path: '/api/v1/backup', method: 'POST', headers },
     { notes: 'Production stabilization backup before Phase 1-11 repair' },
   );
   if (backupRes.status !== 201 && backupRes.status !== 200) {

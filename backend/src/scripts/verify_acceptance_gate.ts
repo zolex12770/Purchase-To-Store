@@ -1,11 +1,17 @@
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
+
 async function main() {
-  const baseURL = 'http://127.0.0.1:4001/api/v1';
+  const baseURL = SCRIPT_API.baseUrl;
 
   console.log('=== TEST 1: Authentication & HOD Resolution for MDO ===');
   const loginRes = await fetch(`${baseURL}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ employeeId: '10221', password: 'Admin@12345' }),
+    body: JSON.stringify(SCRIPT_LOGIN),
   });
   const loginData = await loginRes.json() as any;
   if (!loginData.success) throw new Error('Login failed: ' + JSON.stringify(loginData));
