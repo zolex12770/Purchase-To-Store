@@ -416,7 +416,7 @@ export const METRICS: MetricDef[] = [
     key: 'requisition_issue_transaction_count',
     label: 'Issue Transactions',
     description: 'Number of distinct store-issue events (issue slips) recorded — a requisition may have several.',
-    formula: 'COUNT(*) FROM requisition_issues',
+    formula: "COUNT(*) FROM requisition_issues WHERE status = 'POSTED'",
     unit: 'count',
     source: 'requisition_issues',
     drilldown: '/requisitions/store-queue',

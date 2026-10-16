@@ -34,6 +34,8 @@ export interface IssueSlipDocumentData {
   machine_name: string | null;
   cost_centre_name: string | null;
   store_user_name: string | null;
+  /** Set once the slip has been reversed — a reprint must never pass for a live issue. */
+  reversal?: { at: string | null; by: string | null; reason: string } | null;
   lines: IssueSlipDocumentLine[];
   company: RequisitionDocumentCompany;
 }
@@ -149,6 +151,11 @@ export function renderIssueSlipHtml(d: IssueSlipDocumentData): string {
     border-radius: 4px; padding: 8px 11px; font-size: 9px; color: #7a4c00;
   }
   .excess-banner strong { text-transform: uppercase; font-size: 8.2px; letter-spacing: 0.4px; }
+  .reversed-banner {
+    margin-bottom: 12px; background: #fdecec; border: 1px solid #f3c2c2; border-left: 3px solid #b42318;
+    border-radius: 4px; padding: 8px 11px; font-size: 9.6px; color: #7a1414;
+  }
+  .reversed-banner strong { text-transform: uppercase; letter-spacing: 0.4px; }
 
   .footer { margin-top: 18px; page-break-inside: avoid; }
   .sign-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin-top: 34px; max-width: 420px; margin-left: auto; margin-right: auto; }
@@ -180,12 +187,19 @@ export function renderIssueSlipHtml(d: IssueSlipDocumentData): string {
   <div class="accent-bar"></div>
 
   <div class="title-band">
-    <h1>MATERIAL ISSUE SLIP</h1>
+    <h1>MATERIAL ISSUE SLIP${d.reversal ? ' — REVERSED' : ''}</h1>
     <div class="doc-meta">
       <div class="doc-no">${esc(d.issue_slip_no)}</div>
       <div class="doc-date">Dated ${fmtDate(d.issue_date)}</div>
     </div>
   </div>
+
+  ${d.reversal ? `
+  <div class="reversed-banner">
+    <strong>Reversed${d.reversal.at ? ` on ${fmtDate(d.reversal.at)}` : ''}${d.reversal.by ? ` by ${esc(d.reversal.by)}` : ''}.</strong>
+    Every quantity below was returned to stock; this slip no longer counts as issued.
+    Reason: ${esc(d.reversal.reason) || '—'}
+  </div>` : ''}
 
   <div class="info-grid">
     <div class="info-box">

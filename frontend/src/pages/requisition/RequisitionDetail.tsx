@@ -14,7 +14,7 @@ import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Pencil, Send, CheckCircle2, XCircle, RotateCcw, Ban, Printer, Eye,
-  Trash2, History, PackageCheck, TriangleAlert, FileText, Download,
+  Trash2, History, PackageCheck, TriangleAlert, FileText, Download, Undo2,
 } from 'lucide-react';
 import { api, ApiError, downloadFile, fetchHtml } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
@@ -22,7 +22,7 @@ import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
 import {
   Button, Card, CardBody, CardHeader, StatusBadge, Badge, ConfirmDialog, Modal, DetailItem, DetailGrid,
-  LoadingBlock, ErrorState, Input, Checkbox,
+  LoadingBlock, ErrorState, Input, Checkbox, Field, Textarea,
 } from '../../components/ui';
 import { StatTile } from '../../components/KpiCard';
 import { qty, money, formatDate, formatDateTime, count, text, statusLabel } from '../../lib/format';
@@ -71,10 +71,17 @@ interface RequisitionDoc {
   close_reason: string | null;
   lines: RequisitionLine[];
   approvals: { id: number; action: string; reason: string | null; from_status: string; to_status: string; created_at: string; actor_name: string | null; actor_code: string | null }[];
-  issues: {
-    id: number; issue_slip_no: string; issue_date: string; remarks: string; created_at: string; store_user_name: string | null;
-    lines: { itemCode: string; itemDescription: string; requestedQtySnapshot: string; previouslyIssuedQty: string; issueQty: string }[];
-  }[];
+  issues: IssueSlip[];
+}
+
+/** A REVERSED slip stays in the history; its stock went back and it no longer counts as issued. */
+interface IssueSlip {
+  id: number; issue_slip_no: string; issue_date: string; remarks: string; created_at: string; store_user_name: string | null;
+  status: 'POSTED' | 'REVERSED';
+  reversed_at: string | null;
+  reversal_reason: string;
+  reversed_by_name: string | null;
+  lines: { itemCode: string; itemDescription: string; requestedQtySnapshot: string; previouslyIssuedQty: string; issueQty: string }[];
 }
 
 type ActionKind = 'submit' | 'approve' | 'reject' | 'return' | 'reopen' | 'cancel' | 'delete';
@@ -188,6 +195,22 @@ export default function RequisitionDetail() {
     onError: (err) => toast.fromError(err),
   });
 
+  // Reverse one issue slip — its stock goes back; the slip stays, marked reversed.
+  const [reversingSlip, setReversingSlip] = useState<IssueSlip | null>(null);
+  const [reverseReason, setReverseReason] = useState('');
+  const reverseIssue = useMutation({
+    mutationFn: (p: { issueId: number; reason: string }) =>
+      api.post<{ message: string }>(`/requisitions/${id}/issues/${p.issueId}/reverse`, { reason: p.reason }),
+    onSuccess: (res) => {
+      toast.success('Issue reversed', res.message);
+      setReversingSlip(null); setReverseReason('');
+      void qc.invalidateQueries({ queryKey: ['requisitions'] });
+      void qc.invalidateQueries({ queryKey: ['requisition', id] });
+      void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
+    },
+    onError: (err) => toast.fromError(err, 'Could not reverse the issue'),
+  });
+
   if (isLoading) return <LoadingBlock label="Loading requisition…" />;
   if (error) return <ErrorState error={error} onRetry={() => void refetch()} />;
   if (!data) return null;
@@ -207,7 +230,10 @@ export default function RequisitionDetail() {
     ? 'You cannot approve a requisition you raised yourself.'
     : wrongHod ? 'Only this requisition\'s HOD can approve it.' : undefined;
 
-  const hasAnyIssue = data.issues.length > 0;
+  // Only slips still standing block a cancel; a reversed one returned its stock.
+  const postedIssueCount = data.issues.filter((i) => i.status !== 'REVERSED').length;
+  const reversedIssueCount = data.issues.length - postedIssueCount;
+  const hasAnyIssue = postedIssueCount > 0;
   const canSeeFinancials = can('requisition.approve') || isSuperAdmin;
   const totalRequested = data.lines.reduce((s, l) => s + Number(l.requested_qty), 0);
   const totalIssued = data.lines.reduce((s, l) => s + Number(l.issued_qty), 0);

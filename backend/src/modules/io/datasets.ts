@@ -583,9 +583,10 @@ export const DATASETS: Record<string, DatasetDef> = {
         sql: `SELECT l.item_code, l.item_description, u.code AS uom_code, l.main_group_name,
                      h.employee_name, h.department_name, m.name AS machine_name, cc.name AS cost_centre_name,
                      v.requested_qty, h.requisition_date, h.requisition_no, h.hod_name, bal.hod_status,
-                     (SELECT i.issue_slip_no FROM requisition_issues i WHERE i.requisition_id = h.id
+                     (SELECT i.issue_slip_no FROM requisition_issues i WHERE i.requisition_id = h.id AND i.status = 'POSTED'
                        ORDER BY i.created_at DESC LIMIT 1) AS last_issue_slip_no,
-                     (SELECT MAX(i.issue_date) FROM requisition_issues i WHERE i.requisition_id = h.id) AS last_issue_date,
+                     (SELECT MAX(i.issue_date) FROM requisition_issues i
+                       WHERE i.requisition_id = h.id AND i.status = 'POSTED') AS last_issue_date,
                      v.issued_qty, l.remarks
                 FROM requisition_lines l
                 JOIN requisition_headers h ON h.id = l.requisition_id

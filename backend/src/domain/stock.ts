@@ -26,21 +26,30 @@ export async function nextMln(tx: Queryable): Promise<string> {
 }
 
 /**
- * True once a Requisition has issued ANY quantity of this item out of the
- * pooled balance (a real, already-existing `stock_ledger` row — not an
- * invented relationship). Stock is pooled per item, not lot-tracked to a
- * specific GRN (Part 12/14: `requisition_issue_lines` carries no GRN-specific
- * identifier), so this is genuinely the finest-grained signal available that
- * "this item's stock has been consumed downstream" — used by GRN's edit-lock
+ * True while Requisitions have a NET quantity of this item issued out of the
+ * pooled balance: their REQUISITION_ISSUE ledger rows minus the
+ * REQUISITION_REVERSAL rows that took issues back (real, already-existing
+ * `stock_ledger` rows — not an invented relationship). Stock is pooled per
+ * item, not lot-tracked to a specific GRN (Part 12/14:
+ * `requisition_issue_lines` carries no GRN-specific identifier), so this is
+ * genuinely the finest-grained signal available that "this item's stock has
+ * been consumed downstream" — used by GRN's edit-lock and cancel guard
  * (grn/routes.ts) to protect exactly the fields that would corrupt a
- * Requisition that already relied on the pooled balance, without inventing a
- * fake per-GRN foreign key to Requisition.
+ * Requisition that relies on the pooled balance, without inventing a fake
+ * per-GRN foreign key to Requisition.
+ *
+ * Net, not "any issue row ever written": counting rows kept GRN-20261014-0001
+ * (production test chain) uncancellable forever, even once the issue that
+ * consumed it was reversed.
  */
 export async function hasRequisitionConsumption(tx: Queryable, itemId: number): Promise<boolean> {
-  const row = await txQueryOne<{ n: string }>(
-    tx, `SELECT COUNT(*) AS n FROM stock_ledger WHERE item_id = $1 AND txn_type = 'REQUISITION_ISSUE'`, [itemId],
+  const row = await txQueryOne<{ net: string }>(
+    tx,
+    `SELECT COALESCE(SUM(outward_qty - inward_qty), 0) AS net FROM stock_ledger
+      WHERE item_id = $1 AND txn_type IN ('REQUISITION_ISSUE', 'REQUISITION_REVERSAL')`,
+    [itemId],
   );
-  return Number(row?.n ?? 0) > 0;
+  return dec(row?.net ?? '0').greaterThan(0);
 }
 
 /**
@@ -172,13 +181,24 @@ export async function reverseGrnLine(
   line: GrnLineForStock,
   ctx: { grnId: number; grnNo: string; grnDate: string; supplierId: number | null; userId: number | null },
 ): Promise<{ newBalance: string }> {
-  const item = await txQueryOne<{ id: number; live_stock_qty: string }>(
-    tx, 'SELECT id, live_stock_qty FROM items WHERE id = $1 FOR UPDATE', [line.item_id],
+  const item = await txQueryOne<{ id: number; item_code: string; live_stock_qty: string }>(
+    tx, 'SELECT id, item_code, live_stock_qty FROM items WHERE id = $1 FOR UPDATE', [line.item_id],
   );
   if (!item) throw new Error(`Item ${line.item_id} not found while reversing stock inward.`);
 
   const usable = usableQtyOf(line);
-  const newBalance = toQty(dec(item.live_stock_qty).minus(dec(usable)));
+  const after = dec(item.live_stock_qty).minus(dec(usable));
+  // Only requisition consumption is checked before a cancel; the received stock
+  // may also have left through a direct issue or an adjustment since. Refuse in
+  // words rather than tripping chk_items_live_stock_nonneg as a bare data-rule error.
+  if (after.isNegative()) {
+    throw BusinessRuleError(
+      `Cancelling ${ctx.grnNo} would take ${item.item_code}'s stock below zero ` +
+      `(stock now ${toQty(item.live_stock_qty)}, this receipt ${toQty(usable)}).`,
+      { itemCode: item.item_code, currentStock: toQty(item.live_stock_qty), receiptQty: toQty(usable) },
+    );
+  }
+  const newBalance = toQty(after);
 
   await tx.query('UPDATE items SET live_stock_qty = $2, updated_at = now() WHERE id = $1', [line.item_id, newBalance]);
 
@@ -355,6 +375,52 @@ export async function reverseDirectStoreLine(
     [line.item_id, ctx.directIssueId, ctx.issueNo, toQty(dec(issueQty)), newBalance, line.uom_id, ctx.date, ctx.userId],
   );
   return { newBalance };
+}
+
+/** `location` of a ledger-only void row: the ledger has no remarks column, and the row must say what it is. */
+export const LEDGER_ONLY_VOID_LOCATION = 'Ledger-only void: stock already excluded by the sheet';
+
+export interface LedgerOnlyReversal {
+  itemId: number;
+  txnType: 'GRN_REVERSAL' | 'REQUISITION_REVERSAL' | 'DIRECT_ISSUE_REVERSAL';
+  referenceType: 'GRN' | 'REQUISITION' | 'DIRECT_ISSUE';
+  referenceId: number;
+  referenceNo: string;
+  inwardQty: string;
+  outwardQty: string;
+  /** The running LEDGER balance after this row — not live stock, which this never touches. */
+  balanceQty: string;
+  uomId: number | null;
+  grnLineId: number | null;
+  mlnNo: string;
+  poLineId: number | null;
+  supplierId: number | null;
+  batchNo: string;
+  txnDate: string;
+  userId: number | null;
+}
+
+/**
+ * Appends a reversal entry WITHOUT moving `items.live_stock_qty` — only for the
+ * admin void of test documents whose stock effect live stock already excludes.
+ * Production 2026-10-15/16: the old inventory sync set item 1161480001 to its
+ * sheet figure (3) without a ledger row, taking the test chain's +14 out of live
+ * stock but not out of the ledger (17). A normal reversal would remove it a
+ * second time (3 - 14 < 0). The caller proves first that ledger sum plus the
+ * void equals live stock (admin/void-test-documents.ts).
+ */
+export async function appendLedgerOnlyReversal(tx: Queryable, r: LedgerOnlyReversal): Promise<void> {
+  await tx.query(
+    `INSERT INTO stock_ledger
+       (item_id, txn_type, reference_type, reference_id, reference_no, grn_line_id, mln_no, po_line_id,
+        supplier_id, inward_qty, outward_qty, balance_qty, uom_id, location, batch_no, txn_date, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+    [
+      r.itemId, r.txnType, r.referenceType, r.referenceId, r.referenceNo, r.grnLineId, r.mlnNo, r.poLineId,
+      r.supplierId, r.inwardQty, r.outwardQty, r.balanceQty, r.uomId, LEDGER_ONLY_VOID_LOCATION, r.batchNo,
+      r.txnDate, r.userId,
+    ],
+  );
 }
 
 /**

@@ -276,3 +276,38 @@ export async function recomputeIndentClosure(tx: Queryable, indentId: number): P
     );
   }
 }
+
+/**
+ * Re-derives an approved requisition's store status from its POSTED issue slips
+ * (v_requisition_header_balance ignores reversed ones): nothing issued ->
+ * APPROVED, everything requested issued -> FULLY_ISSUED, otherwise
+ * PARTIALLY_ISSUED. Called after every issue and every issue reversal, both of
+ * which change what the requisition has received, so the header is always
+ * stamped. Any other status (draft, pending, rejected, cancelled) is a decision
+ * a person made and is left alone.
+ */
+export async function recomputeRequisitionStatus(
+  tx: Queryable,
+  requisitionId: number,
+  userId: number | null,
+): Promise<{ from: string; to: string; totalRequested: string; totalIssued: string }> {
+  const row = await txQueryOne<{ status: string; total_requested_qty: string; total_issued_qty: string }>(
+    tx,
+    'SELECT status, total_requested_qty, total_issued_qty FROM v_requisition_header_balance WHERE requisition_id = $1',
+    [requisitionId],
+  );
+  if (!row) throw NotFoundError('Requisition');
+  const totals = { totalRequested: row.total_requested_qty, totalIssued: row.total_issued_qty };
+  if (!['APPROVED', 'PARTIALLY_ISSUED', 'FULLY_ISSUED'].includes(row.status)) {
+    return { from: row.status, to: row.status, ...totals };
+  }
+  const issued = dec(row.total_issued_qty);
+  const to = !issued.greaterThan(0) ? 'APPROVED'
+    : issued.greaterThanOrEqualTo(dec(row.total_requested_qty)) ? 'FULLY_ISSUED'
+      : 'PARTIALLY_ISSUED';
+  await tx.query(
+    'UPDATE requisition_headers SET status = $2, updated_at = now(), updated_by = $3 WHERE id = $1',
+    [requisitionId, to, userId],
+  );
+  return { from: row.status, to, ...totals };
+}
