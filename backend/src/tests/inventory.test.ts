@@ -120,24 +120,26 @@ describe('Enterprise Inventory Module API', () => {
   // 3,191 items at Rs 0 while the Overview valued the same stock at the sheets' rates.
   it('GET /api/v1/inventory/stock values stock at the sheet rate when the item has no standard rate, and says so', async () => {
     const { query } = await import('../db/index.js');
-    const mk = async (code: string, stock: number) => (await query<{ id: number }>(
+    const run = `TVAL${Date.now().toString(36).toUpperCase()}`;
+    const mk = async (code: string, stock: number, rate: number) => (await query<{ id: number }>(
       `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, standard_rate, is_active)
-       VALUES ($1, $1, 'GENERAL', $2, 0, TRUE) RETURNING id`, [code, stock],
+       VALUES ($1, $1, 'GENERAL', $2, $3, TRUE) RETURNING id`, [code, stock, rate],
     ))[0]!.id;
-    const sheetRated = await mk('TEST-INV-SHEETRATE', 4);
-    await mk('TEST-INV-NORATE', 3);
+    const sheetRated = await mk(`${run}-SHEET`, 4, 0);
+    await mk(`${run}-NONE`, 3, 0);
+    await mk(`${run}-STD`, 2, 100);
     await query(
       `INSERT INTO inventory_items (item_id, item_code, item_description, category, live_stock_qty, unit_price)
-       VALUES ($1, 'TEST-INV-SHEETRATE', 'TEST-INV-SHEETRATE', 'GENERAL', 4, 12.5)`, [sheetRated],
+       VALUES ($1, $2, $2, 'GENERAL', 4, 12.5)`, [sheetRated, `${run}-SHEET`],
     );
-    const res = await request(app).get('/api/v1/inventory/stock?category=GENERAL&search=TEST-INV-').set(auth(adminToken));
+    const res = await request(app).get(`/api/v1/inventory/stock?category=GENERAL&search=${run}`).set(auth(adminToken));
     expect(res.status).toBe(200);
     const row = (code: string) => res.body.data.find((r: { item_code: string }) => r.item_code === code);
-    expect(row('TEST-INV-SHEETRATE')).toMatchObject({ valuation_basis: 'SHEET' });
-    expect(Number(row('TEST-INV-SHEETRATE').stock_valuation)).toBe(50);
-    expect(row('TEST-INV-NORATE')).toMatchObject({ valuation_basis: 'NONE' });
-    expect(row('TEST-INV-001')).toMatchObject({ valuation_basis: 'STANDARD' });
-    expect(res.body.meta.summary.totalValuation).toBe(5050);
+    expect(row(`${run}-SHEET`)).toMatchObject({ valuation_basis: 'SHEET' });
+    expect(Number(row(`${run}-SHEET`).stock_valuation)).toBe(50);
+    expect(row(`${run}-NONE`)).toMatchObject({ valuation_basis: 'NONE' });
+    expect(row(`${run}-STD`)).toMatchObject({ valuation_basis: 'STANDARD' });
+    expect(res.body.meta.summary.totalValuation).toBe(250);
     expect(res.body.meta.summary.unvaluedWithStock).toBe(1);
     expect(res.body.meta.summary.sheetRatedWithStock).toBe(1);
   });
@@ -320,3 +322,87 @@ describe('Enterprise Inventory Module API', () => {
   });
 });
 
+
+/* ── 2026-10-16 audit fixes: exports match their lists, bad input is 422, auto-indent states ── */
+
+describe('inventory exports and auto-indent states', () => {
+  // The suite reuses its database between runs, so every fixture carries a per-run code.
+  const run = `T${Date.now().toString(36).toUpperCase()}`;
+  const get = (path: string) => request(app).get(path).set(auth(adminToken));
+  const post = (path: string, body: object = {}) => request(app).post(path).set(auth(adminToken)).send(body);
+  const csvCodes = (text: string) => text.split('\r\n').slice(1).filter(Boolean).map((l) => l.split(',')[0]!.replace(/"/g, ''));
+
+  it('an invalid filter value is a 422, not a 500', async () => {
+    expect((await get('/api/v1/inventory/categories/RM?status=FOO')).status).toBe(422);
+    expect((await get('/api/v1/inventory/reconciliation?status=FOO')).status).toBe(422);
+  });
+
+  it("the stock export applies the stock-status filter and uses the screen's status rule", async () => {
+    const { query } = await import('../db/index.js');
+    await query(
+      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, min_stock, reorder_level, is_active)
+       VALUES ($1, 'critical', 'GENERAL', 2, 10, 0, TRUE), ($2, 'normal', 'GENERAL', 50, 0, 0, TRUE)`,
+      [`${run}-CRIT`, `${run}-OK`],
+    );
+    const list = await get(`/api/v1/inventory/stock?category=GENERAL&stockStatus=CRITICAL&search=${run}`);
+    expect(list.body.data.map((r: { item_code: string }) => r.item_code)).toEqual([`${run}-CRIT`]);
+    const csv = await get(`/api/v1/inventory/stock/export?category=GENERAL&stockStatus=CRITICAL&search=${run}`);
+    expect(csv.status).toBe(200);
+    expect(csvCodes(csv.text)).toEqual([`${run}-CRIT`]);
+    expect(csv.text.split('\r\n')[1]!.endsWith(',CRITICAL')).toBe(true);
+    const all = await get(`/api/v1/inventory/stock/export?category=GENERAL&search=${run}`);
+    expect(all.text).toMatch(new RegExp(`${run}-OK.*,NORMAL`));
+  });
+
+  it('the ledger export prints plain dates', async () => {
+    const csv = await get('/api/v1/inventory/ledger/export');
+    expect(csv.status).toBe(200);
+    const first = csv.text.split('\r\n')[1];
+    if (first) expect(first.slice(0, 10)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(csv.text).not.toMatch(/GMT[+-]\d{4}/);
+  });
+
+  it('a category export holds exactly the rows its list shows', async () => {
+    const { query } = await import('../db/index.js');
+    const item = (await query<{ id: number }>(`SELECT id FROM items WHERE item_code = 'TEST-INV-001'`))[0]!;
+    await query(
+      `INSERT INTO inventory_items (item_id, item_code, item_description, category, live_stock_qty)
+       VALUES ($1, $2, 'Export zero', 'RM', 0), ($1, $3, 'Export some', 'RM', 7)`, [item.id, `${run}-ZERO`, `${run}-SOME`],
+    );
+    const list = await get(`/api/v1/inventory/categories/RM?status=ZERO_STOCK&search=${run}`);
+    expect(list.body.data.map((r: { item_code: string }) => r.item_code)).toEqual([`${run}-ZERO`]);
+    const csv = await get(`/api/v1/inventory/categories/RM/export?status=ZERO_STOCK&search=${run}`);
+    expect(csvCodes(csv.text)).toEqual([`${run}-ZERO`]);
+  });
+
+  it('an auto-indent suggestion is converted only once, and only after approval', async () => {
+    const { query } = await import('../db/index.js');
+    const dept = await post('/api/v1/lookups/DEPARTMENT', { code: `${run}-D`, name: `Auto indent dept ${run}` });
+    expect(dept.status).toBe(201);
+    const cc = await post("/api/v1/lookups/COST_CENTRE", { code: `${run}-CC`, name: `Auto indent cost centre ${run}` });
+    expect(cc.status).toBe(201);
+    const item = (await query<{ id: number }>(`SELECT id FROM items WHERE item_code = 'TEST-INV-001'`))[0]!;
+    const suggest = async () => (await query<{ id: number }>(
+      `INSERT INTO auto_indents (item_id, item_code, item_name, eligible_stock, min_stock, reorder_level, suggested_qty, department_id, cost_centre_id, status)
+       VALUES ($1, 'TEST-INV-001', 'Test Inventory General Item', 5, 10, 20, 15, $2, $3, 'PENDING_APPROVAL') RETURNING id`,
+      [item.id, dept.body.data.id, cc.body.data.id],
+    ))[0]!.id;
+
+    const a = await suggest();
+    expect((await post(`/api/v1/inventory/auto-indents/${a}/convert`)).status).toBe(422);
+    const approved = await post(`/api/v1/inventory/auto-indents/${a}/approve`);
+    expect(approved.status).toBe(200);
+    const converted = await post(`/api/v1/inventory/auto-indents/${a}/convert`);
+    expect(converted.status, JSON.stringify(converted.body)).toBe(200);
+    expect((await post(`/api/v1/inventory/auto-indents/${a}/convert`)).status).toBe(422);
+    expect((await post(`/api/v1/inventory/auto-indents/${a}/approve`)).status).toBe(422);
+    expect((await post(`/api/v1/inventory/auto-indents/${a}/reject`, { reason: 'late' })).status).toBe(422);
+    const history = await query<{ action: string }>(`SELECT action FROM indent_approvals WHERE indent_id = $1`, [converted.body.data.indentId]);
+    expect(history.map((h) => h.action)).toEqual(['SUBMIT']);
+
+    const b = await suggest();
+    expect((await post(`/api/v1/inventory/auto-indents/${b}/reject`, { reason: 'not needed' })).status).toBe(200);
+    expect((await post(`/api/v1/inventory/auto-indents/${b}/approve`)).status).toBe(422);
+    expect((await post(`/api/v1/inventory/auto-indents/${b}/convert`)).status).toBe(422);
+  });
+});

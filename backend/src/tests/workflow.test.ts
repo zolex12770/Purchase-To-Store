@@ -2099,3 +2099,22 @@ describe('health', () => {
     expect(res.body.error.code).toBe('NOT_FOUND');
   });
 });
+
+describe('indent reopen (2026-10-16 audit)', () => {
+  // Reopen sent an APPROVED indent back to DRAFT with indent.edit alone, skipping
+  // Unapprove's approve right and its purchase-order check.
+  it('refuses to reopen an approved indent and points to Unapprove; a rejected one still reopens', async () => {
+    const create = async () => (await request(app).post('/api/v1/indents').set(auth(adminToken)).send({
+      indentTypeId, requiredByDate, departmentId, costCentreId, submit: true, lines: [{ itemId: itemAId, indentQty: '3' }],
+    })).body.data.id as number;
+    const approvedId = await create();
+    expect((await request(app).post(`/api/v1/indents/${approvedId}/approve`).set(auth(headToken)).send({})).status).toBe(200);
+    const refused = await request(app).post(`/api/v1/indents/${approvedId}/reopen`).set(auth(adminToken)).send({});
+    expect(refused.status).toBe(422);
+    expect(refused.body.error.message).toMatch(/Unapprove/);
+
+    const rejectedId = await create();
+    await request(app).post(`/api/v1/indents/${rejectedId}/reject`).set(auth(headToken)).send({ reason: 'Not needed' });
+    expect((await request(app).post(`/api/v1/indents/${rejectedId}/reopen`).set(auth(adminToken)).send({})).status).toBe(200);
+  });
+});

@@ -204,6 +204,32 @@ router.get(
   }),
 );
 
+/** The register's one stock-status rule, used by its rows, counts, summary and export.
+    The CSV kept its own copy, which had drifted: it marked 1,759 items BELOW_REORDER that
+    the screen showed as NORMAL (2026-10-16). */
+const AVAILABLE_SQL = 'GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0))';
+
+/** Exports are complete or refused: they used to stop silently at 10,000 rows, while the
+    stock ledger alone holds more than 27,000. */
+const EXPORT_ROW_CAP = 200_000;
+function refuseTruncatedExport(rowCount: number): void {
+  if (rowCount > EXPORT_ROW_CAP) {
+    throw ValidationError(`This export would exceed ${EXPORT_ROW_CAP.toLocaleString('en-IN')} rows. Narrow the filters (dates, category or item) and export again.`);
+  }
+}
+const STOCK_STATUS_SQL = `CASE
+                 WHEN ${AVAILABLE_SQL} < COALESCE(i.min_stock, 0)
+                      OR (COALESCE(i.min_stock, 0) > 0 AND ${AVAILABLE_SQL} = 0)
+                   THEN 'CRITICAL'
+                 WHEN ${AVAILABLE_SQL} <= COALESCE(i.reorder_level, 0)
+                      AND COALESCE(i.reorder_level, 0) > 0
+                   THEN 'BELOW_REORDER'
+                 WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
+                      AND ${AVAILABLE_SQL} > i.max_stock
+                   THEN 'EXCESS'
+                 ELSE 'NORMAL'
+               END`;
+
 /* ── GET /inventory/stock ───────────────────────────────────────────────────── */
 
 const stockQuerySchema = listQuerySchema.extend({
@@ -310,18 +336,7 @@ router.get(
     const countSql = `
       SELECT COUNT(*) AS n FROM (
         SELECT i.id,
-               CASE
-                 WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                      OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
-                   THEN 'CRITICAL'
-                 WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
-                      AND COALESCE(i.reorder_level, 0) > 0
-                   THEN 'BELOW_REORDER'
-                 WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
-                      AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock
-                   THEN 'EXCESS'
-                 ELSE 'NORMAL'
-               END AS stock_status
+               ${STOCK_STATUS_SQL} AS stock_status
         ${baseFrom}
         ${b.where()}
       ) t ${statusFilter}
@@ -365,18 +380,7 @@ router.get(
                 i.live_stock_qty,
                 COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0) AS valuation_rate,
                 CASE WHEN COALESCE(i.standard_rate, 0) > 0 THEN 'STANDARD' WHEN sr.sheet_rate IS NOT NULL THEN 'SHEET' ELSE 'NONE' END AS valuation_basis,
-                CASE
-                  WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                       OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
-                    THEN 'CRITICAL'
-                  WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
-                       AND COALESCE(i.reorder_level, 0) > 0
-                    THEN 'BELOW_REORDER'
-                  WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
-                       AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock
-                    THEN 'EXCESS'
-                  ELSE 'NORMAL'
-                END AS stock_status
+                ${STOCK_STATUS_SQL} AS stock_status
           ${baseFrom}
           ${b.where()}
        ) t`,
@@ -421,18 +425,7 @@ router.get(
                COALESCE(po.pending_po_qty, 0) AS pending_grn_qty,
                COALESCE(i.standard_rate, 0) AS standard_rate,
                i.qc_required,
-               CASE
-                 WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                      OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
-                   THEN 'CRITICAL'
-                 WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
-                      AND COALESCE(i.reorder_level, 0) > 0
-                   THEN 'BELOW_REORDER'
-                 WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
-                      AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock
-                   THEN 'EXCESS'
-                 ELSE 'NORMAL'
-               END AS stock_status
+               ${STOCK_STATUS_SQL} AS stock_status
         ${baseFrom}
         ${b.where()}
       ) t
@@ -499,6 +492,14 @@ router.get(
     b.addIn('i.main_group_id', q.mainGroupId);
     b.addIn('i.sub_main_group_id', q.subMainGroupId);
     b.addIn('i.id', q.itemId);
+    // The same filters as the list it exports (the CSV ignored hodId and stockStatus).
+    if (q.hodId && q.hodId.length > 0) {
+      const p = b.push(q.hodId);
+      b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+    }
+    if (q.stockStatus !== 'ALL') {
+      b.addRaw(`(${STOCK_STATUS_SQL}) = ${b.push(q.stockStatus)}`);
+    }
 
     if (q.search) {
       const p = b.push(`%${q.search.toLowerCase()}%`);
@@ -524,16 +525,7 @@ router.get(
              COALESCE(ind.pending_indent_qty, 0) AS pending_indents,
              COALESCE(po.pending_po_qty, 0) AS pending_pos,
              ROUND((i.live_stock_qty * COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0)), 2) AS stock_valuation,
-             CASE
-               WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                 THEN 'CRITICAL'
-               WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
-                 THEN 'BELOW_REORDER'
-               WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
-                    AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock
-                 THEN 'EXCESS'
-               ELSE 'NORMAL'
-             END AS stock_status
+             ${STOCK_STATUS_SQL} AS stock_status
         FROM items i
         LEFT JOIN lookups u ON u.id = i.uom_id
         LEFT JOIN lookups d ON d.id = i.department_id
@@ -567,10 +559,11 @@ router.get(
         ) sr ON TRUE
        ${b.where()}
        ORDER BY i.item_code ASC
-       LIMIT 10000
+       LIMIT ${EXPORT_ROW_CAP + 1}
     `;
 
     const rows = await query<Record<string, unknown>>(selectSql, b.params);
+    refuseTruncatedExport(rows.length);
 
     const headers = [
       'Item Code', 'Item Description', 'Category', 'Opening Stock', 'UOM', 'Department', 'Cost Centre',
@@ -731,7 +724,9 @@ router.get(
       SELECT sl.id, sl.item_id, i.item_code, i.item_description, i.inventory_category AS category,
              COALESCE(u.code, '') AS uom_code,
              sl.txn_type, sl.reference_type, sl.reference_id, sl.reference_no,
-             sl.inward_qty, sl.outward_qty, sl.balance_qty, sl.txn_date,
+             sl.inward_qty, sl.outward_qty, sl.balance_qty,
+             -- A plain date: the CSV printed 'Fri Oct 16 2026 05:30:00 GMT+0530 (India Standard Time)'.
+             to_char(sl.txn_date, 'YYYY-MM-DD') AS txn_date,
              sl.created_at, usr.employee_name AS created_by_name
         FROM stock_ledger sl
         JOIN items i ON i.id = sl.item_id
@@ -739,10 +734,11 @@ router.get(
         LEFT JOIN users usr ON usr.id = sl.created_by
        ${b.where()}
        ORDER BY sl.id DESC
-       LIMIT 10000
+       LIMIT ${EXPORT_ROW_CAP + 1}
     `;
 
     const rows = await query<Record<string, unknown>>(selectSql, b.params);
+    refuseTruncatedExport(rows.length);
 
     const headers = [
       'Date', 'Time', 'Item Code', 'Item Description', 'Category', 'Movement Type',
@@ -1346,6 +1342,15 @@ router.post(
         tx, 'SELECT id, item_code, status FROM auto_indents WHERE id = $1 FOR UPDATE', [id],
       );
       if (!ai) throw NotFoundError('Auto Indent');
+      // A suggestion only moves forward: store approval, then purchase approval. Without
+      // this check a rejected or converted suggestion could be approved again and then
+      // converted a second time into a duplicate indent (2026-10-16 audit).
+      const approvable = isStoreUser && !isPurchaseHead
+        ? ['SUGGESTED', 'PENDING_APPROVAL']
+        : ['SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED'];
+      if (!approvable.includes(ai.status)) {
+        throw BusinessRuleError(`Auto indent for ${ai.item_code} is ${ai.status.replace(/_/g, ' ').toLowerCase()} and cannot be approved now.`);
+      }
 
       let nextStatus = 'APPROVED';
       if (isStoreUser && !isPurchaseHead) {
@@ -1401,6 +1406,9 @@ router.post(
         tx, 'SELECT id, item_code, status FROM auto_indents WHERE id = $1 FOR UPDATE', [id],
       );
       if (!ai) throw NotFoundError('Auto Indent');
+      if (!['SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED', 'PURCHASE_APPROVED', 'APPROVED'].includes(ai.status)) {
+        throw BusinessRuleError(`Auto indent for ${ai.item_code} is ${ai.status.replace(/_/g, ' ').toLowerCase()} and cannot be rejected now.`);
+      }
 
       await tx.query(
         `UPDATE auto_indents
@@ -1455,6 +1463,11 @@ router.post(
       if (ai.status === 'CONVERTED' || ai.status === 'ORDERED') {
         throw BusinessRuleError(`Auto indent for ${ai.item_code} has already been converted.`);
       }
+      // Only a fully approved suggestion becomes an indent; a pending or rejected one
+      // could be converted before (no approval at all).
+      if (ai.status !== 'APPROVED' && ai.status !== 'PURCHASE_APPROVED') {
+        throw BusinessRuleError(`Auto indent for ${ai.item_code} must be approved before it is converted (it is ${ai.status.replace(/_/g, ' ').toLowerCase()}).`);
+      }
 
       // Read item details
       const item = await txQueryOne<{
@@ -1504,6 +1517,13 @@ router.post(
         ],
       );
 
+      // The new indent's approval history starts like any submitted indent's.
+      await tx.query(
+        `INSERT INTO indent_approvals (indent_id, action, actor_user_id, reason, from_status, to_status)
+         VALUES ($1, 'SUBMIT', $2, $3, 'DRAFT', 'PENDING_APPROVAL')`,
+        [indentHeader!.id, req.user!.id, `Converted from auto-indent suggestion for ${ai.item_code}`],
+      );
+
       // Mark auto indent as converted
       await tx.query(
         `UPDATE auto_indents
@@ -1546,6 +1566,47 @@ router.post(
 const categoryParam = z.enum(['RM', 'FG', 'TRADING', 'WIP', 'GENERAL']);
 
 // 1. GET /inventory/categories/:category - Category Stock Register
+/** A category workspace's stock-status rule. The status filters are the exact counterparts
+    of the displayed status, so a row never shows a status its filter does not return. */
+const CAT_CRITICAL = '(ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0))';
+const CAT_BELOW = '(ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0)';
+const CAT_EXCESS = '(ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2))';
+const CAT_STATUS_SQL = `CASE
+          WHEN ${CAT_CRITICAL} THEN 'CRITICAL'
+          WHEN ${CAT_BELOW} THEN 'BELOW_REORDER'
+          WHEN ${CAT_EXCESS} THEN 'EXCESS'
+          ELSE 'NORMAL'
+        END`;
+
+const categoryListSchema = listQuerySchema.extend({
+  status: z.enum(['ALL', 'NORMAL', 'BELOW_REORDER', 'CRITICAL', 'EXCESS', 'ZERO_STOCK', 'POSITIVE_STOCK']).default('ALL'),
+  source: z.enum(['ALL', 'LIVE_SHEET', 'ERP_ONLY']).default('ALL'),
+  mainGroup: z.string().trim().optional(),
+  recon: z.enum(['MATCHED', 'MISMATCH', 'NOT_IN_SHEET', 'ERP_ONLY']).optional(),
+});
+
+/** The category register's WHERE clause, shared by the list and its export (the export
+    ignored every filter: 'RM, zero stock' listed 504 rows and exported 933, 2026-10-16). */
+function categoryItemFilter(category: string, q: z.infer<typeof categoryListSchema>): { b: SqlBuilder; whereClause: string } {
+  const b = new SqlBuilder();
+  let whereClause = `ii.category = ${b.push(category)} AND ii.deleted_at IS NULL`;
+  if (q.search) {
+    const s = b.push(`%${q.search}%`);
+    whereClause += ` AND (ii.item_code ILIKE ${s} OR ii.item_description ILIKE ${s} OR ii.rack_id ILIKE ${s})`;
+  }
+  if (q.source === 'LIVE_SHEET') whereClause += ' AND ii.source_spreadsheet_id IS NOT NULL';
+  else if (q.source === 'ERP_ONLY') whereClause += ' AND ii.source_spreadsheet_id IS NULL';
+  if (q.mainGroup) whereClause += ` AND ii.main_group = ${b.push(q.mainGroup)}`;
+  if (q.recon) whereClause += ` AND ii.recon_status = ${b.push(q.recon)}`;
+  if (q.status === 'CRITICAL') whereClause += ` AND ${CAT_CRITICAL}`;
+  else if (q.status === 'BELOW_REORDER') whereClause += ` AND NOT ${CAT_CRITICAL} AND ${CAT_BELOW}`;
+  else if (q.status === 'EXCESS') whereClause += ` AND NOT ${CAT_CRITICAL} AND NOT ${CAT_BELOW} AND ${CAT_EXCESS}`;
+  else if (q.status === 'NORMAL') whereClause += ` AND NOT ${CAT_CRITICAL} AND NOT ${CAT_BELOW} AND NOT ${CAT_EXCESS}`;
+  else if (q.status === 'ZERO_STOCK') whereClause += ' AND ii.live_stock_qty = 0';
+  else if (q.status === 'POSITIVE_STOCK') whereClause += ' AND ii.live_stock_qty > 0';
+  return { b, whereClause };
+}
+
 router.get(
   '/categories/:category',
   requirePermission('inventory.view'),
@@ -1557,52 +1618,8 @@ router.get(
     }
     const category = parseCat.data;
 
-    const q = listQuerySchema.extend({
-      status: z.enum(['ALL', 'NORMAL', 'BELOW_REORDER', 'CRITICAL', 'EXCESS', 'ZERO_STOCK', 'POSITIVE_STOCK']).default('ALL'),
-      source: z.enum(['ALL', 'LIVE_SHEET', 'ERP_ONLY']).default('ALL'),
-      mainGroup: z.string().trim().optional(),
-      recon: z.enum(['MATCHED', 'MISMATCH', 'NOT_IN_SHEET', 'ERP_ONLY']).optional(),
-    }).parse(req.query);
-
-    const b = new SqlBuilder();
-    const catParam = b.push(category);
-    let whereClause = `ii.category = ${catParam} AND ii.deleted_at IS NULL`;
-
-    if (q.search) {
-      const s = b.push(`%${q.search}%`);
-      whereClause += ` AND (ii.item_code ILIKE ${s} OR ii.item_description ILIKE ${s} OR ii.rack_id ILIKE ${s})`;
-    }
-
-    if (q.source === 'LIVE_SHEET') {
-      whereClause += ` AND ii.source_spreadsheet_id IS NOT NULL`;
-    } else if (q.source === 'ERP_ONLY') {
-      whereClause += ` AND ii.source_spreadsheet_id IS NULL`;
-    }
-
-    if (q.mainGroup) {
-      const mg = b.push(q.mainGroup);
-      whereClause += ` AND ii.main_group = ${mg}`;
-    }
-
-    if (q.recon) {
-      whereClause += ` AND ii.recon_status = ${b.push(q.recon)}`;
-    }
-
-    if (q.status !== 'ALL') {
-      if (q.status === 'CRITICAL') {
-        whereClause += ` AND (ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0))`;
-      } else if (q.status === 'BELOW_REORDER') {
-        whereClause += ` AND (ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 AND NOT (ii.available_qty < ii.min_stock_level))`;
-      } else if (q.status === 'EXCESS') {
-        whereClause += ` AND (ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2))`;
-      } else if (q.status === 'NORMAL') {
-        whereClause += ` AND (ii.available_qty > ii.reorder_point OR (ii.reorder_point = 0 AND ii.available_qty > ii.min_stock_level))`;
-      } else if (q.status === 'ZERO_STOCK') {
-        whereClause += ` AND ii.live_stock_qty = 0`;
-      } else if (q.status === 'POSITIVE_STOCK') {
-        whereClause += ` AND ii.live_stock_qty > 0`;
-      }
-    }
+    const q = categoryListSchema.parse(req.query);
+    const { b, whereClause } = categoryItemFilter(category, q);
 
     const countSql = `SELECT COUNT(*)::int AS count FROM inventory_items ii WHERE ${whereClause}`;
     const totalRow = await queryOne<{ count: number }>(countSql, b.params);
@@ -1649,12 +1666,7 @@ router.get(
         ii.computed_stock_qty,
         ii.recon_status,
         ii.recon_note,
-        CASE
-          WHEN ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
-          WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 THEN 'BELOW_REORDER'
-          WHEN ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2) THEN 'EXCESS'
-          ELSE 'NORMAL'
-        END AS stock_status
+        ${CAT_STATUS_SQL} AS stock_status
       FROM inventory_items ii
       WHERE ${whereClause}
       ORDER BY ${sortCol} ${sortDir}
@@ -1821,6 +1833,8 @@ router.get(
       throw ValidationError(`Invalid inventory category "${req.params.category}".`);
     }
     const category = parseCat.data;
+    const q = categoryListSchema.parse(req.query);
+    const { b, whereClause } = categoryItemFilter(category, q);
 
     const rows = await query<any>(
       `SELECT
@@ -1834,20 +1848,15 @@ router.get(
          ii.weight_per_1000pc_kg,
          ii.unit_price,
          ROUND((ii.live_stock_qty * COALESCE(ii.unit_price, 0)), 2) AS valuation,
-         CASE
-           WHEN ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
-           WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 THEN 'BELOW_REORDER'
-           WHEN ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2) THEN 'EXCESS'
-           ELSE 'NORMAL'
-         END AS stock_status,
+         ${CAT_STATUS_SQL} AS stock_status,
          CASE WHEN ii.source_spreadsheet_id IS NOT NULL THEN 'LIVE_SHEET' ELSE 'ERP_ONLY' END AS origin,
          ii.source_tab,
          ii.source_row_index,
          ii.last_sync_at
        FROM inventory_items ii
-       WHERE ii.category = $1 AND ii.deleted_at IS NULL
+       WHERE ${whereClause}
        ORDER BY ii.item_code ASC`,
-      [category],
+      b.params,
     );
 
     const headers = [
