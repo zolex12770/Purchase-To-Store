@@ -162,7 +162,10 @@ describe('requisition issue slips can be reversed', () => {
     expect((await reverse(req.id, slip2.id, 'Issued in error', buyerToken)).status).toBe(403);
     expect((await reverse(req.id, slip2.id, 'oops')).status).toBe(422);
     // The slip must belong to the requisition named in the URL.
-    expect((await reverse(req.id + 9999, slip2.id, 'Issued in error')).status).toBe(404);
+    const other = await approvedRequisition(itemId, '1');
+    const wrongRequisition = await reverse(other.id, slip2.id, 'Issued in error');
+    expect(wrongRequisition.status).toBe(404);
+    expect(wrongRequisition.body.error.message).toMatch(/issue slip/i);
     expect(await stockOf(itemId)).toBe(40);
   });
 
@@ -400,6 +403,14 @@ describe('controlled ledger-only void of the 2026-10-14 test chain', () => {
     expect(dry.body.data.documents.map((d: { number: string; status: string; becomes: string }) => [d.number, d.status, d.becomes])).toEqual([
       [dir.no, 'ISSUED', 'CANCELLED'], [slip.no, 'POSTED', 'REVERSED'], [grn.grnNo, 'POSTED', 'CANCELLED'],
     ]);
+    // Per document too: each line's ledger balance before and after its row, and live stock.
+    expect(dry.body.data.documents[0].lines).toEqual([expect.objectContaining({
+      itemId, txnType: 'DIRECT_ISSUE_REVERSAL', ledgerBalanceBefore: '17.0000', ledgerBalanceAfter: '18.0000', liveStock: '3.0000',
+    })]);
+    expect(dry.body.data.documents[2].lines).toEqual([expect.objectContaining({
+      txnType: 'GRN_REVERSAL', outwardQty: '20.0000', ledgerBalanceBefore: '23.0000', ledgerBalanceAfter: '3.0000', liveStock: '3.0000',
+    })]);
+    expect(dry.body.data.documents[1].ledger).toEqual([{ itemId, documentNet: '-5.0000', ledgerNet: '-5.0000' }]);
     // The hash is of the plan, not of the order the documents were listed in.
     const reordered = await request(app).post(url).set(auth(adminToken))
       .send({ documents: [...chain()].reverse(), reason: REASON });

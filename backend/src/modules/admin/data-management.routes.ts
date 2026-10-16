@@ -1358,6 +1358,8 @@ const voidTestDocumentsSchema = z.object({
 });
 
 function presentVoidPlan(plan: VoidPlan) {
+  // Each document line also carries its item's live stock, so a document reads on its own.
+  const liveOf = new Map(plan.items.map((i) => [i.itemId, i.liveStock]));
   return {
     selectionHash: plan.selectionHash,
     canApply: plan.canApply,
@@ -1367,7 +1369,9 @@ function presentVoidPlan(plan: VoidPlan) {
       type: d.type, number: d.number, id: d.id, status: d.status, becomes: d.becomes, requisitionNo: d.requisitionNo,
       lines: d.lines.map((l) => ({
         itemId: l.itemId, itemCode: l.itemCode, qty: l.qty, txnType: l.txnType,
-        inwardQty: l.inwardQty, outwardQty: l.outwardQty, ledgerBalanceAfter: l.balanceQty,
+        inwardQty: l.inwardQty, outwardQty: l.outwardQty,
+        ledgerBalanceBefore: l.balanceBeforeQty, ledgerBalanceAfter: l.balanceQty,
+        liveStock: liveOf.get(l.itemId) ?? null,
       })),
       ledger: d.ledger,
       blockers: d.blockers,

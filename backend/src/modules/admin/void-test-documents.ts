@@ -57,7 +57,8 @@ export interface VoidLine {
   txnType: (typeof REVERSAL_TYPE)[VoidDocumentType];
   inwardQty: string;
   outwardQty: string;
-  /** Running ledger balance after this line's reversal row; set once the plan is ordered. */
+  /** Running ledger balance before and after this line's reversal row; set once the plan is ordered. */
+  balanceBeforeQty: string | null;
   balanceQty: string | null;
   // Copied onto a GRN_REVERSAL row exactly as reverseGrnLine does.
   grnLineId: number | null;
@@ -126,7 +127,8 @@ function reversalLine(
   return {
     itemId: Number(l.item_id), itemCode: l.item_code, uomId: l.uom_id == null ? null : Number(l.uom_id),
     qty: toQty(qty), txnType: REVERSAL_TYPE[type],
-    inwardQty: inward ? toQty(qty) : toQty(0), outwardQty: inward ? toQty(0) : toQty(qty), balanceQty: null,
+    inwardQty: inward ? toQty(qty) : toQty(0), outwardQty: inward ? toQty(0) : toQty(qty),
+    balanceBeforeQty: null, balanceQty: null,
     grnLineId: grn ? Number(grn.id) : null, mlnNo: grn?.mln_no ?? '',
     poLineId: grn?.po_line_id == null ? null : Number(grn.po_line_id), batchNo: grn?.batch_no ?? '',
   };
@@ -305,8 +307,10 @@ export async function planTestDocumentVoid(
     for (const l of d.lines) {
       const item = items.get(l.itemId);
       if (!item || !dec(l.qty).greaterThan(0)) continue;
-      const next = running.get(l.itemId)!.plus(dec(l.inwardQty)).minus(dec(l.outwardQty));
+      const before = running.get(l.itemId)!;
+      const next = before.plus(dec(l.inwardQty)).minus(dec(l.outwardQty));
       running.set(l.itemId, next);
+      l.balanceBeforeQty = toQty(before);
       l.balanceQty = toQty(next);
       item.rows.push({ document: d.number, txnType: l.txnType, inwardQty: l.inwardQty, outwardQty: l.outwardQty, balanceQty: l.balanceQty });
     }
