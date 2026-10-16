@@ -479,13 +479,23 @@ describe('controlled ledger-only void of the 2026-10-14 test chain', () => {
     expect((await query<{ status: string }>('SELECT status FROM purchase_order_headers WHERE id = $1', [poId]))[0]!.status).toBe('OPEN');
     expect((await requisition(req.id)).status).toBe('APPROVED');
 
-    const audit = await query<{ entity: string; entity_label: string }>(
-      `SELECT entity, entity_label FROM audit_logs WHERE action = 'CANCEL' AND entity_label = ANY($1::text[]) ORDER BY id`,
+    const audit = await query<{ entity: string; entity_label: string; before_data: Record<string, unknown>; after_data: Record<string, unknown> }>(
+      `SELECT entity, entity_label, before_data, after_data FROM audit_logs
+        WHERE action = 'CANCEL' AND entity_label = ANY($1::text[]) ORDER BY id`,
       [[grn.grnNo, slip.no, dir.no]],
     );
     expect(audit.map((a) => [a.entity, a.entity_label])).toEqual([
       ['direct_issue', dir.no], ['requisition_issue', slip.no], ['grn', grn.grnNo],
     ]);
+    // Each entry has before/after, and the status change the document's void caused downstream.
+    expect(audit[0]!.before_data).toMatchObject({ status: 'ISSUED' });
+    expect(audit[0]!.after_data).toMatchObject({ status: 'CANCELLED', ledgerOnly: true, liveStockChanged: false });
+    expect(audit[1]!.after_data).toMatchObject({
+      status: 'REVERSED', requisition: { requisitionNo: req.no, from: 'FULLY_ISSUED', to: 'APPROVED' },
+    });
+    expect(audit[2]!.after_data).toMatchObject({
+      status: 'CANCELLED', purchaseOrders: [expect.objectContaining({ from: 'PARTIALLY_RECEIVED', to: 'OPEN' })],
+    });
     const recon = await request(app).get(api('/items/analysis/stock-reconciliation')).query({ search: 'TREV2-1161480001' }).set(auth(adminToken));
     expect(recon.body.data[0]).toMatchObject({ mismatch: false });
   });

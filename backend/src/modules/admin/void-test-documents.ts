@@ -31,6 +31,7 @@ import { dec, toQty } from '../../domain/money.js';
 import { usableQtyOf, appendLedgerOnlyReversal } from '../../domain/stock.js';
 import { recomputeRequisitionStatus } from '../../domain/quantities.js';
 import { auditIn, type AuditActor } from '../../core/audit.js';
+import { ServerError } from '../../core/errors.js';
 
 export const VOID_DOCUMENT_TYPES = ['GRN', 'REQUISITION_ISSUE', 'DIRECT_ISSUE'] as const;
 export type VoidDocumentType = (typeof VOID_DOCUMENT_TYPES)[number];
@@ -342,16 +343,18 @@ export async function planTestDocumentVoid(
 
 /**
  * Writes a plan that has passed every check: marks each document, appends its
- * ledger-only reversal rows, re-derives the affected PO and requisition statuses,
- * audits each document, and finally re-proves ledger = live for every item.
+ * ledger-only reversal rows, re-derives the PO or requisition status it fed,
+ * audits each document with that knock-on change, and finally re-proves
+ * ledger = live for every item.
  */
 export async function applyTestDocumentVoid(
   tx: Queryable,
   plan: VoidPlan,
   ctx: { reason: string; userId: number; actor: AuditActor; date: string },
 ): Promise<{ poStatusesRederived: number; requisitionStatuses: { requisitionNo: string; from: string; to: string }[] }> {
-  const poIds = new Set<number>();
-  const requisitions = new Map<number, string>();
+  const { recomputePoStatuses } = await import('../google-sync/engine.js');
+  let poStatusesRederived = 0;
+  const requisitionStatuses: { requisitionNo: string; from: string; to: string }[] = [];
 
   for (const d of plan.documents) {
     const id = d.id!;
@@ -363,14 +366,12 @@ export async function applyTestDocumentVoid(
           WHERE id = $1`,
         [id, ctx.userId, ctx.reason],
       );
-      d.poIds.forEach((p) => poIds.add(p));
     } else if (d.type === 'REQUISITION_ISSUE') {
       await tx.query(
         `UPDATE requisition_issues SET status = 'REVERSED', reversed_at = now(), reversed_by = $2, reversal_reason = $3
           WHERE id = $1`,
         [id, ctx.userId, ctx.reason],
       );
-      requisitions.set(d.requisitionId!, d.requisitionNo!);
     } else {
       await tx.query(
         `UPDATE direct_issue_headers SET status = 'CANCELLED', cancelled_at = now(), cancelled_by = $2,
@@ -388,6 +389,24 @@ export async function applyTestDocumentVoid(
         batchNo: l.batchNo, txnDate: ctx.date, userId: ctx.userId,
       });
     }
+
+    // Re-derive what this document fed right away, so its own audit entry records
+    // the knock-on status change (as the GRN cancel and slip reversal routes do).
+    const knockOn: Record<string, unknown> = {};
+    if (d.type === 'GRN' && d.poIds.length > 0) {
+      // A cancelled GRN no longer counts as received (v_po_line_balance), so its POs fall back.
+      const poStatuses = () => txQuery<{ po_no: string; status: string }>(
+        tx, 'SELECT po_no, status FROM purchase_order_headers WHERE id = ANY($1::bigint[]) ORDER BY id', [d.poIds],
+      );
+      const before = await poStatuses();
+      poStatusesRederived += await recomputePoStatuses(tx, d.poIds);
+      knockOn.purchaseOrders = (await poStatuses()).map((p, i) => ({ poNo: p.po_no, from: before[i]?.status, to: p.status }));
+    } else if (d.type === 'REQUISITION_ISSUE') {
+      const r = await recomputeRequisitionStatus(tx, d.requisitionId!, ctx.userId);
+      requisitionStatuses.push({ requisitionNo: d.requisitionNo!, from: r.from, to: r.to });
+      knockOn.requisition = { requisitionNo: d.requisitionNo, from: r.from, to: r.to };
+    }
+
     await auditIn(tx, {
       actor: ctx.actor, action: 'CANCEL', entity: AUDIT_ENTITY[d.type], entityId: id, entityLabel: d.number,
       before: { status: d.status, ledger: d.ledger },
@@ -395,19 +414,11 @@ export async function applyTestDocumentVoid(
         status: d.becomes, reason: ctx.reason, ledgerOnly: true, liveStockChanged: false,
         reversalRows: d.lines.filter((l) => l.balanceQty !== null)
           .map((l) => ({ item: l.itemCode, txnType: l.txnType, inwardQty: l.inwardQty, outwardQty: l.outwardQty, ledgerBalance: l.balanceQty })),
+        ...knockOn,
         selectionHash: plan.selectionHash,
       },
       message: `${d.number} voided as a test document (ledger only; live stock unchanged, it already excluded this document). Reason: ${ctx.reason}`,
     });
-  }
-
-  // A cancelled GRN no longer counts as received (v_po_line_balance), so its POs fall back.
-  const { recomputePoStatuses } = await import('../google-sync/engine.js');
-  const poStatusesRederived = poIds.size > 0 ? await recomputePoStatuses(tx, [...poIds]) : 0;
-  const requisitionStatuses: { requisitionNo: string; from: string; to: string }[] = [];
-  for (const [requisitionId, requisitionNo] of requisitions) {
-    const r = await recomputeRequisitionStatus(tx, requisitionId, ctx.userId);
-    requisitionStatuses.push({ requisitionNo, from: r.from, to: r.to });
   }
 
   // Belt and braces: re-read what was written. Any drift rolls the whole void back.
@@ -419,7 +430,8 @@ export async function applyTestDocumentVoid(
       [item.itemId],
     );
     if (!after || dec(after.ledger_sum).minus(dec(after.live)).abs().greaterThan(TOLERANCE) || !dec(after.live).equals(dec(item.liveStock))) {
-      throw new Error(`Void check failed for ${item.itemCode}: ledger ${after?.ledger_sum}, live ${after?.live}; nothing was written.`);
+      // Cannot happen with the plan checked under lock in this same transaction — a bug, not a user error.
+      throw ServerError(`Void check failed for ${item.itemCode}: ledger ${after?.ledger_sum}, live ${after?.live}; nothing was written.`);
     }
   }
   return { poStatusesRederived, requisitionStatuses };
