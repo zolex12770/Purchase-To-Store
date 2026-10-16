@@ -274,6 +274,9 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
   const [txnPage, setTxnPage] = useState(1);
   const [txnPageSize, setTxnPageSize] = useState(25);
   const [txnSearch, setTxnSearch] = useState('');
+  const [txnShowReversed, setTxnShowReversed] = useState(false);
+  const [reversingTxn, setReversingTxn] = useState<CategoryTxnRow | null>(null);
+  const [txnReverseReason, setTxnReverseReason] = useState('');
 
   // Movement Modal State
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(false);
@@ -321,7 +324,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
   // Each sheet sub-tab lists exactly that sheet tab's counted rows; "Entered in ERP" lists the
   // movements recorded in this system — together they add up to the cards above.
   const txnParams = currentSubTabDef.type === 'erp'
-    ? { page: txnPage, pageSize: txnPageSize, search: txnSearch || undefined, origin: 'ERP' }
+    ? { page: txnPage, pageSize: txnPageSize, search: txnSearch || undefined, origin: 'ERP', status: txnShowReversed ? 'ALL' : undefined }
     : {
         page: txnPage,
         pageSize: txnPageSize,
@@ -405,6 +408,23 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
       void qc.invalidateQueries({ queryKey: ['inventory-overview'] });
     },
     onError: (err) => toast.fromError(err, 'Failed to record stock movement'),
+  });
+
+  // 6. Reverse a movement entered in the ERP (the sheet's own rows change only in the sheet)
+  const reverseTxnMutation = useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post<{ message: string }>(`/inventory/transactions/${id}/reverse`, { reason }),
+    onSuccess: (res) => {
+      toast.success(res.message);
+      setReversingTxn(null);
+      setTxnReverseReason('');
+      void qc.invalidateQueries({ queryKey: ['inventory-category-summary', category] });
+      void qc.invalidateQueries({ queryKey: ['inventory-category-items', category] });
+      void qc.invalidateQueries({ queryKey: ['inventory-category-txns', category] });
+      void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-overview'] });
+    },
+    onError: (err) => toast.fromError(err, 'Failed to reverse the movement'),
   });
 
   const openMoveModal = (
@@ -682,7 +702,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
 
   // Transaction Columns (Inward / Outward tabs)
   const txnColumns = useMemo<Column<CategoryTxnRow>[]>(() => {
-    return [
+    const cols: Column<CategoryTxnRow>[] = [
       {
         key: 'txn_date',
         header: 'Date',
@@ -795,7 +815,33 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         ),
       },
     ];
-  }, []);
+    if (currentSubTabDef.type !== 'erp') return cols;
+    cols.push({
+      key: 'status',
+      header: 'Status',
+      render: (r) =>
+        r.status === 'REVERSED' ? (
+          <div style={{ fontSize: '11px' }}>
+            <Badge tone="neutral">Reversed</Badge>
+            {r.reversal_reason && <div style={{ color: 'var(--text-faint)', marginTop: 2 }}>{r.reversal_reason}</div>}
+          </div>
+        ) : can('inventory.adjust') ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setReversingTxn(r);
+              setTxnReverseReason('');
+            }}
+          >
+            Reverse
+          </Button>
+        ) : (
+          <Badge tone="success">Posted</Badge>
+        ),
+    });
+    return cols;
+  }, [currentSubTabDef.type, can]);
 
   const stats = summaryData?.stats;
   const lastSync = summaryData?.lastSync;
@@ -1218,6 +1264,20 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                 </Button>
               )}
 
+              {currentSubTabDef.type === 'erp' && (
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
+                  <input
+                    type="checkbox"
+                    checked={txnShowReversed}
+                    onChange={(e) => {
+                      setTxnShowReversed(e.target.checked);
+                      setTxnPage(1);
+                    }}
+                  />
+                  Show reversed movements
+                </label>
+              )}
+
               <span style={{ marginLeft: 'auto', fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
                 <strong>{count(txnsData?.meta?.total ?? 0)}</strong> transactions recorded
               </span>
@@ -1236,6 +1296,41 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
             />
           </CardBody>
         </Card>
+      )}
+
+      {/* ── Reverse a movement entered in the ERP ───────────────────────── */}
+      {reversingTxn && (
+        <Modal
+          open={Boolean(reversingTxn)}
+          onClose={() => setReversingTxn(null)}
+          title={`Reverse ${reversingTxn.txn_no}`}
+          subtitle={`${reversingTxn.item_code}: ${reversingTxn.direction === 'IN' ? '+' : '-'}${qty(reversingTxn.quantity)} ${toShortUom(reversingTxn.uom)} is undone with a reversal entry. The movement stays on record, marked reversed.`}
+          footer={
+            <div className="row" style={{ gap: 'var(--sp-2)', justifyContent: 'flex-end', width: '100%' }}>
+              <Button variant="ghost" onClick={() => setReversingTxn(null)}>
+                Keep it
+              </Button>
+              <Button
+                variant="danger"
+                disabled={txnReverseReason.trim().length < 5}
+                loading={reverseTxnMutation.isPending}
+                onClick={() => reverseTxnMutation.mutate({ id: reversingTxn.id, reason: txnReverseReason.trim() })}
+              >
+                Reverse movement
+              </Button>
+            </div>
+          }
+        >
+          <Field label="Why is it being reversed?" required hint="At least 5 characters. Saved in the audit log.">
+            <Textarea
+              placeholder="e.g. Receipt was entered twice"
+              value={txnReverseReason}
+              onChange={(e) => setTxnReverseReason(e.target.value)}
+              rows={3}
+              autoFocus
+            />
+          </Field>
+        </Modal>
       )}
 
       {/* ── 4. Quick Movement Modal ────────────────────────────────────── */}

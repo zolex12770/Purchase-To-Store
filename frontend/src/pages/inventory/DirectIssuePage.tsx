@@ -20,7 +20,7 @@ import { PageHeader } from '../../layout/AppShell';
 import { DataTable, type Column } from '../../components/DataTable';
 import { StatTile } from '../../components/KpiCard';
 import {
-  Button, Card, CardBody, Badge, Modal,
+  Button, Card, CardBody, Badge, Modal, Field, Textarea,
 } from '../../components/ui';
 import { qty, formatDate, count, toShortUom } from '../../lib/format';
 import { useLookupOptions, useUserOptions, type ItemOption } from '../../lib/masters';
@@ -44,6 +44,9 @@ interface DirectIssueHeader {
   item_count: number;
   created_by_name: string;
   created_at: string;
+  status?: 'ISSUED' | 'CANCELLED';
+  cancel_reason?: string;
+  cancelled_at?: string | null;
 }
 
 interface DirectIssueDetail extends DirectIssueHeader {
@@ -147,6 +150,21 @@ export default function DirectIssuePage() {
       void qc.invalidateQueries({ queryKey: ['direct-issues'] });
     },
     onError: (err) => toast.fromError(err, 'Failed to post direct issue'),
+  });
+
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+  const cancelMutation = useMutation({
+    mutationFn: (p: { id: number; reason: string }) =>
+      api.post<{ message: string }>(`/inventory/direct-issues/${p.id}/cancel`, { reason: p.reason }),
+    onSuccess: (res) => {
+      toast.success(res.message);
+      setCancelOpen(false);
+      void refetch();
+      void qc.invalidateQueries({ queryKey: ['direct-issue-detail'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
+    },
+    onError: (err) => toast.fromError(err, 'Could not cancel the issue'),
   });
 
   const resetDraftForm = () => {
@@ -287,6 +305,14 @@ export default function DirectIssuePage() {
       ),
     },
     {
+      key: 'status',
+      header: 'Status',
+      width: '110px',
+      render: (r) => r.status === 'CANCELLED'
+        ? <span title={r.cancel_reason || undefined}><Badge tone="danger">Cancelled</Badge></span>
+        : <Badge tone="success" plain>Issued</Badge>,
+    },
+    {
       key: 'issue_date',
       header: 'Date & Time',
       width: '130px',
@@ -374,7 +400,7 @@ export default function DirectIssuePage() {
         title="Direct Issue from Store"
         subtitle="Issue materials directly from store with instant stock deduction and ledger audit."
         actions={
-          (can('direct_issue.create') || can('store.issue') || can('requisition.issue') || can('system.admin')) ? (
+          can('direct_issue.create') ? (
             <Button
               variant="primary"
               icon={<Plus size={15} />}
@@ -780,7 +806,18 @@ export default function DirectIssuePage() {
               </tfoot>
             </table>
 
+            {detailData.status === 'CANCELLED' && (
+              <div style={{ marginTop: 10, padding: '8px 12px', borderRadius: 'var(--radius-sm)', background: 'var(--danger-50)', color: 'var(--danger-700)', fontSize: 'var(--text-xs)' }}>
+                <strong>Cancelled</strong>{detailData.cancelled_at ? ` on ${formatDate(detailData.cancelled_at)}` : ''} — stock returned. Reason: {detailData.cancel_reason || '—'}
+              </div>
+            )}
+
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+              {can('direct_issue.create') && detailData.status !== 'CANCELLED' && (
+                <Button variant="danger" onClick={() => { setCancelReason(''); setCancelOpen(true); }}>
+                  Cancel issue
+                </Button>
+              )}
               <Button
                 variant="secondary"
                 icon={<Printer size={14} />}
@@ -795,6 +832,30 @@ export default function DirectIssuePage() {
           </div>
         ) : null}
       </Modal>
+
+      {cancelOpen && detailData && (
+        <Modal
+          title={`Cancel ${detailData.issue_no}?`}
+          subtitle="Every line goes back into stock. The issue stays in the register, marked Cancelled."
+          open={cancelOpen}
+          onClose={() => setCancelOpen(false)}
+        >
+          <Field label="Why is this issue being cancelled?" required>
+            <Textarea rows={3} value={cancelReason} onChange={(e) => setCancelReason(e.target.value)} placeholder="e.g. Issued to the wrong department" />
+          </Field>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+            <Button variant="ghost" onClick={() => setCancelOpen(false)}>Keep the issue</Button>
+            <Button
+              variant="danger"
+              loading={cancelMutation.isPending}
+              disabled={cancelReason.trim().length < 5}
+              onClick={() => cancelMutation.mutate({ id: detailData.id, reason: cancelReason.trim() })}
+            >
+              Cancel issue
+            </Button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

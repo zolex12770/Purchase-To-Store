@@ -166,6 +166,8 @@ interface AdjustmentRow {
   approver_name: string;
   created_by_name: string;
   created_at: string;
+  reversed_at?: string | null;
+  reversal_reason?: string | null;
 }
 
 interface RequisitionQueueRow {
@@ -341,6 +343,8 @@ export default function InventoryStockPage() {
   const [adjReason, setAdjReason] = useState<string>('Cycle Count Reconciliation');
   const [adjFindings, setAdjFindings] = useState<string>('');
   const [adjRemarks, setAdjRemarks] = useState<string>('');
+  const [reversingAdj, setReversingAdj] = useState<AdjustmentRow | null>(null);
+  const [reverseReason, setReverseReason] = useState('');
 
   // Requisition Queue
   const [reqQueueSearch, setReqQueueSearch] = useState('');
@@ -499,6 +503,22 @@ export default function InventoryStockPage() {
       void qc.invalidateQueries({ queryKey: ['inventory-overview'] });
     },
     onError: (err) => toast.fromError(err, 'Failed to post physical stock adjustment'),
+  });
+
+  // Stock Adjustment Reverse — undoes the count through its own reversal ledger entry
+  const reverseAdjMutation = useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post<{ message: string }>(`/inventory/adjustments/${id}/reverse`, { reason }),
+    onSuccess: (res) => {
+      toast.success(res.message);
+      setReversingAdj(null);
+      setReverseReason('');
+      void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-ledger'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-adjustments'] });
+      void qc.invalidateQueries({ queryKey: ['inventory-overview'] });
+    },
+    onError: (err) => toast.fromError(err, 'Failed to reverse the adjustment'),
   });
 
   // Auto Indent Scan
@@ -941,6 +961,30 @@ export default function InventoryStockPage() {
           <div style={{ color: 'var(--text-faint)', fontSize: '10px' }}>{formatDateTime(r.created_at)}</div>
         </div>
       ),
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      render: (r) =>
+        r.reversed_at ? (
+          <div style={{ fontSize: 'var(--text-xs)' }}>
+            <Badge tone="neutral">Reversed</Badge>
+            {r.reversal_reason && <div style={{ color: 'var(--text-faint)', marginTop: 2 }}>{r.reversal_reason}</div>}
+          </div>
+        ) : can('inventory.adjust') ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setReversingAdj(r);
+              setReverseReason('');
+            }}
+          >
+            Reverse
+          </Button>
+        ) : (
+          <Badge tone="success">Posted</Badge>
+        ),
     },
   ];
 
@@ -2309,6 +2353,41 @@ export default function InventoryStockPage() {
               </>
             )}
           </div>
+        </Modal>
+      )}
+
+      {/* ── MODAL: REVERSE A STOCK ADJUSTMENT ─────────────────────────────────── */}
+      {reversingAdj && (
+        <Modal
+          open={Boolean(reversingAdj)}
+          onClose={() => setReversingAdj(null)}
+          title={`Reverse adjustment ${reversingAdj.adjustment_no}`}
+          subtitle={`${reversingAdj.item_code}: the variance of ${qty(reversingAdj.adjustment_qty)} is undone with a reversal entry. The adjustment stays on record, marked reversed.`}
+          footer={
+            <div className="row" style={{ gap: 'var(--sp-2)', justifyContent: 'flex-end', width: '100%' }}>
+              <Button variant="ghost" onClick={() => setReversingAdj(null)}>
+                Keep it
+              </Button>
+              <Button
+                variant="danger"
+                disabled={reverseReason.trim().length < 5}
+                loading={reverseAdjMutation.isPending}
+                onClick={() => reverseAdjMutation.mutate({ id: reversingAdj.id, reason: reverseReason.trim() })}
+              >
+                Reverse adjustment
+              </Button>
+            </div>
+          }
+        >
+          <Field label="Why is it being reversed?" required hint="At least 5 characters. Saved in the audit log.">
+            <Textarea
+              placeholder="e.g. Count was entered against the wrong item"
+              value={reverseReason}
+              onChange={(e) => setReverseReason(e.target.value)}
+              rows={3}
+              autoFocus
+            />
+          </Field>
         </Modal>
       )}
 
