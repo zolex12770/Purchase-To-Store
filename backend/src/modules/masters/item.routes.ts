@@ -193,8 +193,12 @@ router.get(
     // other entry as a false mismatch. The report covers inactive items too
     // (2026-10-16: 305 of the 2,769 mismatches were inactive items), so the meta
     // splits the count.
-    const rows = await query<Record<string, string> & { is_active: boolean }>(
+    // The mismatch rule is evaluated on the exact numerics: in floating point a
+    // difference of exactly 0.0001 on a large figure (1,000,000.0001 vs 1,000,000)
+    // reads as more than 0.0001.
+    const rows = await query<Record<string, string> & { is_active: boolean; mismatch: boolean }>(
       `SELECT i.id, i.item_code, i.item_description, u.code AS uom_code, i.live_stock_qty, i.is_active,
+              abs(COALESCE(l.balance, 0) - i.live_stock_qty) > 0.0001 AS mismatch,
               COALESCE(l.grn_inward, 0)              AS grn_inward,
               COALESCE(l.grn_reversal, 0)             AS grn_reversal,
               COALESCE(l.requisition_issue, 0)        AS requisition_issue,
@@ -228,20 +232,16 @@ router.get(
     );
 
     const data = rows
-      .map((r) => {
-        const computed = Number(r.computed_balance);
-        const current = Number(r.live_stock_qty);
-        return {
-          id: Number(r.id), item_code: r.item_code, item_description: r.item_description, uom_code: r.uom_code,
-          is_active: r.is_active,
-          grn_inward: r.grn_inward, grn_reversal: r.grn_reversal,
-          requisition_issue: r.requisition_issue, requisition_reversal: r.requisition_reversal,
-          direct_issue_net: r.direct_issue_net, adjustment_net: r.adjustment_net,
-          inventory_net: r.inventory_net, sheet_sync_net: r.sheet_sync_net, alignment_net: r.alignment_net,
-          computed_balance: r.computed_balance, current_stock: r.live_stock_qty,
-          mismatch: Math.abs(computed - current) > 0.0001,
-        };
-      })
+      .map((r) => ({
+        id: Number(r.id), item_code: r.item_code, item_description: r.item_description, uom_code: r.uom_code,
+        is_active: r.is_active,
+        grn_inward: r.grn_inward, grn_reversal: r.grn_reversal,
+        requisition_issue: r.requisition_issue, requisition_reversal: r.requisition_reversal,
+        direct_issue_net: r.direct_issue_net, adjustment_net: r.adjustment_net,
+        inventory_net: r.inventory_net, sheet_sync_net: r.sheet_sync_net, alignment_net: r.alignment_net,
+        computed_balance: r.computed_balance, current_stock: r.live_stock_qty,
+        mismatch: r.mismatch,
+      }))
       .filter((r) => q.mismatchOnly !== 'true' || r.mismatch);
 
     const order = resolveSort(q, { itemCode: 'item_code' }, 'itemCode');
