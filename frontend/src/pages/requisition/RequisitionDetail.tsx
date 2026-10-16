@@ -8,6 +8,8 @@
  * piece: issue qty is capped ONLY by current stock server-side, never by the
  * requested quantity — this screen shows a non-blocking warning (Rule 23) when
  * a typed issue quantity exceeds what remains pending, but never blocks it.
+ * A Store user can reverse an issue slip (with a reason): its material goes
+ * back to stock and the slip stays in the history, marked Reversed.
  */
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
@@ -472,7 +474,13 @@ export default function RequisitionDetail() {
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: 'var(--sp-4)' }}>
         <Card>
-          <CardHeader icon={<PackageCheck size={15} />} title="Issue history" subtitle={data.issues.length === 0 ? 'No material issued yet' : `${data.issues.length} issue transaction(s)`} />
+          <CardHeader
+            icon={<PackageCheck size={15} />}
+            title="Issue history"
+            subtitle={data.issues.length === 0
+              ? 'No material issued yet'
+              : `${postedIssueCount} issue transaction(s)${reversedIssueCount > 0 ? ` · ${reversedIssueCount} reversed` : ''}`}
+          />
           <CardBody flush>
             {data.issues.length === 0 ? (
               <div style={{ padding: 'var(--sp-6)', textAlign: 'center', color: 'var(--text-muted)', fontSize: 'var(--text-sm)' }}>
@@ -481,16 +489,38 @@ export default function RequisitionDetail() {
             ) : (
               <div className="table-wrap">
                 <table className="table table-compact">
-                  <thead><tr><th>Issue Slip</th><th>Date</th><th>Store User</th><th className="right">Qty Issued</th><th /></tr></thead>
+                  <thead><tr><th>Issue Slip</th><th>Date</th><th>Store User</th><th className="right">Qty Issued</th><th>Status</th><th /></tr></thead>
                   <tbody>
                     {data.issues.map((iss) => {
                       const total = iss.lines.reduce((s, l) => s + Number(l.issueQty), 0);
+                      const reversed = iss.status === 'REVERSED';
                       return (
                         <tr key={iss.id}>
                           <td className="cell-code">{iss.issue_slip_no}</td>
                           <td>{formatDate(iss.issue_date)}</td>
                           <td>{text(iss.store_user_name)}</td>
-                          <td className="right num cell-strong">{qty(total)}</td>
+                          {/* A reversed slip's quantity went back to stock; it is shown, not counted. */}
+                          <td
+                            className="right num cell-strong"
+                            style={reversed ? { textDecoration: 'line-through', color: 'var(--text-faint)' } : undefined}
+                          >
+                            {qty(total)}
+                          </td>
+                          <td style={{ maxWidth: 220 }}>
+                            {reversed ? (
+                              <div style={{ fontSize: 'var(--text-xs)' }}>
+                                <Badge tone="neutral">Reversed</Badge>
+                                <div className="cell-wrap" style={{ color: 'var(--text-faint)', marginTop: 2 }}>
+                                  {text(iss.reversal_reason)}
+                                </div>
+                                <div style={{ color: 'var(--text-faint)', fontSize: 'var(--text-2xs)', marginTop: 1 }}>
+                                  {text(iss.reversed_by_name)}{iss.reversed_at ? ` · ${formatDateTime(iss.reversed_at)}` : ''}
+                                </div>
+                              </div>
+                            ) : (
+                              <Badge tone="success">Posted</Badge>
+                            )}
+                          </td>
                           <td className="right">
                             <div className="row" style={{ gap: 2, justifyContent: 'flex-end' }}>
                               <Button variant="ghost" size="sm" icon={<Eye size={13} />} title="Preview" onClick={() => void openIssuePreview(iss.id, iss.issue_slip_no)} />
@@ -500,6 +530,15 @@ export default function RequisitionDetail() {
                               >
                                 PDF
                               </Button>
+                              {!reversed && can('requisition.issue') && (
+                                <Button
+                                  variant="ghost" size="sm" icon={<Undo2 size={13} />}
+                                  title="Reverse issue: return this slip's material to stock"
+                                  onClick={() => { setReverseReason(''); setReversingSlip(iss); }}
+                                >
+                                  Reverse
+                                </Button>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -595,11 +634,45 @@ export default function RequisitionDetail() {
             : action === 'approve' ? <>It moves to the Store Issue Queue, ready for material to be issued.</>
             : action === 'reject' ? <>The reason is recorded on the document and in the audit trail.</>
             : action === 'return' ? <>The requester can edit and resubmit it — the reason is recorded in the audit trail.</>
-            : action === 'cancel' ? <>A requisition with any material already issued against it cannot be cancelled.</>
+            : action === 'cancel' ? <>A requisition with material still issued against it cannot be cancelled; reverse its issue slips first.</>
             : action === 'reopen' ? <>The requisition returns to draft so it can be corrected and resubmitted.</>
             : <>Draft <strong>{data.requisition_no}</strong> will be permanently deleted.</>
         }
       />
+
+      {reversingSlip && (
+        <Modal
+          title={`Reverse ${reversingSlip.issue_slip_no}?`}
+          subtitle={
+            `${reversingSlip.lines.length} line(s), ${qty(reversingSlip.lines.reduce((s, l) => s + Number(l.issueQty), 0))} in all, go back into stock. `
+            + 'The slip stays in the issue history, marked Reversed, and no longer counts as issued.'
+          }
+          open={Boolean(reversingSlip)}
+          onClose={() => setReversingSlip(null)}
+        >
+          <Field label="Why is this issue being reversed?" required hint="At least 5 characters. Shown on the slip and saved in the audit log.">
+            <Textarea
+              rows={3}
+              value={reverseReason}
+              onChange={(e) => setReverseReason(e.target.value)}
+              placeholder="e.g. Issued against the wrong requisition"
+              autoFocus
+            />
+          </Field>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+            <Button variant="ghost" onClick={() => setReversingSlip(null)}>Keep the issue</Button>
+            <Button
+              variant="danger"
+              icon={<Undo2 size={14} />}
+              loading={reverseIssue.isPending}
+              disabled={reverseReason.trim().length < 5}
+              onClick={() => reverseIssue.mutate({ issueId: reversingSlip.id, reason: reverseReason.trim() })}
+            >
+              Reverse issue
+            </Button>
+          </div>
+        </Modal>
+      )}
 
       <StoreIssueModal
         open={issueOpen}
