@@ -102,6 +102,9 @@ async function main(): Promise<void> {
   logger.info(
     `Restore complete — ${result.totalRows} row(s) across ${Object.keys(result.restored).length} table(s).`,
   );
+  if (result.notInBackup.length > 0) {
+    logger.warn(`This backup predates ${result.notInBackup.join(', ')} — those tables are now empty.`);
+  }
   await closeDatabase();
 }
 

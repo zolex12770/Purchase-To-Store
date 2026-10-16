@@ -267,9 +267,16 @@ router.post(
     sendOk(res, {
       restored: result.restored,
       totalRows: result.totalRows,
+      notInBackup: result.notInBackup,
       message:
         `Database restored from ${meta.filename}. All users have been signed out — ` +
-        `sign in again to continue.`,
+        `sign in again to continue.` +
+        (result.notInBackup.length > 0
+          ? ` This backup predates ${result.notInBackup.join(', ')}; those tables are now empty` +
+            (result.notInBackup.some((t) => t.startsWith('inventory_'))
+              ? ' — run the inventory sync to reload stock from the Google Sheets.'
+              : '.')
+          : ''),
     });
   }),
 );

@@ -25,6 +25,12 @@ export const BACKUP_TABLES = [
   'requisition_headers', 'requisition_lines', 'requisition_approvals',
   'requisition_issues', 'requisition_issue_lines',
   'direct_issue_headers', 'direct_issue_lines',
+  // Inventory module (migrations 023–025). They reference items/users with
+  // ON DELETE RESTRICT, so they must be listed here: left out, a restore's
+  // DELETE FROM items fails on any database that holds inventory data, and a
+  // backup silently lacks every inventory movement.
+  'stock_adjustments', 'inventory_items', 'inventory_transactions',
+  'inventory_sync_checkpoints', 'inventory_quarantine',
   'document_sequences', 'app_settings', 'google_sheet_mappings',
   'google_sync_jobs', 'google_sync_errors',
   'import_jobs', 'import_rows',
@@ -103,6 +109,12 @@ async function loadGeneratedColumns(tx: Queryable): Promise<Map<string, Set<stri
 export interface RestoreResult {
   restored: Record<string, number>;
   totalRows: number;
+  /**
+   * Tables the backup file does not contain at all (it predates them). They are
+   * left empty, exactly as they were at the backup's point in time — reported
+   * so the operator knows, e.g., to run the inventory sync again.
+   */
+  notInBackup: string[];
 }
 
 /**
@@ -196,6 +208,7 @@ export async function restoreFromPayload(
   return {
     restored,
     totalRows: Object.values(restored).reduce((a, b) => a + b, 0),
+    notInBackup: BACKUP_TABLES.filter((t) => !Object.prototype.hasOwnProperty.call(payload.data, t)),
   };
 }
 
