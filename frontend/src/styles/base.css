@@ -933,14 +933,17 @@ h1, h2, h3, h4, h5, h6 {
   font-size: var(--fs-12); color: var(--text-3); white-space: nowrap;
 }
 
-/* Condensed header that follows the reader down long detail and form pages. */
+/* Condensed header that follows the reader down long detail and form pages.
+   Fixed under the top bar; the shell publishes the sidebar width as
+   --shell-offset. */
 .page-header-condensed {
-  position: sticky;
+  position: fixed;
   top: var(--topbar-h);
+  left: var(--shell-offset, 0px);
+  right: 0;
   z-index: var(--z-page-sticky);
   display: flex; align-items: center; gap: var(--space-3);
   height: 48px;
-  margin: 0 calc(-1 * var(--page-gutter)) var(--space-3);
   padding: 0 var(--page-gutter);
   background: var(--glass-bg);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -1236,6 +1239,29 @@ h1, h2, h3, h4, h5, h6 {
   font-variant-numeric: var(--numeric);
   pointer-events: none;
 }
+
+.sync-pop { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-3) var(--space-4); width: 340px; max-width: calc(100vw - 32px); }
+.sync-facts { display: grid; grid-template-columns: 92px 1fr; gap: 6px var(--space-3); margin: 0; font-size: var(--fs-13); }
+.sync-facts dt { color: var(--text-3); }
+.sync-facts dd { margin: 0; color: var(--text-1); min-width: 0; overflow-wrap: anywhere; }
+
+.notif-item { display: block; width: 100%; text-align: left; padding: var(--space-2-5) var(--space-4); border-bottom: 1px solid var(--border-subtle); }
+.notif-item:last-child { border-bottom: none; }
+.notif-item:hover, .notif-item:focus-visible { background: var(--hover-wash); }
+.notif-item:focus-visible { outline: none; box-shadow: var(--focus-ring-inset); }
+
+.user-menu-head { padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--border-subtle); }
+.user-menu-theme { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-2-5) var(--space-4); border-bottom: 1px solid var(--border-subtle); }
+
+/* Keyboard users can jump past the sidebar. */
+.skip-link {
+  position: fixed; left: var(--space-3); top: var(--space-2); z-index: var(--z-tooltip);
+  padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm);
+  background: var(--surface-1); color: var(--text-1); font-size: var(--fs-13); font-weight: var(--fw-semibold);
+  box-shadow: var(--shadow-3); transform: translateY(-200%);
+}
+.skip-link:focus { transform: none; }
+.app-content:focus { outline: none; }
 
 .user-trigger { display: flex; align-items: center; gap: var(--space-2); height: 40px; padding: 0 var(--space-1-5) 0 var(--space-1); border-radius: var(--radius-sm); }
 .user-trigger:hover { background: var(--hover-wash); }

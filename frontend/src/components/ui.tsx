@@ -419,8 +419,8 @@ export interface MenuAction {
   separatorBefore?: boolean;
 }
 
-/** Arrow keys, Home/End and type-ahead-free roving focus inside a role="menu". */
-function onMenuKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+/** Arrow keys and Home/End move focus between the items of a role="menu". */
+export function menuKeyNav(e: React.KeyboardEvent<HTMLDivElement>): void {
   const items = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'));
   if (items.length === 0) return;
   const i = items.indexOf(document.activeElement as HTMLElement);
@@ -526,7 +526,7 @@ export function OverflowMenu({
           role="menu"
           aria-label={typeof triggerLabel === 'string' ? triggerLabel : label}
           className="menu-list"
-          onKeyDown={(e) => { onMenuKeyDown(e); if (e.key === 'Tab') setOpen(false); }}
+          onKeyDown={(e) => { menuKeyNav(e); if (e.key === 'Tab') setOpen(false); }}
         >
           <MenuList items={visible} onAction={run} header={header} />
         </div>

@@ -5,12 +5,12 @@
  * Both are ergonomic guards — the server re-checks every request regardless
  * (SRS §25), so a hand-typed URL cannot reach data the user may not see.
  */
-import { Suspense, lazy, type ReactNode } from 'react';
-import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { Suspense, lazy, useRef, type ReactNode } from 'react';
+import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from './lib/auth';
 import { AppShell } from './layout/AppShell';
-import { LoadingBlock, EmptyState, Button } from './components/ui';
-import { ShieldAlert, Compass } from 'lucide-react';
+import { LoadingBlock, EmptyState, Button, Spinner } from './components/ui';
+import { ShieldAlert, Compass, Home as HomeIcon } from 'lucide-react';
 
 /* Public */
 import Landing from './pages/Landing';
@@ -57,8 +57,10 @@ const Profile        = lazy(() => import('./pages/Profile'));
 
 function FullPageLoader() {
   return (
-    <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg-app)' }}>
-      <LoadingBlock label="Loading Zolex…" />
+    <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>
+      <div className="row" style={{ gap: 10, color: 'var(--text-3)', fontSize: 'var(--fs-14)' }}>
+        <Spinner /> Loading ZOLEX…
+      </div>
     </div>
   );
 }
@@ -80,16 +82,18 @@ function RequirePermission({ permission, anyOf, children }: { permission: string
   const allowed = anyOf ? canAny(...anyOf) : can(permission);
   if (!allowed) {
     return (
-      <EmptyState
-        icon={<ShieldAlert />}
-        title="You do not have access to this screen"
-        message={
-          <>
-            This area requires the <code style={{ fontFamily: 'var(--font-mono)', fontSize: '0.9em' }}>{permission}</code>{' '}
-            permission. Contact your administrator if you believe you should have it.
-          </>
-        }
-      />
+      <div className="card">
+        <EmptyState
+          icon={<ShieldAlert />}
+          title="You don't have access to this screen"
+          message={
+            <>
+              It needs the <code style={{ fontFamily: 'var(--font-mono)', fontSize: '0.9em', color: 'var(--text-1)' }}>{permission}</code>{' '}
+              permission. Ask your administrator if you should have it.
+            </>
+          }
+        />
+      </div>
     );
   }
   return <>{children}</>;
@@ -154,7 +158,7 @@ export default function App() {
                     signed-in user's permissions allow, so it needs no guard of its own. */}
                 <Route path="/home" element={<Home />} />
                 <Route path="/dashboard" element={guard('dashboard.view', <Dashboard />)} />
-                <Route path="/profile" element={<Profile />} />
+                <Route path="/profile" element={<ProfileRoute />} />
 
                 <Route path="/masters/suppliers" element={guard('supplier.view', <Suppliers />)} />
                 <Route path="/masters/suppliers/:id" element={guard('supplier.view', <Suppliers />)} />
@@ -196,12 +200,15 @@ export default function App() {
                 <Route path="/requisitions/:id/edit" element={guard('requisition.edit', <RequisitionForm />)} />
 
                 <Route path="/inventory" element={<RequirePermission permission="inventory.view" anyOf={['inventory.view', 'auto_indent.view']}><InventoryStockPage /></RequirePermission>} />
-                <Route path="/inventory/stock" element={<RequirePermission permission="inventory.view" anyOf={['inventory.view', 'auto_indent.view']}><InventoryStockPage /></RequirePermission>} />
+                {/* Old addresses of two inventory views. They rendered the Overview
+                    (the page defaults to it), so a bookmark opened the wrong screen;
+                    they now redirect to the view they name (audit UI-017). */}
+                <Route path="/inventory/stock" element={<Navigate to="/inventory?tab=stock" replace />} />
                 <Route path="/inventory/direct-issue" element={<RequirePermission permission="direct_issue.view" anyOf={['direct_issue.view', 'auto_indent.view', 'requisition.issue', 'inventory.view']}><DirectIssuePage /></RequirePermission>} />
-                <Route path="/inventory/auto-indent" element={<RequirePermission permission="auto_indent.view" anyOf={['auto_indent.view', 'inventory.view']}><InventoryStockPage /></RequirePermission>} />
+                <Route path="/inventory/auto-indent" element={<Navigate to="/inventory?tab=auto-indent" replace />} />
 
                 <Route path="/qc" element={guard('qc.view', <QcPage />)} />
-                <Route path="/qc/inspections" element={guard('qc.view', <QcPage />)} />
+                <Route path="/qc/inspections" element={<Navigate to="/qc" replace />} />
 
                 <Route path="/admin/users" element={guard('user.view', <Users />)} />
                 <Route path="/admin/users/:id" element={guard('user.view', <Users />)} />
@@ -223,14 +230,30 @@ export default function App() {
   );
 }
 
+/**
+ * Profile reads its ?tab only when it mounts. The user menu's "Change
+ * password" sends a fresh `profileTab` nonce in the navigation state, and a
+ * new nonce remounts the page, so the password tab opens even when /profile
+ * is already on screen (audit UI-017). Profile's own tab clicks carry no
+ * nonce and keep the page mounted.
+ */
+function ProfileRoute() {
+  const location = useLocation();
+  const nonce = (location.state as { profileTab?: number } | null)?.profileTab;
+  const lastNonce = useRef(nonce);
+  if (nonce !== undefined) lastNonce.current = nonce;
+  return <Profile key={lastNonce.current ?? 'profile'} />;
+}
+
 function NotFound() {
+  const navigate = useNavigate();
   return (
-    <div className="card" style={{ padding: 'var(--sp-8)' }}>
+    <div className="card" style={{ padding: 'var(--space-6)' }}>
       <EmptyState
         icon={<Compass />}
         title="That page does not exist"
         message="The link may be out of date, or the record may have been removed."
-        action={<Button variant="primary" onClick={() => { window.location.href = '/home'; }}>Back to Home</Button>}
+        action={<Button variant="primary" icon={<HomeIcon size={15} />} onClick={() => navigate('/home')}>Back to My work</Button>}
       />
     </div>
   );
