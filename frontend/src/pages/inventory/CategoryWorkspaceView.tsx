@@ -17,9 +17,12 @@ import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom
 
 export type InventoryCategoryKey = 'RM' | 'FG' | 'WIP' | 'TRADING' | 'GENERAL';
 
+type ReconStatus = 'MATCHED' | 'MISMATCH' | 'NOT_IN_SHEET' | 'ERP_ONLY';
+
 interface CategoryItemRow {
   id: number;
-  item_id: number;
+  /** The Purchase item this stock row is linked to; null for codes only the sheet knows. */
+  item_id: number | null;
   item_code: string;
   item_description: string;
   category: InventoryCategoryKey;
@@ -44,6 +47,9 @@ interface CategoryItemRow {
   source_tab: string | null;
   source_row_index: number | null;
   last_sync_at: string | null;
+  computed_stock_qty: string | null;
+  recon_status: ReconStatus | null;
+  recon_note: string | null;
   stock_status: 'NORMAL' | 'BELOW_REORDER' | 'CRITICAL' | 'EXCESS';
 }
 
@@ -68,11 +74,46 @@ interface CategoryTxnRow {
   to_location: string | null;
   department: string | null;
   source_tab: string | null;
+  source_row_index: number | null;
+  origin: 'SHEET' | 'ERP';
   status: string;
+  reversal_reason: string | null;
   notes: string | null;
   created_by_name: string;
   txn_date: string;
   created_at: string;
+}
+
+/** What one sync run reports back (see backend sync-engine.ts). */
+interface SyncResult {
+  category: string;
+  status: 'SUCCESS' | 'PARTIAL' | 'FAILED';
+  durationMs: number;
+  transactionsImported: number;
+  quarantinedRecords: number;
+  tabs: Array<{ tab: string; reversed: number; status: string; message?: string }>;
+  reconciliation: { checked: number; matched: number; mismatched: number };
+  errorMessage?: string;
+}
+
+interface QuarantineRow {
+  id: number;
+  category: string;
+  source_tab: string;
+  source_row_index: number;
+  raw_data: string[] | null;
+  quarantine_reason: string;
+  reason_code: string | null;
+  resolution_status: string;
+  created_at: string;
+  last_seen_at: string | null;
+}
+
+/** One-line, plain-language result of a sync for a toast. */
+export function describeSync(r: SyncResult): string {
+  const reversed = r.tabs.reduce((a, t) => a + t.reversed, 0);
+  return `${r.category}: ${count(r.transactionsImported)} new entries, ${count(reversed)} removed, ` +
+    `${count(r.quarantinedRecords)} rows not counted. ${count(r.reconciliation.matched)} of ${count(r.reconciliation.checked)} items match the sheet.`;
 }
 
 interface CategorySummary {
@@ -99,8 +140,18 @@ interface CategorySummary {
     inwardTxnQty: number;
     outwardTxnCount: number;
     outwardTxnQty: number;
+    sheetInwardTxnCount: number;
+    sheetOutwardTxnCount: number;
+    erpInwardTxnCount: number;
+    erpOutwardTxnCount: number;
+    adjustmentTxnCount: number;
+    reversedTxnCount: number;
     prodInwardTxnCount: number;
     prodInwardTxnQty: number;
+    reconMatchedCount: number;
+    reconMismatchCount: number;
+    notInSheetCount: number;
+    erpOnlyItemsCount: number;
     lastSyncAt: string | null;
   };
   mainGroups?: Array<{ name: string; count: number; totalQty: number }>;
@@ -134,9 +185,15 @@ interface Props {
 interface SourceSubTab {
   key: string;
   label: string;
-  type: 'stock' | 'inward' | 'outward' | 'prod_inward';
+  type: 'stock' | 'inward' | 'outward' | 'prod_inward' | 'adjustment' | 'erp';
   sheetTabName: string;
 }
+
+/** Every category also shows its sheet's Stock Adjustment tab and the movements entered in the ERP. */
+const COMMON_SUB_TABS: SourceSubTab[] = [
+  { key: 'stock_adjustment', label: 'Stock Adjustment', type: 'adjustment', sheetTabName: 'Stock Adjustment' },
+  { key: 'erp_entries', label: 'Entered in ERP', type: 'erp', sheetTabName: '' },
+];
 
 const CATEGORY_CONFIG: Record<
   InventoryCategoryKey,
@@ -152,6 +209,7 @@ const CATEGORY_CONFIG: Record<
       { key: 'grn_inward', label: 'GRN Inward', type: 'inward', sheetTabName: 'GRN Inward' },
       { key: 'rm_outward', label: 'RM Outward', type: 'outward', sheetTabName: 'RM Outward' },
       { key: 'prod_inward', label: 'Production Inward', type: 'prod_inward', sheetTabName: 'Production Inward' },
+      ...COMMON_SUB_TABS,
     ],
   },
   FG: {
@@ -160,6 +218,7 @@ const CATEGORY_CONFIG: Record<
       { key: 'live_stock', label: 'FG Stock Live', type: 'stock', sheetTabName: 'FG  Stock Live' },
       { key: 'inward_fg', label: 'Inward FG', type: 'inward', sheetTabName: 'Inward FG ' },
       { key: 'outward_fg', label: 'Outward FG', type: 'outward', sheetTabName: 'Outward FG' },
+      ...COMMON_SUB_TABS,
     ],
   },
   WIP: {
@@ -168,6 +227,7 @@ const CATEGORY_CONFIG: Record<
       { key: 'live_stock', label: 'WIP Stock Live', type: 'stock', sheetTabName: 'WIP  Stock Live' },
       { key: 'inward_wip', label: 'Inward WIP', type: 'inward', sheetTabName: 'Inward WIP' },
       { key: 'outward_wip', label: 'Outward WIP', type: 'outward', sheetTabName: 'Outward WIP' },
+      ...COMMON_SUB_TABS,
     ],
   },
   TRADING: {
@@ -176,6 +236,7 @@ const CATEGORY_CONFIG: Record<
       { key: 'live_stock', label: 'Trading Live Stock', type: 'stock', sheetTabName: 'Trading Live Stock' },
       { key: 'inward_trading', label: 'Inward Trading', type: 'inward', sheetTabName: 'Inward Trading' },
       { key: 'outward_trading', label: 'Outward Trading', type: 'outward', sheetTabName: 'Outward Trading ' },
+      ...COMMON_SUB_TABS,
     ],
   },
   GENERAL: {
@@ -184,6 +245,7 @@ const CATEGORY_CONFIG: Record<
       { key: 'live_stock', label: 'General Item Live Stock', type: 'stock', sheetTabName: 'General Item Live Stock' },
       { key: 'grn_register', label: 'GRN Register (Store Inward Entry)', type: 'inward', sheetTabName: 'GRN Register (Store Inward Entry)' },
       { key: 'issue_register', label: 'Issue Register (Store Outward Entry)', type: 'outward', sheetTabName: 'Issue Register (Store Outward Entry)' },
+      ...COMMON_SUB_TABS,
     ],
   },
 };
@@ -204,7 +266,9 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
   const [stockStatus, setStockStatus] = useState('ALL');
   const [stockSource, setStockSource] = useState<'ALL' | 'LIVE_SHEET' | 'ERP_ONLY'>('ALL');
   const [stockMainGroup, setStockMainGroup] = useState<string>('');
+  const [stockRecon, setStockRecon] = useState<'' | ReconStatus>('');
   const [isQuarantineModalOpen, setIsQuarantineModalOpen] = useState(false);
+  const [quarantineReason, setQuarantineReason] = useState('');
 
   // Filters for Transactions
   const [txnPage, setTxnPage] = useState(1);
@@ -244,6 +308,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     status: stockStatus !== 'ALL' ? stockStatus : undefined,
     source: stockSource !== 'ALL' ? stockSource : undefined,
     mainGroup: stockMainGroup || undefined,
+    recon: stockRecon || undefined,
   };
 
   const { data: itemsData, isLoading: itemsLoading } = useQuery({
@@ -253,14 +318,20 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
   });
 
   // 3. Fetch Transactions (when type !== 'stock')
-  const txnParams = {
-    page: txnPage,
-    pageSize: txnPageSize,
-    search: txnSearch || undefined,
-    direction: currentSubTabDef.type === 'inward' || currentSubTabDef.type === 'prod_inward' ? 'IN' : 'OUT',
-    txnType: currentSubTabDef.type === 'prod_inward' ? 'PRODUCTION_INWARD' : undefined,
-    sourceTab: currentSubTabDef.sheetTabName,
-  };
+  // Each sheet sub-tab lists exactly that sheet tab's counted rows; "Entered in ERP" lists the
+  // movements recorded in this system — together they add up to the cards above.
+  const txnParams = currentSubTabDef.type === 'erp'
+    ? { page: txnPage, pageSize: txnPageSize, search: txnSearch || undefined, origin: 'ERP' }
+    : {
+        page: txnPage,
+        pageSize: txnPageSize,
+        search: txnSearch || undefined,
+        direction: currentSubTabDef.type === 'adjustment' ? undefined
+          : currentSubTabDef.type === 'inward' || currentSubTabDef.type === 'prod_inward' ? 'IN' : 'OUT',
+        txnType: currentSubTabDef.type === 'prod_inward' ? 'PRODUCTION_INWARD' : undefined,
+        sourceTab: currentSubTabDef.sheetTabName,
+        origin: 'SHEET',
+      };
 
   const { data: txnsData, isLoading: txnsLoading } = useQuery({
     queryKey: ['inventory-category-txns', category, currentSubTabDef.key, txnParams],
@@ -270,8 +341,10 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
 
   // 4. Fetch Quarantined Records
   const { data: quarantineData, isLoading: quarantineLoading } = useQuery({
-    queryKey: ['inventory-quarantine', category],
-    queryFn: () => api.getWithMeta<any[], PageMeta>(`/inventory/quarantine?category=${category}&pageSize=50`),
+    queryKey: ['inventory-quarantine', category, quarantineReason],
+    queryFn: () => api.getWithMeta<QuarantineRow[], PageMeta & { byReason?: Array<{ reasonCode: string | null; label: string; count: number }> }>(
+      `/inventory/quarantine${qs({ category, pageSize: 200, reasonCode: quarantineReason || undefined })}`,
+    ),
     enabled: isQuarantineModalOpen,
   });
 
@@ -287,20 +360,10 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
 
   // 4. Live Google Sheet Sync Mutation
   const syncMutation = useMutation({
-    mutationFn: () => api.post<{
-      category: string;
-      spreadsheetId: string;
-      tabName: string;
-      totalRowsRead: number;
-      validRecordsImported: number;
-      quarantinedRecords: number;
-      status: string;
-      durationMs: number;
-    }>(`/inventory/sync/${category}`),
+    mutationFn: () => api.post<SyncResult>(`/inventory/sync/${category}`, {}),
     onSuccess: (res) => {
-      toast.success(
-        `Synced with "${currentSubTabDef.sheetTabName}": ${count(res.validRecordsImported)} valid items updated (${(res.durationMs / 1000).toFixed(1)}s)`
-      );
+      if (res.status === 'SUCCESS') toast.success(describeSync(res));
+      else toast.error(res.errorMessage || `${category} sync did not finish. Nothing was changed — please try again.`);
       void qc.invalidateQueries({ queryKey: ['inventory-category-summary', category] });
       void qc.invalidateQueries({ queryKey: ['inventory-category-items', category] });
       void qc.invalidateQueries({ queryKey: ['inventory-category-txns', category] });
@@ -352,8 +415,8 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     setMoveDirection(direction);
     setMoveTxnType(
       direction === 'IN'
-        ? currentSubTabDef.type === 'prod_inward' ? 'PRODUCTION_INWARD' : 'GRN_INWARD'
-        : 'DIRECT_ISSUE'
+        ? currentSubTabDef.type === 'prod_inward' ? 'PRODUCTION_INWARD' : 'ERP_RECEIPT'
+        : 'ERP_ISSUE'
     );
     setMoveQty('');
     setMoveWeightKg('');
@@ -506,16 +569,24 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
       },
       {
         key: 'origin',
-        header: 'Source',
+        header: 'Sheet check',
         align: 'center',
-        width: '100px',
-        render: (r) => (
-          r.source_spreadsheet_id ? (
-            <Badge tone="success" plain>Sheet Synced</Badge>
-          ) : (
-            <Badge tone="neutral" plain>ERP Only</Badge>
-          )
-        ),
+        width: '130px',
+        render: (r) => {
+          // Opening + inward − outward + adjustments, from the sheet's own rows, against its live stock.
+          if (r.recon_status === 'MATCHED') return <Badge tone="success" plain>Matches sheet</Badge>;
+          if (r.recon_status === 'MISMATCH') {
+            const diff = Number(r.live_stock_qty || 0) - Number(r.computed_stock_qty || 0);
+            return (
+              <span title={r.recon_note ?? undefined}>
+                <Badge tone="warning">Check: {diff > 0 ? '+' : ''}{qty(diff)}</Badge>
+              </span>
+            );
+          }
+          if (r.recon_status === 'NOT_IN_SHEET') return <span title={r.recon_note ?? undefined}><Badge tone="neutral" plain>Not in sheet now</Badge></span>;
+          if (r.recon_status === 'ERP_ONLY' || !r.source_spreadsheet_id) return <Badge tone="neutral" plain>ERP only</Badge>;
+          return <Badge tone="neutral" plain>Not checked yet</Badge>;
+        },
       },
       {
         key: 'status',
@@ -536,7 +607,17 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         header: 'Actions',
         align: 'right',
         locked: true,
-        render: (r) => (
+        render: (r) => {
+          const itemId = r.item_id;
+          // A code only the Google Sheet knows (not in the Purchase item master) is moved in the sheet.
+          if (itemId === null) {
+            return (
+              <span className="cell-muted" style={{ fontSize: '11px' }} title="This item is not in the Purchase item master. Record its movements in the Google Sheet.">
+                Use the sheet
+              </span>
+            );
+          }
+          return (
           <div className="row" style={{ gap: 4, justifyContent: 'flex-end' }}>
             {can('inventory.adjust') && (
               <>
@@ -547,7 +628,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                   title="Receive Stock"
                   onClick={() =>
                     openMoveModal(
-                      { id: r.item_id, code: r.item_code, desc: r.item_description, stock: Number(r.live_stock_qty || 0), uom: r.primary_uom, rate: Number(r.unit_price || 0) },
+                      { id: itemId, code: r.item_code, desc: r.item_description, stock: Number(r.live_stock_qty || 0), uom: r.primary_uom, rate: Number(r.unit_price || 0) },
                       'IN'
                     )
                   }
@@ -561,7 +642,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                   title="Issue Stock"
                   onClick={() =>
                     openMoveModal(
-                      { id: r.item_id, code: r.item_code, desc: r.item_description, stock: Number(r.live_stock_qty || 0), uom: r.primary_uom, rate: Number(r.unit_price || 0) },
+                      { id: itemId, code: r.item_code, desc: r.item_description, stock: Number(r.live_stock_qty || 0), uom: r.primary_uom, rate: Number(r.unit_price || 0) },
                       'OUT'
                     )
                   }
@@ -578,7 +659,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                 title="Physical Stock Adjustment"
                 onClick={() =>
                   onOpenAdjustment({
-                    id: r.item_id,
+                    id: itemId,
                     code: r.item_code,
                     description: r.item_description,
                     category: r.category,
@@ -591,7 +672,8 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
               </Button>
             )}
           </div>
-        ),
+        );
+        },
       }
     );
 
@@ -651,6 +733,11 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
             <Badge tone={r.direction === 'IN' ? 'success' : 'neutral'} plain>
               {r.txn_type.replace(/_/g, ' ')}
             </Badge>
+            <span style={{ marginLeft: 6 }} title={r.origin === 'SHEET' && r.source_row_index ? `Google Sheet row ${r.source_row_index}` : undefined}>
+              <Badge tone={r.origin === 'SHEET' ? 'info' : 'warning'} plain>
+                {r.origin === 'SHEET' ? `Sheet${r.source_row_index ? ` row ${r.source_row_index}` : ''}` : 'Entered in ERP'}
+              </Badge>
+            </span>
             {r.department && (
               <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginLeft: 6 }}>
                 Dept: {r.department}
@@ -726,8 +813,9 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
               </span>
               {lastSync && (
                 <span style={{ fontSize: '11px', color: 'var(--text-faint)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                  <Database size={12} /> Last synced: {formatDate(lastSync.created_at)} ({lastSync.tab_name})
-                  {lastSync.sync_duration_ms > 0 && ` in ${(lastSync.sync_duration_ms / 1000).toFixed(1)}s`}
+                  <Database size={12} /> Last synced: {formatDateTime(lastSync.created_at)}
+                  {lastSync.status !== 'SUCCESS' && ` — ${lastSync.status === 'PARTIAL' ? 'partly applied' : 'failed'}`}
+                  {lastSync.sync_duration_ms > 0 && ` (${(lastSync.sync_duration_ms / 1000).toFixed(1)}s)`}
                 </span>
               )}
             </div>
@@ -806,13 +894,30 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         <StatTile
           label="Total Items"
           value={count(stats?.totalItems ?? itemsData?.meta?.total ?? 0)}
-          sub={`${stats?.sheetItemsCount ?? 0} sheet • ${stats?.unsyncedItemsCount ?? 0} ERP only`}
+          sub={`${count(stats?.sheetItemsCount ?? 0)} in the sheet • ${count(stats?.unsyncedItemsCount ?? 0)} ERP only`}
           tone="default"
           onClick={() => {
             setStockStatus('ALL');
             setStockSource('ALL');
             setStockMainGroup('');
+            setStockRecon('');
             setStockSearch('');
+            setStockPage(1);
+            setActiveSubTab(config.subTabs[0].key);
+          }}
+        />
+
+        <StatTile
+          label="Matches Google Sheet"
+          value={`${count(stats?.reconMatchedCount ?? 0)} / ${count(stats?.sheetItemsCount ?? 0)}`}
+          sub={stats?.reconMismatchCount
+            ? `${count(stats.reconMismatchCount)} item(s) to check — click`
+            : 'Opening + in − out + adjustments = sheet'}
+          tone={stats?.reconMismatchCount ? 'warning' : 'success'}
+          onClick={() => {
+            setStockRecon(stats?.reconMismatchCount ? 'MISMATCH' : 'MATCHED');
+            setStockStatus('ALL');
+            setStockSource('ALL');
             setStockPage(1);
             setActiveSubTab(config.subTabs[0].key);
           }}
@@ -826,9 +931,11 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
               : `${count(stats?.totalStockQty ?? 0)} Qty`
           }
           sub={
-            category === 'RM' || category === 'FG' || category === 'WIP'
+            category === 'RM'
               ? `${qty(stats?.totalStockQty ?? 0)} Kg live stock`
-              : 'Physical inventory units'
+              : category === 'FG' || category === 'WIP'
+                ? `${count(stats?.totalStockQty ?? 0)} Nos live stock`
+                : 'Physical inventory units'
           }
           tone="default"
           onClick={() => setActiveSubTab(config.subTabs[0].key)}
@@ -864,7 +971,8 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
           sub="No stock in store"
           tone="danger"
           onClick={() => {
-            setStockStatus('CRITICAL');
+            setStockStatus('ZERO_STOCK');
+            setStockRecon('');
             setActiveSubTab(config.subTabs[0].key);
             setStockPage(1);
           }}
@@ -883,9 +991,9 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         />
 
         <StatTile
-          label="Inward Receipts"
+          label="Inward Entries"
           value={count(stats?.inwardTxnCount ?? 0)}
-          sub={`Qty: +${qty(stats?.inwardTxnQty ?? 0)}`}
+          sub={`${count(stats?.sheetInwardTxnCount ?? 0)} from sheet • ${count(stats?.erpInwardTxnCount ?? 0)} entered in ERP`}
           tone="success"
           onClick={() => {
             const inTab = config.subTabs.find((t) => t.type === 'inward');
@@ -894,9 +1002,9 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         />
 
         <StatTile
-          label="Outward Issues"
+          label="Outward Entries"
           value={count(stats?.outwardTxnCount ?? 0)}
-          sub={`Qty: -${qty(stats?.outwardTxnQty ?? 0)}`}
+          sub={`${count(stats?.sheetOutwardTxnCount ?? 0)} from sheet • ${count(stats?.erpOutwardTxnCount ?? 0)} entered in ERP`}
           tone="warning"
           onClick={() => {
             const outTab = config.subTabs.find((t) => t.type === 'outward');
@@ -905,11 +1013,14 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         />
 
         <StatTile
-          label="Quarantined"
+          label="Rows Not Counted"
           value={count(stats?.quarantinedCount ?? 0)}
-          sub={stats?.quarantinedCount ? 'Click to inspect errors' : '0 invalid rows'}
+          sub={stats?.quarantinedCount ? 'Sheet rows to fix — click to see why' : 'Every sheet row is counted'}
           tone={stats?.quarantinedCount ? 'danger' : 'default'}
-          onClick={() => setIsQuarantineModalOpen(true)}
+          onClick={() => {
+            setQuarantineReason('');
+            setIsQuarantineModalOpen(true);
+          }}
         />
       </div>
 
@@ -1026,7 +1137,23 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                 </div>
               )}
 
-              {(stockSearch || stockStatus !== 'ALL' || stockSource !== 'ALL' || stockMainGroup) && (
+              <div style={{ width: '170px' }}>
+                <Select
+                  value={stockRecon}
+                  onChange={(e) => {
+                    setStockRecon(e.target.value as '' | ReconStatus);
+                    setStockPage(1);
+                  }}
+                >
+                  <option value="">Any sheet check</option>
+                  <option value="MATCHED">Matches the sheet</option>
+                  <option value="MISMATCH">Differs from the sheet</option>
+                  <option value="NOT_IN_SHEET">No longer in the sheet</option>
+                  <option value="ERP_ONLY">ERP only</option>
+                </Select>
+              </div>
+
+              {(stockSearch || stockStatus !== 'ALL' || stockSource !== 'ALL' || stockMainGroup || stockRecon) && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -1035,6 +1162,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                     setStockStatus('ALL');
                     setStockSource('ALL');
                     setStockMainGroup('');
+                    setStockRecon('');
                     setStockPage(1);
                   }}
                 >
@@ -1128,17 +1256,18 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--sp-3)' }}>
               <Field label="Transaction Type" required>
                 <Select value={moveTxnType} onChange={(e) => setMoveTxnType(e.target.value)}>
+                  {/* Plain names, and no GRN / requisition / direct-issue types: those documents
+                      have their own screens, and posting one here would only imitate them. */}
                   {moveDirection === 'IN' ? (
                     <>
-                      <option value="GRN_INWARD">GRN Inward Receipt</option>
-                      <option value="PRODUCTION_INWARD">Production / Job Work Inward</option>
-                      <option value="STOCK_ADJUSTMENT">Stock Return / Found</option>
+                      <option value="ERP_RECEIPT">Material received</option>
+                      <option value="PRODUCTION_INWARD">Production / job work inward</option>
+                      <option value="RETURN_TO_STORE">Returned to store / found</option>
                     </>
                   ) : (
                     <>
-                      <option value="DIRECT_ISSUE">Direct Store Issue</option>
-                      <option value="REQUISITION_ISSUE">Requisition Issue</option>
-                      <option value="STOCK_ADJUSTMENT">Scrap / Breakage Outward</option>
+                      <option value="ERP_ISSUE">Material issued</option>
+                      <option value="SCRAP_OUTWARD">Scrap / breakage</option>
                     </>
                   )}
                 </Select>
@@ -1222,11 +1351,24 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                 Current live stock: <strong>{qty(moveItem.stock)} {moveItem.uom}</strong>.
                 {moveDirection === 'OUT' && (
                   <span style={{ color: 'var(--danger-700)', marginLeft: 6 }}>
-                    Strict constraint: Stock cannot become negative.
+                    Stock cannot go below zero.
                   </span>
                 )}
               </div>
             )}
+
+            <div
+              style={{
+                padding: 'var(--sp-2) var(--sp-3)',
+                borderRadius: 'var(--radius-sm)',
+                border: '1px solid var(--border-subtle)',
+                fontSize: 'var(--text-xs)',
+                color: 'var(--text-muted)',
+              }}
+            >
+              The Google Sheet is the stock record. Write this movement in the sheet too — at the next sync the
+              ERP stock follows the sheet again, and anything not in the sheet is shown under “Entered in ERP”.
+            </div>
 
             <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--sp-2)', marginTop: 'var(--sp-2)' }}>
               <Button variant="secondary" onClick={() => setIsMoveModalOpen(false)}>
@@ -1247,78 +1389,76 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
       {/* ── 5. Quarantined Records Modal ───────────────────────────────── */}
       {isQuarantineModalOpen && (
         <Modal
-          title={`${category} Quarantined Records`}
-          subtitle="Invalid or negative rows from the Google Sheet quarantined to protect inventory ledger integrity."
+          title={`${category}: sheet rows not counted`}
+          subtitle="Rows the Google Sheet's own stock formula does not count, or that need fixing in the sheet. Fix the row in the sheet, then Sync."
           open={isQuarantineModalOpen}
           onClose={() => setIsQuarantineModalOpen(false)}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
-            <div
-              style={{
-                padding: 'var(--sp-2) var(--sp-3)',
-                backgroundColor: 'var(--warning-50, #fef3c7)',
-                borderRadius: 'var(--radius-sm)',
-                border: '1px solid var(--warning-200, #fde68a)',
-                fontSize: 'var(--text-xs)',
-                color: 'var(--warning-900, #78350f)',
-              }}
-            >
-              <strong>Data Integrity Protection:</strong> These entries in the Google Sheet have negative stock quantities or invalid identifiers. They are quarantined with their original spreadsheet row number and excluded from live stock balance so double-entry accounting remains true.
-            </div>
+            {(quarantineData?.meta?.byReason?.length ?? 0) > 0 && (
+              <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                <Button size="sm" variant={quarantineReason === '' ? 'primary' : 'secondary'} onClick={() => setQuarantineReason('')}>
+                  All ({count(quarantineData!.meta!.byReason!.reduce((a, r) => a + r.count, 0))})
+                </Button>
+                {quarantineData!.meta!.byReason!.map((r) => (
+                  <Button
+                    key={r.reasonCode ?? 'none'}
+                    size="sm"
+                    variant={quarantineReason === (r.reasonCode ?? '') ? 'primary' : 'secondary'}
+                    onClick={() => setQuarantineReason(r.reasonCode ?? '')}
+                    title={r.label}
+                  >
+                    {(r.reasonCode ?? 'OTHER').replace(/_/g, ' ').toLowerCase()} ({count(r.count)})
+                  </Button>
+                ))}
+              </div>
+            )}
 
             {quarantineLoading ? (
               <div style={{ textAlign: 'center', padding: 'var(--sp-4)', color: 'var(--text-muted)' }}>
-                Loading quarantined records...
+                Loading…
               </div>
             ) : (!quarantineData?.data || quarantineData.data.length === 0) ? (
               <div style={{ textAlign: 'center', padding: 'var(--sp-4)', color: 'var(--success-700)' }}>
-                ✓ No quarantined records found for {category}. All rows imported cleanly!
+                ✓ Every {category} sheet row is counted. Nothing to fix.
               </div>
             ) : (
-              <div style={{ maxHeight: '380px', overflowY: 'auto' }}>
+              <div style={{ maxHeight: '420px', overflowY: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-xs)' }}>
                   <thead>
                     <tr style={{ borderBottom: '2px solid var(--border)', textAlign: 'left' }}>
-                      <th style={{ padding: '6px 8px' }}>Row #</th>
-                      <th style={{ padding: '6px 8px' }}>Sheet Tab</th>
-                      <th style={{ padding: '6px 8px' }}>Quarantine Reason</th>
-                      <th style={{ padding: '6px 8px' }}>Data Summary</th>
-                      <th style={{ padding: '6px 8px' }}>Detected At</th>
+                      <th style={{ padding: '6px 8px' }}>Sheet tab · row</th>
+                      <th style={{ padding: '6px 8px' }}>Why it is not counted / what to fix</th>
+                      <th style={{ padding: '6px 8px' }}>Row content</th>
+                      <th style={{ padding: '6px 8px' }}>Last seen</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {quarantineData.data.map((q: any) => {
-                      let rawDesc = '';
-                      try {
-                        const parsed = typeof q.raw_record_json === 'string' ? JSON.parse(q.raw_record_json) : q.raw_record_json;
-                        rawDesc = parsed.ItemCode
-                          ? `${parsed.ItemCode} - ${parsed.Description || ''} (Qty: ${parsed.StockQty || parsed.ClosingStock || ''})`
-                          : JSON.stringify(parsed).slice(0, 80);
-                      } catch {
-                        rawDesc = String(q.raw_record_json).slice(0, 80);
-                      }
-                      return (
-                        <tr key={q.id} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                          <td style={{ padding: '6px 8px' }}>
-                            <Badge tone="neutral" plain>
-                              Row {q.source_row_index ?? '—'}
-                            </Badge>
-                          </td>
-                          <td style={{ padding: '6px 8px', fontWeight: 500 }}>{q.source_tab}</td>
-                          <td style={{ padding: '6px 8px', color: 'var(--danger-700)', fontWeight: 500 }}>
-                            {q.reason}
-                          </td>
-                          <td style={{ padding: '6px 8px', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
-                            {rawDesc}
-                          </td>
-                          <td style={{ padding: '6px 8px', color: 'var(--text-faint)' }}>
-                            {formatDate(q.created_at)}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {quarantineData.data.map((q) => (
+                      <tr key={q.id} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                        <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                          <div style={{ fontWeight: 500 }}>{q.source_tab.trim()}</div>
+                          <Badge tone="neutral" plain>Row {q.source_row_index ?? '—'}</Badge>
+                        </td>
+                        <td style={{ padding: '6px 8px', color: 'var(--danger-700)' }}>{q.quarantine_reason}</td>
+                        <td
+                          style={{ padding: '6px 8px', color: 'var(--text-muted)', fontFamily: 'monospace', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                          title={(q.raw_data ?? []).join(' | ')}
+                        >
+                          {(q.raw_data ?? []).filter(Boolean).slice(0, 8).join(' | ')}
+                        </td>
+                        <td style={{ padding: '6px 8px', color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>
+                          {formatDate(q.last_seen_at ?? q.created_at)}
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
+                {(quarantineData.meta?.total ?? 0) > quarantineData.data.length && (
+                  <div style={{ padding: 'var(--sp-2)', color: 'var(--text-muted)' }}>
+                    Showing {count(quarantineData.data.length)} of {count(quarantineData.meta!.total)} — pick a reason above to narrow the list.
+                  </div>
+                )}
               </div>
             )}
 

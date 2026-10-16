@@ -31,7 +31,7 @@ import {
   Modal, Field, Textarea, Select, Input,
 } from '../../components/ui';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
-import { CategoryWorkspaceView, type InventoryCategoryKey } from './CategoryWorkspaceView';
+import { CategoryWorkspaceView, describeSync, type InventoryCategoryKey } from './CategoryWorkspaceView';
 
 /* ── Type Interfaces ────────────────────────────────────────────────────────── */
 
@@ -554,11 +554,18 @@ export default function InventoryStockPage() {
 
   // Sync All 5 Google Sheets
   const syncAllMutation = useMutation({
-    mutationFn: () => api.post<Array<{ category: string; validRecordsImported: number; quarantinedRecords: number }>>('/inventory/sync-all'),
+    mutationFn: () => api.post<Array<Parameters<typeof describeSync>[0]>>('/inventory/sync-all', {}),
     onSuccess: (results) => {
-      const totalImported = results.reduce((acc, r) => acc + (r.validRecordsImported || 0), 0);
-      const totalQuarantined = results.reduce((acc, r) => acc + (r.quarantinedRecords || 0), 0);
-      toast.success(`Synchronized all 5 Google Sheets: ${count(totalImported)} valid records imported, ${count(totalQuarantined)} quarantined.`);
+      const notDone = results.filter((r) => r.status !== 'SUCCESS');
+      if (notDone.length === 0) {
+        toast.success(`All 5 Google Sheets synced. ${results.map(describeSync).join(' ')}`);
+      } else {
+        toast.error(
+          `${notDone.map((r) => r.category).join(', ')} not fully synced: ` +
+          notDone.map((r) => r.errorMessage ?? r.status).join(' ') +
+          (results.length > notDone.length ? ` The others synced: ${results.filter((r) => r.status === 'SUCCESS').map(describeSync).join(' ')}` : ''),
+        );
+      }
       void qc.invalidateQueries({ queryKey: ['inventory-overview'] });
       void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
       void qc.invalidateQueries({ queryKey: ['inventory-category-summary'] });
