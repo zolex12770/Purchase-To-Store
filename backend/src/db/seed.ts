@@ -14,14 +14,15 @@
  *     mistaken for real business data (build brief §46, §52). Removable with
  *     `npm run db:reset`.
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, type Queryable } from './index.js';
 import { PERMISSIONS, ROLES } from '../auth/permissions.js';
 import { hashPassword } from '../auth/tokens.js';
 import { logger } from '../core/logger.js';
-import { env } from '../config/env.js';
+import { env, paths } from '../config/env.js';
 import { nextDocumentNumber, dateStamp, timeStamp } from '../domain/numbering.js';
 import { finalRate, lineAmount, toQty, toRate } from '../domain/money.js';
 
@@ -149,21 +150,65 @@ const BOOTSTRAP_ADMINS = [
   { employeeId: '10422', name: 'Secondary Administrator', designation: 'Super Admin' },
 ];
 
+/**
+ * The first-sign-in password for accounts the seed creates. The repository is
+ * public, so outside the automated test suite this is NEVER a fixed literal:
+ * BOOTSTRAP_ADMIN_PASSWORD (min. 12 characters) if set, otherwise a random one
+ * written once to <data root>/bootstrap-admin-password.txt — never to the log —
+ * and the accounts must change it at their first sign-in.
+ */
+let bootstrapSecret: { password: string; forceChange: boolean } | null = null;
+function bootstrapPassword(): { password: string; forceChange: boolean } {
+  if (bootstrapSecret) return bootstrapSecret;
+  if (env.NODE_ENV === 'test') {
+    bootstrapSecret = { password: 'Admin@12345', forceChange: false }; // test databases only
+    return bootstrapSecret;
+  }
+  const fromEnv = process.env.BOOTSTRAP_ADMIN_PASSWORD?.trim();
+  if (fromEnv && fromEnv.length >= 12) {
+    bootstrapSecret = { password: fromEnv, forceChange: true };
+    return bootstrapSecret;
+  }
+  const password = randomBytes(18).toString('base64url');
+  const file = join(paths.root, 'bootstrap-admin-password.txt');
+  mkdirSync(paths.root, { recursive: true });
+  writeFileSync(
+    file,
+    `First sign-in password for the bootstrap administrator account(s) created ${new Date().toISOString()}:\n${password}\n` +
+      'Sign in, set your own password when asked, then delete this file.\n',
+    { encoding: 'utf8', mode: 0o600 },
+  );
+  logger.warn(`Bootstrap administrator password written to ${file} — change it at first sign-in, then delete the file.`);
+  bootstrapSecret = { password, forceChange: true };
+  return bootstrapSecret;
+}
+
 async function seedBootstrapUsers(): Promise<void> {
-  const hash = await hashPassword('Admin@12345');
+  const missing = [];
   for (const admin of BOOTSTRAP_ADMINS) {
+    const exists = await queryOne<{ id: number }>(
+      'SELECT id FROM users WHERE employee_id = $1 AND deleted_at IS NULL', [admin.employeeId],
+    );
+    if (!exists) missing.push(admin);
+  }
+  if (missing.length === 0) return;
+  const secret = bootstrapPassword();
+  const hash = await hashPassword(secret.password);
+  for (const admin of missing) {
     const existing = await queryOne<{ id: number }>(
       'SELECT id FROM users WHERE employee_id = $1 AND deleted_at IS NULL',
       [admin.employeeId],
     );
     if (existing) continue;
 
+    // must_change_password used to be inserted FALSE despite the comment above,
+    // leaving a known password valid indefinitely.
     const user = await queryOne<{ id: number }>(
       `INSERT INTO users (employee_id, employee_name, designation, password_hash,
                           is_active, must_change_password)
-       VALUES ($1,$2,$3,$4,TRUE,FALSE)
+       VALUES ($1,$2,$3,$4,TRUE,$5)
        RETURNING id`,
-      [admin.employeeId, admin.name, admin.designation, hash],
+      [admin.employeeId, admin.name, admin.designation, hash, secret.forceChange],
     );
     if (!user) continue;
 
@@ -173,7 +218,7 @@ async function seedBootstrapUsers(): Promise<void> {
        ON CONFLICT DO NOTHING`,
       [user.id],
     );
-    logger.info(`  · bootstrap Super Admin created: ${admin.employeeId} (password change required)`);
+    logger.info(`  · bootstrap Super Admin created: ${admin.employeeId}${secret.forceChange ? ' (password change required at first sign-in)' : ''}`);
   }
 }
 
@@ -754,8 +799,10 @@ export async function seedDemoData(): Promise<void> {
     }
   });
 
-  // Demo users — password identical to the bootstrap credential, rotation forced.
-  const demoHash = await hashPassword('Admin@12345');
+  // Demo users — the same first-sign-in password as the bootstrap accounts (never a fixed
+  // literal outside the test suite), and they must change it at first sign-in.
+  const demoSecret = bootstrapPassword();
+  const demoHash = await hashPassword(demoSecret.password);
   await withTransaction(async (tx) => {
     for (const u of DEMO_USERS) {
       const existing = await txQueryOne<{ id: number }>(
@@ -766,8 +813,8 @@ export async function seedDemoData(): Promise<void> {
         tx,
         `INSERT INTO users (employee_id, employee_name, designation, password_hash,
                             is_active, must_change_password, department_id, seed_tag)
-         VALUES ($1,$2,$3,$4,TRUE,FALSE,$5,'demo') RETURNING id`,
-        [u.employeeId, u.name, u.designation, demoHash, lk(idx, 'DEPARTMENT', rng.pick(['PROD', 'MAINT', 'STORE', 'ADMIN']))],
+         VALUES ($1,$2,$3,$4,TRUE,$6,$5,'demo') RETURNING id`,
+        [u.employeeId, u.name, u.designation, demoHash, lk(idx, 'DEPARTMENT', rng.pick(['PROD', 'MAINT', 'STORE', 'ADMIN'])), demoSecret.forceChange],
       );
       if (created) {
         await tx.query(
