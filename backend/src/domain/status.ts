@@ -101,9 +101,13 @@ const REQUISITION_TRANSITIONS: Record<RequisitionStatus, RequisitionStatus[]> = 
   // issue transactions may land against an already-FULLY_ISSUED requisition,
   // and a reversal can fall a requisition back from FULLY to PARTIALLY. Once
   // every slip is reversed nothing is issued any more, so it returns to
-  // APPROVED (awaiting store issue) and can then be cancelled.
-  PARTIALLY_ISSUED:  ['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'CANCELLED'],
-  FULLY_ISSUED:      ['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'CANCELLED'],
+  // APPROVED (awaiting store issue) and can then be cancelled — but only
+  // recomputeRequisitionStatus makes that move, writing the derived status
+  // directly. APPROVED is deliberately absent here: the HOD's approve action
+  // checks this table, and must never pull an issued requisition back to
+  // APPROVED with stock still out against it (a stale approval screen).
+  PARTIALLY_ISSUED:  ['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'CANCELLED'],
+  FULLY_ISSUED:      ['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'CANCELLED'],
   CANCELLED:         [],
 };
 

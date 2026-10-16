@@ -6,7 +6,8 @@
  *      REQUISITION_REVERSAL entry, the slip is kept and marked REVERSED, the
  *      requisition's status is re-derived, every total ignores the slip, it cannot
  *      be reversed twice, and once all slips are reversed the requisition can be
- *      cancelled.
+ *      cancelled. The approve action still refuses an issued requisition: only
+ *      that re-derivation moves it back to APPROVED.
  *   2. A GRN can be cancelled once the issue that consumed it is reversed (the
  *      guard counts NET requisition consumption).
  *   3. Hard-delete refuses posted stock documents; inspecting a GRN no longer fails.
@@ -255,6 +256,46 @@ describe('requisition issue slips can be reversed', () => {
       .send({ reason: 'No longer needed' });
     expect(cancel.status).toBe(200);
     expect((await requisition(req.id)).status).toBe('CANCELLED');
+  });
+});
+
+describe('an issued requisition cannot be approved again', () => {
+  // Only the re-derivation after a reversal may move an issued requisition back to
+  // APPROVED. The approve action must still refuse one: a HOD on a stale
+  // PENDING_APPROVAL screen, clicking Approve after another approver approved and
+  // Stores issued, would otherwise reset it to APPROVED with stock still out.
+  // The Super Admin skips the HOD and self-approval checks, so a refusal for them is
+  // a refusal for every approver.
+  it('refuses approve on a PARTIALLY_ISSUED and a FULLY_ISSUED requisition and changes nothing', async () => {
+    const itemId = await mkItem('TREV2-E');
+    await grnDirect(itemId, '20');
+    const req = await approvedRequisition(itemId, '10');
+    const header = async () => (await query<{ status: string; hod_decided_at: unknown; hod_decided_by: unknown }>(
+      'SELECT status, hod_decided_at, hod_decided_by FROM requisition_headers WHERE id = $1', [req.id],
+    ))[0]!;
+    const approvals = async () => Number((await query<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM requisition_approvals WHERE requisition_id = $1 AND action = 'APPROVE'`, [req.id],
+    ))[0]!.n);
+    const approve = () => request(app).post(api(`/requisitions/${req.id}/approve`)).set(auth(adminToken)).send({});
+
+    await issue(req.id, req.lineId, '4');
+    const partial = await header();
+    expect(partial.status).toBe('PARTIALLY_ISSUED');
+    const refusedPartial = await approve();
+    expect(refusedPartial.status).toBe(422);
+    expect(refusedPartial.body.error.message).toMatch(/Partially Issued cannot become Approved/);
+    expect(await header()).toEqual(partial);
+
+    await issue(req.id, req.lineId, '6');
+    const full = await header();
+    expect(full.status).toBe('FULLY_ISSUED');
+    const refusedFull = await approve();
+    expect(refusedFull.status).toBe(422);
+    expect(refusedFull.body.error.message).toMatch(/Fully Issued cannot become Approved/);
+    expect(await header()).toEqual(full);
+
+    expect(await approvals()).toBe(1); // the original approval only
+    expect(Number((await requisition(req.id)).total_issued_qty)).toBe(10);
   });
 });
 

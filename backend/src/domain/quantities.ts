@@ -284,7 +284,9 @@ export async function recomputeIndentClosure(tx: Queryable, indentId: number): P
  * PARTIALLY_ISSUED. Called after every issue and every issue reversal, both of
  * which change what the requisition has received, so the header is always
  * stamped. Any other status (draft, pending, rejected, cancelled) is a decision
- * a person made and is left alone.
+ * a person made and is left alone. The derived status is written without
+ * assertRequisitionTransition on purpose: issued -> APPROVED is not in the
+ * transition table, which keeps it out of reach of the approve action.
  */
 export async function recomputeRequisitionStatus(
   tx: Queryable,
