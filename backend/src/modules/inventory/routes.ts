@@ -101,7 +101,7 @@ router.get(
         COALESCE(SUM(ii.live_stock_qty * COALESCE(ii.unit_price, 0)), 0)::numeric(18, 2) AS valuation,
         COUNT(CASE WHEN ii.live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
         COUNT(CASE WHEN ii.live_stock_qty > 0 THEN 1 END)::int AS positive_stock_count,
-        COUNT(CASE WHEN ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 1 END)::int AS critical_count,
+        COUNT(CASE WHEN ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 1 END)::int AS critical_count,
         COUNT(CASE WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 AND NOT (ii.available_qty < ii.min_stock_level) THEN 1 END)::int AS below_reorder_count,
         COALESCE(q.quarantined_count, 0)::int AS quarantined_count
       FROM inventory_items ii
@@ -282,6 +282,17 @@ router.get(
          WHERE status IN ('PENDING_QC', 'QC_IN_PROGRESS')
          GROUP BY item_id
       ) qc ON qc.item_id = i.id
+      -- Valuation rate: the Item Master's standard rate, else the store's own rate from the
+      -- inventory sheet the stock comes from. No Purchase item has a standard rate (all
+      -- 17,379 were 0 on 2026-10-16), so valuing at standard rate alone showed Rs 0 for
+      -- 3,191 items while the Overview valued the same stock at sheet rates.
+      LEFT JOIN LATERAL (
+        SELECT ii.unit_price AS sheet_rate
+          FROM inventory_items ii
+         WHERE ii.item_id = i.id AND ii.deleted_at IS NULL AND COALESCE(ii.unit_price, 0) > 0
+         ORDER BY (ii.category = i.inventory_category) DESC, ii.id
+         LIMIT 1
+      ) sr ON TRUE
     `;
 
     // Filter by stockStatus in SQL wrapper
@@ -326,6 +337,8 @@ router.get(
       critical_stock: string;
       excess_stock: string;
       total_valuation: string;
+      unvalued_with_stock: string;
+      sheet_rated_with_stock: string;
       total_fg: string;
       total_rm: string;
       total_trading: string;
@@ -338,7 +351,9 @@ router.get(
          COUNT(CASE WHEN t.stock_status = 'BELOW_REORDER' THEN 1 END) AS below_reorder,
          COUNT(CASE WHEN t.stock_status = 'CRITICAL' THEN 1 END) AS critical_stock,
          COUNT(CASE WHEN t.stock_status = 'EXCESS' THEN 1 END) AS excess_stock,
-         COALESCE(SUM(t.live_stock_qty * COALESCE(t.standard_rate, 0)), 0) AS total_valuation,
+         COALESCE(SUM(t.live_stock_qty * t.valuation_rate), 0) AS total_valuation,
+         COUNT(CASE WHEN t.live_stock_qty > 0 AND t.valuation_rate = 0 THEN 1 END) AS unvalued_with_stock,
+         COUNT(CASE WHEN t.live_stock_qty > 0 AND t.valuation_basis = 'SHEET' THEN 1 END) AS sheet_rated_with_stock,
          COUNT(CASE WHEN t.inventory_category = 'FG' THEN 1 END) AS total_fg,
          COUNT(CASE WHEN t.inventory_category = 'RM' THEN 1 END) AS total_rm,
          COUNT(CASE WHEN t.inventory_category = 'TRADING' THEN 1 END) AS total_trading,
@@ -348,7 +363,8 @@ router.get(
          SELECT i.id,
                 i.inventory_category,
                 i.live_stock_qty,
-                i.standard_rate,
+                COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0) AS valuation_rate,
+                CASE WHEN COALESCE(i.standard_rate, 0) > 0 THEN 'STANDARD' WHEN sr.sheet_rate IS NOT NULL THEN 'SHEET' ELSE 'NONE' END AS valuation_basis,
                 CASE
                   WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
                        OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
@@ -377,7 +393,8 @@ router.get(
                i.item_description,
                i.inventory_category AS category,
                COALESCE(i.opening_stock_qty, 0) AS opening_stock_qty,
-               ROUND((i.live_stock_qty * COALESCE(i.standard_rate, 0)), 2) AS stock_valuation,
+               ROUND((i.live_stock_qty * COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0)), 2) AS stock_valuation,
+               CASE WHEN COALESCE(i.standard_rate, 0) > 0 THEN 'STANDARD' WHEN sr.sheet_rate IS NOT NULL THEN 'SHEET' ELSE 'NONE' END AS valuation_basis,
                u.id AS uom_id,
                COALESCE(u.code, '') AS uom_code,
                COALESCE(u.name, '') AS uom_name,
@@ -446,6 +463,10 @@ router.get(
         criticalStock: Number(summaryRow?.critical_stock ?? 0),
         excessStock: Number(summaryRow?.excess_stock ?? 0),
         totalValuation: Number(summaryRow?.total_valuation ?? 0),
+        // How the figure was reached, so a screen never presents an unvalued stock as Rs 0.
+        valuationBasis: 'Item Master standard rate, else the store sheet rate',
+        unvaluedWithStock: Number(summaryRow?.unvalued_with_stock ?? 0),
+        sheetRatedWithStock: Number(summaryRow?.sheet_rated_with_stock ?? 0),
         categories: {
           FG: Number(summaryRow?.total_fg ?? 0),
           RM: Number(summaryRow?.total_rm ?? 0),
@@ -502,7 +523,7 @@ router.get(
              COALESCE(i.max_stock, 0) AS max_stock,
              COALESCE(ind.pending_indent_qty, 0) AS pending_indents,
              COALESCE(po.pending_po_qty, 0) AS pending_pos,
-             ROUND((i.live_stock_qty * COALESCE(i.standard_rate, 0)), 2) AS stock_valuation,
+             ROUND((i.live_stock_qty * COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0)), 2) AS stock_valuation,
              CASE
                WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
                  THEN 'CRITICAL'
@@ -537,6 +558,13 @@ router.get(
            WHERE is_receivable = TRUE
            GROUP BY item_id
         ) po ON po.item_id = i.id
+        LEFT JOIN LATERAL (
+          SELECT ii.unit_price AS sheet_rate
+            FROM inventory_items ii
+           WHERE ii.item_id = i.id AND ii.deleted_at IS NULL AND COALESCE(ii.unit_price, 0) > 0
+           ORDER BY (ii.category = i.inventory_category) DESC, ii.id
+           LIMIT 1
+        ) sr ON TRUE
        ${b.where()}
        ORDER BY i.item_code ASC
        LIMIT 10000
@@ -1562,7 +1590,7 @@ router.get(
 
     if (q.status !== 'ALL') {
       if (q.status === 'CRITICAL') {
-        whereClause += ` AND (ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0))`;
+        whereClause += ` AND (ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0))`;
       } else if (q.status === 'BELOW_REORDER') {
         whereClause += ` AND (ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 AND NOT (ii.available_qty < ii.min_stock_level))`;
       } else if (q.status === 'EXCESS') {
@@ -1622,7 +1650,7 @@ router.get(
         ii.recon_status,
         ii.recon_note,
         CASE
-          WHEN ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
+          WHEN ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
           WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 THEN 'BELOW_REORDER'
           WHEN ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2) THEN 'EXCESS'
           ELSE 'NORMAL'
@@ -1807,7 +1835,7 @@ router.get(
          ii.unit_price,
          ROUND((ii.live_stock_qty * COALESCE(ii.unit_price, 0)), 2) AS valuation,
          CASE
-           WHEN ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
+           WHEN ii.live_stock_qty < 0 OR ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
            WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 THEN 'BELOW_REORDER'
            WHEN ii.reorder_point > 0 AND ii.available_qty > (ii.reorder_point * 2) THEN 'EXCESS'
            ELSE 'NORMAL'

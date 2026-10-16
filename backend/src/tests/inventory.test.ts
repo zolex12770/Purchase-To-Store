@@ -116,6 +116,32 @@ describe('Enterprise Inventory Module API', () => {
     expect(res.body.meta.summary.totalValuation).toBeDefined();
   });
 
+  // Production, 2026-10-16: no Purchase item had a standard rate, so the register valued
+  // 3,191 items at Rs 0 while the Overview valued the same stock at the sheets' rates.
+  it('GET /api/v1/inventory/stock values stock at the sheet rate when the item has no standard rate, and says so', async () => {
+    const { query } = await import('../db/index.js');
+    const mk = async (code: string, stock: number) => (await query<{ id: number }>(
+      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, standard_rate, is_active)
+       VALUES ($1, $1, 'GENERAL', $2, 0, TRUE) RETURNING id`, [code, stock],
+    ))[0]!.id;
+    const sheetRated = await mk('TEST-INV-SHEETRATE', 4);
+    await mk('TEST-INV-NORATE', 3);
+    await query(
+      `INSERT INTO inventory_items (item_id, item_code, item_description, category, live_stock_qty, unit_price)
+       VALUES ($1, 'TEST-INV-SHEETRATE', 'TEST-INV-SHEETRATE', 'GENERAL', 4, 12.5)`, [sheetRated],
+    );
+    const res = await request(app).get('/api/v1/inventory/stock?category=GENERAL&search=TEST-INV-').set(auth(adminToken));
+    expect(res.status).toBe(200);
+    const row = (code: string) => res.body.data.find((r: { item_code: string }) => r.item_code === code);
+    expect(row('TEST-INV-SHEETRATE')).toMatchObject({ valuation_basis: 'SHEET' });
+    expect(Number(row('TEST-INV-SHEETRATE').stock_valuation)).toBe(50);
+    expect(row('TEST-INV-NORATE')).toMatchObject({ valuation_basis: 'NONE' });
+    expect(row('TEST-INV-001')).toMatchObject({ valuation_basis: 'STANDARD' });
+    expect(res.body.meta.summary.totalValuation).toBe(5050);
+    expect(res.body.meta.summary.unvaluedWithStock).toBe(1);
+    expect(res.body.meta.summary.sheetRatedWithStock).toBe(1);
+  });
+
   it('GET /api/v1/inventory/stock/export outputs CSV with Category, Opening Stock, and Valuation', async () => {
     const res = await request(app)
       .get('/api/v1/inventory/stock/export?category=GENERAL')
