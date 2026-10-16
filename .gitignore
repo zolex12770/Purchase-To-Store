@@ -7,6 +7,12 @@ node_modules/
 dist/
 build/
 *.tsbuildinfo
+# Deploy staging and rollback copies (dist-next is built, then swapped in as dist;
+# the previous build is kept as dist-prev-<stamp>). A tracked dist-next could be
+# deployed by mistake as a stale build, so none of them are versioned.
+dist-next/
+dist-prev-*/
+dist-failed-*/
 
 # ── Secrets and environment (SRS §25, §27) ────────────────────────────────────
 # Only .env.example is ever committed.
