@@ -385,8 +385,8 @@ function analyse(backup, sheets) {
     const rows = ledger.get(String(it.id)) ?? [];
     const B = rows.reduce((a, l) => a + S(l.inward_qty) - S(l.outward_qty), 0);
     const I = S(it.live_stock_qty);
-    // Exactly the rule of GET /items/analysis/stock-reconciliation.
-    if (!(Math.abs(Number((B / 10000).toFixed(4)) - Number(it.live_stock_qty)) > 0.0001)) continue;
+    // Exactly the rule of GET /items/analysis/stock-reconciliation: |ledger − live| > 0.0001.
+    if (Math.abs(I - B) <= 1) continue;
 
     const code = it.item_code.toUpperCase();
     const itemUom = uomCode.get(String(it.uom_id)) ?? null;
