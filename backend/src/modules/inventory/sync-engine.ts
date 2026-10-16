@@ -1,983 +1,977 @@
 /**
- * Inventory Google Sheets Synchronisation Engine
+ * Inventory Google Sheets synchronisation (read-only on the Google side).
  *
- * Imports and reconciles live inventory data across all 5 authoritative Google Sheets:
- *  - Raw Material (RM)
- *  - Finished Goods (FG)
- *  - Trading Material
- *  - Work-in-Progress (WIP)
- *  - General Store Items
+ * One run per category:
+ *   1. Read every needed range in ONE batchGet, before any database transaction
+ *      is opened (no lock is held while waiting on Google).
+ *   2. Classify every row with the pure rules in sheet-model.ts — the sheets' own
+ *      live-stock formulas. Rows the sheet does not count are reported with a
+ *      reason (quarantine) or counted in the report, never silently dropped.
+ *   3. Apply the category in ONE transaction, so the ERP always reflects one
+ *      consistent reading of the sheet:
+ *        · live-stock tab  → inventory_items (opening, live stock, adjustment total)
+ *        · movement tabs   → inventory_transactions, identified by content
+ *                            (source_key), not by row number. A movement that
+ *                            disappears from the sheet is REVERSED with a reason,
+ *                            never deleted; edits to its identity show as a
+ *                            reversal plus a new movement.
+ *        · per-item proof  → opening + inward − outward + adjustments vs the
+ *                            sheet's live stock, stored on inventory_items
+ *        · Purchase stock  → items.live_stock_qty follows the sheet total for
+ *                            the code; every change is written to stock_ledger
+ *                            as SHEET_SYNC, so the ledger explains each figure.
+ *   4. Record a per-tab reconciliation report (inventory_sync_checkpoints).
+ *
+ * Safety valve: a tab whose new reading would reverse an unusually large share of
+ * its movements (a cleared or re-sorted sheet, a partial read) is BLOCKED — left
+ * exactly as it was — until an administrator re-runs with `applyLargeChanges`.
+ * `dryRun` performs the whole run and rolls it back, returning the report.
  */
-import { withTransaction, txQuery, txQueryOne } from '../../db/index.js';
+import crypto from 'node:crypto';
+import { withTransaction, txQuery, query, type Queryable } from '../../db/index.js';
 import { env } from '../../config/env.js';
 import { logger } from '../../core/logger.js';
-import { type InventoryCategory } from '../../domain/inventory.js';
+import { INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
+import {
+  INVENTORY_SHEETS, ADJUSTMENT_TAB, financialYearMonths, colIndex,
+  parseStockTab, parseMovementTab, parseAdjustmentTab, reconcileItems,
+  REPORT_ONLY,
+  type CategorySheetConfig, type ExclusionCode, type MovementParse, type MovementRecord,
+  type QuarantineCandidate, type Row, type StockParse,
+} from './sheet-model.js';
+
+/* ── Result shapes ──────────────────────────────────────────────────────────── */
+
+export interface TabSyncReport {
+  tab: string;
+  kind: 'STOCK' | 'MOVEMENT' | 'ADJUSTMENT';
+  range: string;
+  firstDataRow: number;
+  sourceRows: number;
+  blankRows: number;
+  /** Rows the sheet's own formula counts (all imported unless the tab is BLOCKED). */
+  validRows: number;
+  excluded: Partial<Record<ExclusionCode, number>>;
+  /** Counted rows the sheet owner should still correct (e.g. a Month cell holding a date). */
+  warnings?: Record<string, number>;
+  quarantined: number;
+  inserted: number;
+  updated: number;
+  unchanged: number;
+  reversed: number;
+  duplicateRows?: number;
+  duplicateCodes?: string[];
+  firstRecord: string | null;
+  lastRecord: string | null;
+  status: 'SUCCESS' | 'BLOCKED';
+  message?: string;
+}
+
+export interface ItemMismatch {
+  itemCode: string;
+  sheetLive: number;
+  computed: number;
+  difference: number;
+  note: string;
+}
 
 export interface CategorySyncResult {
   category: InventoryCategory;
   spreadsheetId: string;
-  tabsProcessed: string[];
-  totalRowsRead: number;
-  itemsUpserted: number;
-  transactionsImported: number;
-  quarantinedRows: number;
-  durationMs: number;
+  runId: string;
+  dryRun: boolean;
   status: 'SUCCESS' | 'PARTIAL' | 'FAILED';
+  startedAt: string;
+  durationMs: number;
+  tabs: TabSyncReport[];
+  items: { inSheet: number; inserted: number; updated: number; noLongerInSheet: number; negativeInSheet: number; linkedToPurchaseItem: number };
+  reconciliation: { checked: number; matched: number; mismatched: number; mismatches: ItemMismatch[] };
+  purchaseStock: { aligned: number; negativeHeldAtZero: string[]; categoryChanged: number };
+  /** Totals kept for the screens that show a one-line toast. */
+  totalRowsRead: number;
+  validRecordsImported: number;
+  transactionsImported: number;
+  quarantinedRecords: number;
   errorMessage?: string;
 }
 
-export const SHEET_SOURCES: Record<
-  InventoryCategory,
-  {
-    spreadsheetId: string;
-    stockTab: string;
-    stockRange: string;
-    codeCol: number;
-    descCol: number;
-    qtyCol: number;
-    weightCol?: number;
-    uomCol?: number;
-    rackCol?: number;
-    rateCol?: number;
-    amountCol?: number;
-    mainGroupCol?: number;
-    weight1000pcCol?: number;
-    markingCol?: number;
-    seriesCol?: number;
-    headerRow: number;
-  }
-> = {
-  RM: {
-    spreadsheetId: '1smKiS3li81F7aH2pQ0JGgDLp7302d48FJkvWefRf8R4',
-    stockTab: 'RM Stock Live',
-    stockRange: "'RM Stock Live'!A9:Z",
-    codeCol: 1, // Item Code (Col B)
-    descCol: 2, // Item Name (Col C)
-    mainGroupCol: 4, // Main Group (Col E)
-    rackCol: 5, // Rack ID (Col F)
-    qtyCol: 6, // Live Stock KG (Col G)
-    weightCol: 6, // KG
-    amountCol: 7, // Amount (Col H)
-    uomCol: -1, // default KG
-    rateCol: -1,
-    headerRow: 1,
-  },
-  FG: {
-    spreadsheetId: '1mA5il8Jqjgal9g20o-UzqQGv3y-mgPHpjl9KU-XomyQ',
-    stockTab: 'FG  Stock Live',
-    stockRange: "'FG  Stock Live'!A11:Z",
-    codeCol: 1, // Item Code (Col B)
-    markingCol: 2, // Marking (Col C)
-    weight1000pcCol: 3, // 1000pc Weight (Col D)
-    seriesCol: 4, // Customer / Series Name (Col E)
-    descCol: 5, // Description (Col F)
-    rackCol: 6, // Rack Id (Col G)
-    qtyCol: 7, // Store Live Stock in Nos (Col H)
-    weightCol: 8, // Store Live Stock in Kgs (Col I)
-    uomCol: -1, // default Nos
-    rateCol: -1,
-    headerRow: 1,
-  },
-  TRADING: {
-    spreadsheetId: '14AHr2aSmpcCxfNhcWnjGU1DVE-BfJpLOWrnFn3bkilk',
-    stockTab: 'Trading Live Stock',
-    stockRange: "'Trading Live Stock'!A9:Z",
-    codeCol: 1, // Item Code (Col B)
-    descCol: 2, // Item Name (Col C)
-    mainGroupCol: 3, // Group (Col D)
-    uomCol: 4, // Unit (Col E)
-    rackCol: 5, // Rack ID (Col F)
-    rateCol: 6, // Rate(Rs) (Col G)
-    qtyCol: 7, // Live Stock (Qty) (Col H)
-    amountCol: 8, // Live Stock Amount (Rs) (Col I)
-    headerRow: 1,
-  },
-  WIP: {
-    spreadsheetId: '1BirIwXOG4F604q5n1UY0r6kjet4mTdmbhC9FDbTrUXs',
-    stockTab: 'WIP  Stock Live',
-    stockRange: "'WIP  Stock Live'!A10:Z",
-    codeCol: 0, // Item Code (Col A)
-    markingCol: 5, // Marking (Col F)
-    weight1000pcCol: 6, // 1000pc Weight (Col G)
-    seriesCol: 7, // Series (Col H)
-    descCol: 8, // Description (Col I)
-    rackCol: 9, // Rack Id (Col J)
-    qtyCol: 10, // Store Live Stock in Nos (Col K)
-    weightCol: 11, // Store Live Stock in Kgs (Col L)
-    uomCol: -1, // default Nos
-    rateCol: -1,
-    headerRow: 1,
-  },
-  GENERAL: {
-    spreadsheetId: '1VnpDk6kBK2xUGJTVB1CCqlG105UX0_Gs0aAv-bnMpKY',
-    stockTab: 'General Item Live Stock',
-    stockRange: "'General Item Live Stock'!A7:Z",
-    codeCol: 1, // Item Code (Col B)
-    descCol: 2, // Item Name (Col C)
-    mainGroupCol: 3, // Main Group (Col D)
-    uomCol: 4, // Unit (Col E)
-    rackCol: 6, // Rack ID (Col G)
-    qtyCol: 7, // Live Stock Qty (Col H)
-    amountCol: 8, // Live Stock Amount (Rs) (Col I)
-    rateCol: -1,
-    headerRow: 1, // row 7 is header, data starts at index 1 (row 8)
-  },
-};
-
-export interface TxnTabConfig {
-  category: InventoryCategory;
-  tabName: string;
-  range: string;
-  slug: string;
-  direction: 'IN' | 'OUT';
-  txnType: string;
-  codeCol: number;
-  qtyCol: number;
-  altQtyCol?: number;
-  dateCol?: number;
-  weightCol?: number;
-  docNoCol?: number;
-  refDocCol?: number;
-  supplierCol?: number;
-  poCol?: number;
-  descCol?: number;
-  nameCol?: number;
-  uomCol?: number;
-  rateCol?: number;
-  amountCol?: number;
-  deptCol?: number;
-  notesCol?: number;
-  fromLocationCol?: number;
-  toLocationCol?: number;
-  fallbackUom: string;
+export interface SyncOptions {
+  dryRun?: boolean;
+  applyLargeChanges?: boolean;
+  userId?: number | null;
+  runId?: string;
+  /** Replaces the Google read — tests supply sheet contents directly. */
+  reader?: (cfg: CategorySheetConfig) => Promise<CategoryRead>;
 }
 
-export const CATEGORY_TXN_CONFIG: Record<InventoryCategory, TxnTabConfig[]> = {
-  RM: [
-    {
-      category: 'RM',
-      tabName: 'GRN Inward',
-      range: "'GRN Inward'!A8:Z",
-      slug: 'GRN',
-      direction: 'IN',
-      txnType: 'GRN_INWARD',
-      codeCol: 9,
-      descCol: 10,
-      qtyCol: 18,
-      weightCol: 18,
-      dateCol: 5,
-      docNoCol: 4,
-      supplierCol: 6,
-      refDocCol: 7,
-      poCol: 11,
-      uomCol: 15,
-      rateCol: 17,
-      amountCol: 20,
-      fallbackUom: 'Kg',
-    },
-    {
-      category: 'RM',
-      tabName: 'RM Outward',
-      range: "'RM Outward'!A8:Z",
-      slug: 'OUT',
-      direction: 'OUT',
-      txnType: 'RM_OUTWARD',
-      codeCol: 6,
-      descCol: 7,
-      nameCol: 7,
-      qtyCol: 8,
-      weightCol: 8,
-      dateCol: 4,
-      docNoCol: 10,
-      refDocCol: 9,
-      rateCol: 14,
-      amountCol: 15,
-      fallbackUom: 'Kg',
-    },
-    {
-      category: 'RM',
-      tabName: 'Production Inward',
-      range: "'Production Inward'!A8:Z",
-      slug: 'PROD',
-      direction: 'IN',
-      txnType: 'PRODUCTION_INWARD',
-      codeCol: 6,
-      descCol: 7,
-      nameCol: 7,
-      qtyCol: 8,
-      weightCol: 8,
-      dateCol: 4,
-      refDocCol: 9,
-      rateCol: 14,
-      amountCol: 15,
-      fallbackUom: 'Kg',
-    },
-  ],
-  FG: [
-    {
-      category: 'FG',
-      tabName: 'Inward FG ',
-      range: "'Inward FG '!A7:Z",
-      slug: 'IN',
-      direction: 'IN',
-      txnType: 'PACKING_INWARD',
-      codeCol: 4,
-      dateCol: 2,
-      docNoCol: 3,
-      refDocCol: 7,
-      qtyCol: 11,
-      altQtyCol: 6,
-      weightCol: 14,
-      fallbackUom: 'Nos',
-    },
-    {
-      category: 'FG',
-      tabName: 'Outward FG',
-      range: "'Outward FG'!A7:Z",
-      slug: 'OUT',
-      direction: 'OUT',
-      txnType: 'DISPATCH_OUTWARD',
-      codeCol: 4,
-      dateCol: 2,
-      notesCol: 3,
-      qtyCol: 6,
-      refDocCol: 7,
-      weightCol: 10,
-      fallbackUom: 'Nos',
-    },
-  ],
-  TRADING: [
-    {
-      category: 'TRADING',
-      tabName: 'Inward Trading',
-      range: "'Inward Trading'!A8:Z",
-      slug: 'IN',
-      direction: 'IN',
-      txnType: 'PURCHASE_INWARD',
-      dateCol: 2,
-      descCol: 3,
-      codeCol: 4,
-      nameCol: 5,
-      uomCol: 7,
-      qtyCol: 9,
-      altQtyCol: 8,
-      rateCol: 11,
-      fallbackUom: 'Nos',
-    },
-    {
-      category: 'TRADING',
-      tabName: 'Outward Trading ',
-      range: "'Outward Trading '!A7:Z",
-      slug: 'OUT',
-      direction: 'OUT',
-      txnType: 'TRADING_ISSUE',
-      dateCol: 2,
-      notesCol: 3,
-      codeCol: 4,
-      nameCol: 5,
-      uomCol: 7,
-      qtyCol: 8,
-      refDocCol: 9,
-      rateCol: 12,
-      amountCol: 13,
-      fallbackUom: 'Nos',
-    },
-  ],
-  WIP: [
-    {
-      category: 'WIP',
-      tabName: 'Inward WIP',
-      range: "'Inward WIP'!A8:Z",
-      slug: 'IN',
-      direction: 'IN',
-      txnType: 'WIP_STAGE_INWARD',
-      dateCol: 2,
-      deptCol: 3,
-      docNoCol: 4,
-      codeCol: 5,
-      qtyCol: 9,
-      altQtyCol: 7,
-      weightCol: 12,
-      fallbackUom: 'Nos',
-    },
-    {
-      category: 'WIP',
-      tabName: 'Outward WIP',
-      range: "'Outward WIP'!A8:Z",
-      slug: 'OUT',
-      direction: 'OUT',
-      txnType: 'WIP_STAGE_OUTWARD',
-      dateCol: 2,
-      notesCol: 3,
-      codeCol: 4,
-      qtyCol: 6,
-      refDocCol: 7,
-      weightCol: 10,
-      fallbackUom: 'Nos',
-    },
-  ],
-  GENERAL: [
-    {
-      category: 'GENERAL',
-      tabName: 'GRN Register (Store Inward Entry)',
-      range: "'GRN Register (Store Inward Entry)'!A8:Z",
-      slug: 'GRN',
-      direction: 'IN',
-      txnType: 'GRN_INWARD',
-      docNoCol: 4,
-      dateCol: 5,
-      supplierCol: 6,
-      refDocCol: 7,
-      codeCol: 9,
-      descCol: 10,
-      poCol: 11,
-      rateCol: 17,
-      qtyCol: 18,
-      altQtyCol: 14,
-      amountCol: 20,
-      fallbackUom: 'Nos',
-    },
-    {
-      category: 'GENERAL',
-      tabName: 'Issue Register (Store Outward Entry)',
-      range: "'Issue Register (Store Outward Entry)'!A7:Z",
-      slug: 'ISS',
-      direction: 'OUT',
-      txnType: 'STORE_ISSUE',
-      docNoCol: 1,
-      dateCol: 3,
-      notesCol: 4,
-      codeCol: 6,
-      descCol: 7,
-      fromLocationCol: 9,
-      toLocationCol: 11,
-      qtyCol: 13,
-      uomCol: 14,
-      rateCol: 15,
-      amountCol: 16,
-      fallbackUom: 'Nos',
-    },
-  ],
-};
+/* ── Google read ────────────────────────────────────────────────────────────── */
 
-/**
- * Robust date parser supporting DD-MM-YYYY, DD-MM-YY, YYYY-MM-DD and Excel serial dates
- */
-export function parseSheetDate(raw: unknown): string {
-  if (raw === undefined || raw === null) return new Date().toISOString().slice(0, 10);
-  const s = String(raw).trim();
-  if (!s || s === '-' || s === '0' || s.toLowerCase() === 'n/a') {
-    return new Date().toISOString().slice(0, 10);
-  }
-
-  // Serial date number (Excel/Google Sheets)
-  if (/^\d{5}$/.test(s)) {
-    const serial = parseInt(s, 10);
-    const ms = (serial - 25569) * 86400 * 1000;
-    const d = new Date(ms);
-    if (!isNaN(d.getTime())) {
-      return d.toISOString().slice(0, 10);
-    }
-  }
-
-  // YYYY-MM-DD
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    return s;
-  }
-
-  // DD-MM-YYYY or DD/MM/YYYY
-  const dmyMatch = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
-  if (dmyMatch) {
-    const day = dmyMatch[1].padStart(2, '0');
-    const month = dmyMatch[2].padStart(2, '0');
-    const year = dmyMatch[3];
-    return `${year}-${month}-${day}`;
-  }
-
-  // DD-MM-YY or DD/MM/YY
-  const dmyShortMatch = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2})$/);
-  if (dmyShortMatch) {
-    const day = dmyShortMatch[1].padStart(2, '0');
-    const month = dmyShortMatch[2].padStart(2, '0');
-    const yy = parseInt(dmyShortMatch[3], 10);
-    const fullYear = yy < 50 ? 2000 + yy : 1900 + yy;
-    return `${fullYear}-${month}-${day}`;
-  }
-
-  const parsed = new Date(s);
-  if (!isNaN(parsed.getTime())) {
-    return parsed.toISOString().slice(0, 10);
-  }
-
-  return new Date().toISOString().slice(0, 10);
-}
-
-/**
- * Robust numeric parser handling commas, currency symbols, and formula artifacts
- */
-export function parseSheetNum(val: unknown, fallback = 0): number {
-  if (val === undefined || val === null) return fallback;
-  const s = String(val).replace(/,/g, '').trim();
-  if (!s || s === '-' || s.startsWith('=')) return fallback;
-  const n = parseFloat(s);
-  return isNaN(n) ? fallback : n;
-}
-
-/**
- * Get authenticated Google Sheets API client
- */
 async function getSheetsClient() {
   const { google } = await import('googleapis');
   const { GoogleAuth } = await import('google-auth-library');
-
   const keyFile = env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || 'C:\\secure\\google-service-account.json';
-  const auth = new GoogleAuth({
-    keyFile,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-  });
-
+  const auth = new GoogleAuth({ keyFile, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
   return google.sheets({ version: 'v4', auth: auth as never });
 }
 
+const quoteTab = (tab: string) => `'${tab.replace(/'/g, "''")}'`;
+
+export interface CategoryRead {
+  stockMain: Row[];
+  stockOpening: Row[];
+  stockAdjustment: Row[];
+  movements: Row[][];
+  adjustments: Row[];
+  ranges: string[];
+}
+
+export function rangesFor(cfg: CategorySheetConfig): string[] {
+  const s = cfg.stock;
+  return [
+    `${quoteTab(s.tab)}!A${s.headerRow}:${s.lastCol}`,
+    `${quoteTab(s.tab)}!${s.openingCol}${s.headerRow}:${s.openingCol}`,
+    `${quoteTab(s.tab)}!${s.adjustmentCol}${s.headerRow}:${s.adjustmentCol}`,
+    ...cfg.movements.map((m) => `${quoteTab(m.tab)}!A${m.firstRow}:Z`),
+    `${quoteTab(ADJUSTMENT_TAB.tab)}!A${ADJUSTMENT_TAB.firstRow}:K`,
+  ];
+}
+
+async function readCategory(cfg: CategorySheetConfig): Promise<CategoryRead> {
+  const sheets = await getSheetsClient();
+  const ranges = rangesFor(cfg);
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const res = await sheets.spreadsheets.values.batchGet({
+        spreadsheetId: cfg.spreadsheetId,
+        ranges,
+        // Raw numbers (no thousands separators or display rounding); dates as the sheet shows them.
+        valueRenderOption: 'UNFORMATTED_VALUE',
+        dateTimeRenderOption: 'FORMATTED_STRING',
+      });
+      const vr = res.data.valueRanges ?? [];
+      if (vr.length !== ranges.length) {
+        throw new Error(`Google returned ${vr.length} of ${ranges.length} ranges.`);
+      }
+      const rows = (i: number) => (vr[i]?.values ?? []) as Row[];
+      const n = cfg.movements.length;
+      return {
+        stockMain: rows(0), stockOpening: rows(1), stockAdjustment: rows(2),
+        movements: cfg.movements.map((_, i) => rows(3 + i)),
+        adjustments: rows(3 + n),
+        ranges,
+      };
+    } catch (err) {
+      lastErr = err;
+      const status = (err as { code?: unknown }).code ?? (err as { status?: unknown }).status;
+      // Network errors carry a string code (ECONNRESET …); HTTP errors a number.
+      const transient = typeof status !== 'number' || status === 429 || status >= 500;
+      if (!transient || attempt === 3) break;
+      await new Promise((r) => setTimeout(r, 1500 * attempt));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+/* ── Small helpers ──────────────────────────────────────────────────────────── */
+
+export function newRunId(): string {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, '').replace('T', '-');
+  return `INV-${stamp}-${crypto.randomBytes(2).toString('hex')}`;
+}
+
+/** Runs `sql` with `$1` = a JSON array of row objects, in chunks. */
+async function jsonBatch(tx: Queryable, sql: string, rows: object[], extra: unknown[] = [], chunk = 1000): Promise<void> {
+  for (let i = 0; i < rows.length; i += chunk) {
+    await tx.query(sql, [JSON.stringify(rows.slice(i, i + chunk)), ...extra]);
+  }
+}
+
+const describe = (r: MovementRecord | undefined) =>
+  r ? `row ${r.rowNumber}: ${r.dateIso} ${r.code} ${r.direction === 'IN' ? '+' : '−'}${r.qty}` : null;
+
+class DryRunRollback extends Error {
+  constructor(readonly result: CategorySyncResult) {
+    super('dry run — rolled back');
+  }
+}
+
+let activeRun: { runId: string; startedAt: string; scope: string } | null = null;
+
+export function activeInventorySync() {
+  return activeRun;
+}
+
+/* ── Stock tab ──────────────────────────────────────────────────────────────── */
+
+async function applyStock(
+  tx: Queryable,
+  cfg: CategorySheetConfig,
+  stock: StockParse,
+  itemIdByCode: Map<string, number>,
+  result: CategorySyncResult,
+  report: TabSyncReport,
+  opts: SyncOptions,
+): Promise<boolean> {
+  const category = cfg.category;
+  interface ExistingItem {
+    id: string; item_code: string; item_id: string | null; item_description: string; primary_uom: string;
+    opening: number; live: number; weight: number | null; rack_id: string | null; main_group: string | null;
+    w1000: number | null; rate: number | null; adj: number; row_count: number;
+    source_spreadsheet_id: string | null; source_tab: string | null; source_row_index: number | null; deleted: boolean;
+  }
+  const existing = await txQuery<ExistingItem>(
+    tx,
+    `SELECT id, item_code, item_id, item_description, primary_uom,
+            opening_stock_qty::float8 AS opening, live_stock_qty::float8 AS live, live_weight_kg::float8 AS weight,
+            rack_id, main_group, weight_per_1000pc_kg::float8 AS w1000, unit_price::float8 AS rate,
+            sheet_adjustment_qty::float8 AS adj, sheet_row_count AS row_count,
+            source_spreadsheet_id, source_tab, source_row_index, (deleted_at IS NOT NULL) AS deleted
+       FROM inventory_items WHERE category = $1 ORDER BY id`,
+    [category],
+  );
+  const byCode = new Map<string, ExistingItem>();
+  for (const e of existing) {
+    const k = e.item_code.trim().toUpperCase();
+    const prev = byCode.get(k);
+    // Prefer the row the sheet already owns when two rows differ only by letter case.
+    if (!prev || (!prev.source_tab && e.source_tab)) byCode.set(k, e);
+  }
+  const same = (a: number | null, b: number | null) => (a === null || b === null ? a === b : Math.abs(a - b) < 0.00005);
+  /** True when the UPDATE below would leave the stored row exactly as it is. */
+  const unchanged = (e: ExistingItem, r: {
+    item_id: number | null; item_description: string; uom: string; opening: number; live: number; weight: number | null;
+    rack: string | null; main_group: string | null; w1000: number; rate: number; row_no: number; adj: number; row_count: number;
+  }) =>
+    !e.deleted &&
+    (e.item_id === null ? null : Number(e.item_id)) === r.item_id &&
+    (!r.item_description || e.item_description === r.item_description) &&
+    (!r.uom || e.primary_uom === r.uom) &&
+    same(e.opening, r.opening) && same(e.live, r.live) && same(e.adj, r.adj) &&
+    (r.weight === null || same(e.weight, r.weight)) &&
+    (r.rack === null || e.rack_id === r.rack) &&
+    (r.main_group === null || e.main_group === r.main_group) &&
+    (!(r.w1000 > 0) || same(e.w1000, r.w1000)) &&
+    (!(r.rate > 0) || same(e.rate, r.rate)) &&
+    e.source_spreadsheet_id === cfg.spreadsheetId && e.source_tab === cfg.stock.tab &&
+    e.source_row_index === r.row_no && e.row_count === r.row_count;
+  const inSheetBefore = existing.filter((e) => e.source_tab && e.source_row_index !== null).length;
+  if (!opts.applyLargeChanges && inSheetBefore > 50 && stock.records.length < inSheetBefore * 0.5) {
+    report.status = 'BLOCKED';
+    report.message =
+      `The live-stock tab now lists ${stock.records.length} items; ${inSheetBefore} were listed before. ` +
+      'Nothing was changed for this category — check the sheet. An administrator can re-run with "apply large changes".';
+    return false;
+  }
+
+  const inserts: object[] = [];
+  const updates: object[] = [];
+  let unchangedCount = 0;
+  for (const s of stock.records) {
+    const row = {
+      item_id: itemIdByCode.get(s.codeKey) ?? null,
+      item_code: s.code,
+      item_description: s.description,
+      uom: s.uom,
+      opening: s.opening,
+      live: s.liveQty,
+      weight: s.weightKg,
+      rack: s.rack,
+      main_group: s.mainGroup,
+      w1000: s.weight1000pc,
+      rate: s.rate,
+      row_no: s.rowNumber,
+      adj: s.adjustment,
+      row_count: s.rowCount,
+    };
+    const hit = byCode.get(s.codeKey);
+    if (!hit) inserts.push(row);
+    else if (unchanged(hit, row)) unchangedCount += 1;
+    else updates.push({ id: Number(hit.id), ...row });
+    if (row.item_id) result.items.linkedToPurchaseItem += 1;
+    if (s.liveQty < 0) result.items.negativeInSheet += 1;
+  }
+  const recordset = `item_id bigint, item_code text, item_description text, uom text, opening numeric, live numeric,
+       weight numeric, rack text, main_group text, w1000 numeric, rate numeric, row_no int, adj numeric, row_count int`;
+  await jsonBatch(
+    tx,
+    `INSERT INTO inventory_items (
+       item_id, item_code, item_description, category, primary_uom,
+       opening_stock_qty, live_stock_qty, live_weight_kg, available_qty,
+       rack_id, main_group, weight_per_1000pc_kg, unit_price,
+       source_spreadsheet_id, source_tab, source_row_index, sheet_adjustment_qty, sheet_row_count, last_sync_at)
+     SELECT v.item_id, v.item_code, v.item_description, $2, v.uom,
+            v.opening, v.live, v.weight, GREATEST(v.live, 0),
+            v.rack, v.main_group, v.w1000, v.rate,
+            $3, $4, v.row_no, v.adj, v.row_count, now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(${recordset})`,
+    inserts, [category, cfg.spreadsheetId, cfg.stock.tab],
+  );
+  await jsonBatch(
+    tx,
+    `UPDATE inventory_items ii
+        SET item_id = v.item_id,
+            item_description = COALESCE(NULLIF(v.item_description, ''), ii.item_description),
+            primary_uom = COALESCE(NULLIF(v.uom, ''), ii.primary_uom),
+            opening_stock_qty = v.opening,
+            live_stock_qty = v.live,
+            live_weight_kg = COALESCE(v.weight, ii.live_weight_kg),
+            available_qty = GREATEST(v.live - ii.allocated_qty, 0),
+            rack_id = COALESCE(v.rack, ii.rack_id),
+            main_group = COALESCE(v.main_group, ii.main_group),
+            weight_per_1000pc_kg = CASE WHEN v.w1000 > 0 THEN v.w1000 ELSE ii.weight_per_1000pc_kg END,
+            unit_price = CASE WHEN v.rate > 0 THEN v.rate ELSE ii.unit_price END,
+            source_spreadsheet_id = $2, source_tab = $3, source_row_index = v.row_no,
+            sheet_adjustment_qty = v.adj, sheet_row_count = v.row_count,
+            deleted_at = NULL, last_sync_at = now(), updated_at = now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(id bigint, ${recordset})
+      WHERE ii.id = v.id`,
+    updates, [cfg.spreadsheetId, cfg.stock.tab],
+  );
+  result.items.inSheet = stock.records.length;
+  result.items.inserted = inserts.length;
+  result.items.updated = updates.length;
+
+  // Items the sheet no longer lists keep their last figures, clearly marked.
+  const listed = stock.records.map((s) => s.codeKey);
+  const gone = await txQuery<{ id: string }>(
+    tx,
+    `UPDATE inventory_items
+        SET source_row_index = NULL, recon_status = 'NOT_IN_SHEET', recon_checked_at = now(), updated_at = now(),
+            recon_note = $3
+      WHERE category = $1 AND deleted_at IS NULL AND source_tab IS NOT NULL AND source_row_index IS NOT NULL
+        AND NOT (upper(item_code) = ANY($2::text[]))
+      RETURNING id`,
+    [category, listed, `No longer listed in "${cfg.stock.tab}" (sync ${result.runId}); last synced figures kept.`],
+  );
+  result.items.noLongerInSheet = gone.length;
+  report.inserted = inserts.length;
+  report.updated = updates.length;
+  report.unchanged = unchangedCount;
+  return true;
+}
+
+/* ── Movement tabs ──────────────────────────────────────────────────────────── */
+
+interface ExistingTxn {
+  id: string;
+  txn_no: string;
+  item_id: string | null;
+  source_key: string | null;
+  source_attr_hash: string | null;
+  source_row_index: number | null;
+  code_key: string;
+  quantity: number;
+  txn_date: string;
+  direction: string;
+}
+
+const sig = (code: string, qty: number, date: string, dir: string) => `${code}|${Number(qty).toFixed(4)}|${date}|${dir}`;
+
+async function applyMovements(
+  tx: Queryable,
+  cfg: CategorySheetConfig,
+  tab: { tab: string; slug: string; txnType: string; kind: 'MOVEMENT' | 'ADJUSTMENT' },
+  parse: MovementParse,
+  itemIdByCode: Map<string, number>,
+  report: TabSyncReport,
+  result: CategorySyncResult,
+  opts: SyncOptions,
+): Promise<void> {
+  const category = cfg.category;
+  const existing = await txQuery<ExistingTxn>(
+    tx,
+    `SELECT id, txn_no, item_id, source_key, source_attr_hash, source_row_index, upper(item_code) AS code_key,
+            quantity::float8 AS quantity, txn_date::text AS txn_date, direction
+       FROM inventory_transactions
+      WHERE category = $1 AND source_tab = $2 AND origin = 'SHEET' AND status = 'POSTED'`,
+    [category, tab.tab],
+  );
+
+  const byKey = new Map<string, ExistingTxn>();
+  const legacyBySig = new Map<string, ExistingTxn[]>();
+  for (const e of existing) {
+    if (e.source_key) byKey.set(e.source_key, e);
+    else {
+      const k = sig(e.code_key, e.quantity, e.txn_date, e.direction);
+      const list = legacyBySig.get(k) ?? [];
+      list.push(e);
+      legacyBySig.set(k, list);
+    }
+  }
+
+  const matched = new Set<string>();
+  const inserts: MovementRecord[] = [];
+  const refresh: Array<{ id: string; r: MovementRecord }> = [];
+  let attrChanged = 0;
+  for (const r of parse.records) {
+    const hit = byKey.get(r.key);
+    if (hit) {
+      matched.add(hit.id);
+      const link = itemIdByCode.get(r.codeKey) ?? null;
+      const linkChanged = link !== (hit.item_id === null ? null : Number(hit.item_id));
+      if (hit.source_attr_hash !== r.attrHash) attrChanged += 1;
+      // Only rows whose stored copy differs are rewritten (PGlite has no autovacuum).
+      if (hit.source_attr_hash !== r.attrHash || hit.source_row_index !== r.rowNumber || linkChanged) refresh.push({ id: hit.id, r });
+      continue;
+    }
+    // Rows imported before content identity existed: adopt the same movement
+    // (same item, quantity, date and direction) instead of reversing and re-adding it.
+    const list = legacyBySig.get(sig(r.codeKey, r.qty, r.dateIso, r.direction));
+    if (list && list.length > 0) {
+      let best = 0;
+      for (let i = 1; i < list.length; i += 1) {
+        if (Math.abs((list[i].source_row_index ?? 0) - r.rowNumber) < Math.abs((list[best].source_row_index ?? 0) - r.rowNumber)) best = i;
+      }
+      const e = list.splice(best, 1)[0];
+      matched.add(e.id);
+      refresh.push({ id: e.id, r });
+      continue;
+    }
+    inserts.push(r);
+  }
+  const toReverse = existing.filter((e) => !matched.has(e.id));
+
+  report.validRows = parse.records.length;
+  if (!opts.applyLargeChanges && toReverse.length > 50 && toReverse.length > existing.length * 0.2) {
+    report.status = 'BLOCKED';
+    report.message =
+      `${toReverse.length} of the ${existing.length} movements imported from this tab are no longer in the sheet as they were. ` +
+      'Nothing was changed for this tab — check that the sheet was not cleared or re-sorted by mistake. ' +
+      'An administrator can re-run with "apply large changes" once the sheet is confirmed.';
+    report.unchanged = existing.length;
+    return;
+  }
+
+  // New txn numbers: content-derived, made unique against every number ever used for this tab.
+  const used = new Set(
+    (await txQuery<{ txn_no: string }>(tx, `SELECT txn_no FROM inventory_transactions WHERE txn_no LIKE $1`, [`GS-${category}-${tab.slug}-%`]))
+      .map((x) => x.txn_no),
+  );
+  const txnNoFor = (r: MovementRecord) => {
+    const [hash, n] = r.key.split(':');
+    const base = `GS-${category}-${tab.slug}-${hash.slice(0, 10).toUpperCase()}-${n}`;
+    let candidate = base;
+    for (let v = 2; used.has(candidate); v += 1) candidate = `${base}-V${v}`;
+    used.add(candidate);
+    return candidate;
+  };
+  const notesFor = (r: MovementRecord) =>
+    [
+      r.supplier && `Supplier: ${r.supplier}`,
+      r.po && `PO: ${r.po}`,
+      r.refDoc && r.refDoc !== r.docNo && `Ref: ${r.refDoc}`,
+      r.type && `Type: ${r.type}`,
+      r.description && r.description !== r.code && r.description,
+      r.note,
+    ].filter(Boolean).join(' | ') || null;
+  const rowFor = (r: MovementRecord) => ({
+    item_id: itemIdByCode.get(r.codeKey) ?? null,
+    item_code: r.code,
+    direction: r.direction,
+    quantity: r.qty,
+    weight_kg: r.weightKg ?? (category === 'RM' && tab.kind === 'MOVEMENT' ? r.qty : null),
+    uom: r.uom || cfg.stock.defaultUom,
+    rate: r.rate,
+    amount: r.amount,
+    ref_no: r.docNo || r.refDoc || r.po || null,
+    from_loc: r.fromLocation,
+    to_loc: r.toLocation,
+    dept: r.dept || null,
+    row_no: r.rowNumber,
+    notes: notesFor(r),
+    txn_date: r.dateIso,
+    source_key: r.key,
+    attr_hash: r.attrHash,
+    month: r.month || null,
+  });
+
+  await jsonBatch(
+    tx,
+    `INSERT INTO inventory_transactions (
+       txn_no, category, item_id, item_code, txn_type, direction, quantity, weight_kg, uom, rate, amount,
+       balance_qty_after, balance_weight_after, reference_doc_type, reference_doc_no,
+       from_location, to_location, department, source_spreadsheet_id, source_tab, source_row_index,
+       status, notes, created_by_name, txn_date, origin, source_key, source_attr_hash, source_month, source_seen_at)
+     SELECT v.txn_no, $2, v.item_id, v.item_code, $3, v.direction, v.quantity, v.weight_kg, v.uom, v.rate, v.amount,
+            0, v.weight_kg, $3, v.ref_no, v.from_loc, v.to_loc, v.dept, $4, $5, v.row_no,
+            'POSTED', v.notes, 'Google Sheet Sync', v.txn_date, 'SHEET', v.source_key, v.attr_hash, v.month, now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(
+            txn_no text, item_id bigint, item_code text, direction text, quantity numeric, weight_kg numeric,
+            uom text, rate numeric, amount numeric, ref_no text, from_loc text, to_loc text, dept text,
+            row_no int, notes text, txn_date date, source_key text, attr_hash text, month text)`,
+    inserts.map((r) => ({ txn_no: txnNoFor(r), ...rowFor(r) })),
+    [category, tab.txnType, cfg.spreadsheetId, tab.tab],
+  );
+
+  await jsonBatch(
+    tx,
+    `UPDATE inventory_transactions t
+        SET item_id = v.item_id, weight_kg = v.weight_kg, uom = v.uom, rate = v.rate, amount = v.amount,
+            reference_doc_no = v.ref_no, from_location = v.from_loc, to_location = v.to_loc, department = v.dept,
+            source_row_index = v.row_no, notes = v.notes, source_key = v.source_key,
+            source_attr_hash = v.attr_hash, source_month = v.month, source_seen_at = now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(
+            id bigint, item_id bigint, weight_kg numeric, uom text, rate numeric, amount numeric, ref_no text,
+            from_loc text, to_loc text, dept text, row_no int, notes text, source_key text, attr_hash text, month text)
+      WHERE t.id = v.id`,
+    refresh.map(({ id, r }) => {
+      const x = rowFor(r);
+      return {
+        id: Number(id), item_id: x.item_id, weight_kg: x.weight_kg, uom: x.uom, rate: x.rate, amount: x.amount,
+        ref_no: x.ref_no, from_loc: x.from_loc, to_loc: x.to_loc, dept: x.dept, row_no: x.row_no, notes: x.notes,
+        source_key: x.source_key, attr_hash: x.attr_hash, month: x.month,
+      };
+    }),
+  );
+
+  // Reasons for each reversal, from what the sheet row says now.
+  const whyNotCounted = new Map<number, string>();
+  for (const q of parse.quarantine) whyNotCounted.set(q.rowNumber, q.reason);
+  const recordAtRow = new Map(parse.records.map((r) => [r.rowNumber, r]));
+  const reasonFor = (e: ExistingTxn): string => {
+    if (e.source_key) return `No longer in the sheet as imported (row deleted, or its date, item, quantity or reference changed) — sync ${result.runId}.`;
+    const why = e.source_row_index !== null ? whyNotCounted.get(e.source_row_index) : undefined;
+    if (why) return `Not counted by the sheet: ${why} (sync ${result.runId}).`;
+    const now = e.source_row_index !== null ? recordAtRow.get(e.source_row_index) : undefined;
+    if (now && now.codeKey === e.code_key) {
+      return `Sheet row ${e.source_row_index} now counts ${now.qty} on ${now.dateIso} (imported earlier as ${e.quantity} on ${e.txn_date}); re-imported from the sheet's counted figures (sync ${result.runId}).`;
+    }
+    return `Not found in the sheet any more (row deleted, moved or edited) — sync ${result.runId}.`;
+  };
+  await jsonBatch(
+    tx,
+    `UPDATE inventory_transactions t
+        SET status = 'REVERSED', reversed_at = now(), reversal_reason = v.reason
+       FROM jsonb_to_recordset($1::jsonb) AS v(id bigint, reason text)
+      WHERE t.id = v.id AND t.status = 'POSTED'`,
+    toReverse.map((e) => ({ id: Number(e.id), reason: reasonFor(e) })),
+  );
+
+  report.inserted = inserts.length;
+  report.updated = attrChanged;
+  report.unchanged = matched.size - attrChanged;
+  report.reversed = toReverse.length;
+  result.transactionsImported += inserts.length;
+}
+
+/* ── Quarantine ─────────────────────────────────────────────────────────────── */
+
+async function applyQuarantine(
+  tx: Queryable,
+  category: InventoryCategory,
+  tabs: string[],
+  candidates: QuarantineCandidate[],
+  runId: string,
+): Promise<number> {
+  const ignored = new Set(
+    (await txQuery<{ source_key: string }>(
+      tx,
+      `SELECT source_key FROM inventory_quarantine WHERE category = $1 AND resolution_status = 'IGNORED' AND source_key IS NOT NULL`,
+      [category],
+    )).map((r) => r.source_key),
+  );
+  const open = candidates.filter((c) => !ignored.has(c.key));
+  await jsonBatch(
+    tx,
+    `INSERT INTO inventory_quarantine
+       (category, source_tab, source_row_index, raw_data, quarantine_reason, source_key, reason_code, last_seen_at)
+     SELECT $2, v.tab, v.row_no, v.raw, v.reason, v.source_key, v.code, now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(tab text, row_no int, raw jsonb, reason text, source_key text, code text)
+     ON CONFLICT (category, source_tab, source_key) WHERE source_key IS NOT NULL AND resolution_status = 'PENDING'
+     DO UPDATE SET last_seen_at = now(), source_row_index = EXCLUDED.source_row_index,
+                   raw_data = EXCLUDED.raw_data, quarantine_reason = EXCLUDED.quarantine_reason`,
+    open.map((c) => ({ tab: c.tab, row_no: c.rowNumber, raw: c.raw, reason: c.reason, source_key: c.key, code: c.code })),
+    [category],
+  );
+  // Close what the sheet no longer shows (corrected rows, and entries from before content keys).
+  await tx.query(
+    `UPDATE inventory_quarantine
+        SET resolution_status = 'RESOLVED', resolved_at = now(), resolution_note = $4
+      WHERE category = $1 AND resolution_status = 'PENDING' AND source_tab = ANY($2::text[])
+        AND (source_key IS NULL OR NOT (source_key = ANY($3::text[])))`,
+    [category, tabs, open.map((c) => c.key), `No longer present in the sheet at sync ${runId}.`],
+  );
+  return open.length;
+}
+
+/* ── Per-item proof and Purchase stock ──────────────────────────────────────── */
+
+async function reconcileCategory(
+  tx: Queryable,
+  cfg: CategorySheetConfig,
+  stock: StockParse,
+  candidates: QuarantineCandidate[],
+  result: CategorySyncResult,
+): Promise<void> {
+  const category = cfg.category;
+  const totals = new Map<string, { inward: number; outward: number; adjustment: number }>();
+  for (const t of await txQuery<{ code: string; inward: number; outward: number; adjustment: number }>(
+    tx,
+    `SELECT upper(item_code) AS code,
+            COALESCE(SUM(quantity) FILTER (WHERE direction = 'IN'  AND txn_type <> 'SHEET_ADJUSTMENT'), 0)::float8 AS inward,
+            COALESCE(SUM(quantity) FILTER (WHERE direction = 'OUT' AND txn_type <> 'SHEET_ADJUSTMENT'), 0)::float8 AS outward,
+            (COALESCE(SUM(quantity) FILTER (WHERE direction = 'IN'  AND txn_type = 'SHEET_ADJUSTMENT'), 0)
+           - COALESCE(SUM(quantity) FILTER (WHERE direction = 'OUT' AND txn_type = 'SHEET_ADJUSTMENT'), 0))::float8 AS adjustment
+       FROM inventory_transactions
+      WHERE category = $1 AND origin = 'SHEET' AND status = 'POSTED'
+      GROUP BY upper(item_code)`,
+    [category],
+  )) totals.set(t.code, { inward: Number(t.inward), outward: Number(t.outward), adjustment: Number(t.adjustment) });
+
+  const erpByCode = new Map<string, number>();
+  for (const r of await txQuery<{ code: string; n: number }>(
+    tx,
+    `SELECT upper(item_code) AS code, COUNT(*)::int AS n FROM inventory_transactions
+      WHERE category = $1 AND origin = 'ERP' AND status = 'POSTED' GROUP BY upper(item_code)`,
+    [category],
+  )) erpByCode.set(r.code, r.n);
+
+  const notCounted = new Map<string, Map<string, number>>();
+  for (const c of candidates) {
+    if (!c.itemCode) continue;
+    const k = c.itemCode.toUpperCase();
+    const m = notCounted.get(k) ?? new Map<string, number>();
+    m.set(c.code, (m.get(c.code) ?? 0) + 1);
+    notCounted.set(k, m);
+  }
+
+  const stockByCode = new Map(stock.records.map((s) => [s.codeKey, s]));
+  const rec = reconcileItems(stock.records, totals);
+  const updates = rec.map((r) => {
+    const s = stockByCode.get(r.codeKey)!;
+    let note: string | null = null;
+    if (!r.matched) {
+      const parts = [
+        `Sheet shows ${r.sheetLive}; opening ${r.opening} + inward ${r.inward} − outward ${r.outward} + adjustments ${r.adjustment} = ${r.computed} (difference ${r.difference}).`,
+      ];
+      const nc = notCounted.get(r.codeKey);
+      if (nc) parts.push(`Rows not counted for this item: ${[...nc].map(([k, n]) => `${n} × ${k.replace(/_/g, ' ').toLowerCase()}`).join(', ')}.`);
+      if (Math.abs(s.adjustment - r.adjustment) > 0.001) parts.push(`The sheet's adjustment column shows ${s.adjustment}.`);
+      note = parts.join(' ');
+    }
+    const erp = erpByCode.get(r.codeKey);
+    if (erp) note = `${note ? `${note} ` : ''}${erp} movement(s) entered in the ERP are not part of the sheet figure.`;
+    return { code: r.codeKey, computed: r.computed, status: r.matched ? 'MATCHED' : 'MISMATCH', note };
+  });
+  await jsonBatch(
+    tx,
+    `UPDATE inventory_items ii
+        SET computed_stock_qty = v.computed, recon_status = v.status, recon_note = v.note, recon_checked_at = now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(code text, computed numeric, status text, note text)
+      WHERE ii.category = $2 AND upper(ii.item_code) = v.code AND ii.source_row_index IS NOT NULL
+        AND (ii.computed_stock_qty IS DISTINCT FROM v.computed OR ii.recon_status IS DISTINCT FROM v.status
+             OR ii.recon_note IS DISTINCT FROM v.note)`,
+    updates, [category],
+  );
+  await tx.query(
+    `UPDATE inventory_items SET recon_status = 'ERP_ONLY', recon_note = 'Not in the Google Sheet — stock recorded in the ERP only.',
+            recon_checked_at = now()
+      WHERE category = $1 AND source_tab IS NULL AND recon_status IS DISTINCT FROM 'ERP_ONLY'`,
+    [category],
+  );
+
+  const mismatched = rec.filter((r) => !r.matched);
+  result.reconciliation = {
+    checked: rec.length,
+    matched: rec.length - mismatched.length,
+    mismatched: mismatched.length,
+    mismatches: mismatched.slice(0, 50).map((r) => ({
+      itemCode: stockByCode.get(r.codeKey)!.code,
+      sheetLive: r.sheetLive, computed: r.computed, difference: r.difference,
+      note: updates.find((u) => u.code === r.codeKey)?.note ?? '',
+    })),
+  };
+
+  // Running balance per item through the sheet movements (by date; inward before outward on a day).
+  await tx.query(
+    `UPDATE inventory_transactions t
+        SET balance_qty_after = x.bal
+       FROM (
+         SELECT t2.id,
+                COALESCE(o.opening, 0) + SUM(CASE WHEN t2.direction = 'IN' THEN t2.quantity ELSE -t2.quantity END)
+                  OVER (PARTITION BY upper(t2.item_code)
+                        ORDER BY t2.txn_date, CASE WHEN t2.direction = 'IN' THEN 0 ELSE 1 END, t2.source_row_index NULLS LAST, t2.id) AS bal
+           FROM inventory_transactions t2
+           LEFT JOIN (SELECT upper(item_code) AS code, MAX(opening_stock_qty) AS opening
+                        FROM inventory_items WHERE category = $1 GROUP BY upper(item_code)) o
+                  ON o.code = upper(t2.item_code)
+          WHERE t2.category = $1 AND t2.status = 'POSTED' AND t2.origin = 'SHEET'
+       ) x
+      WHERE t.id = x.id AND t.balance_qty_after IS DISTINCT FROM x.bal`,
+    [category],
+  );
+}
+
 /**
- * Synchronize a single inventory category from its live Google Sheet
+ * items.live_stock_qty follows the Google Sheet: the sum of the code's live stock
+ * across every category sheet that lists it. Each change is ledgered as SHEET_SYNC
+ * (difference from the current figure), so the stock ledger explains it. A
+ * negative sheet total is held at zero (the Purchase stock cannot be negative)
+ * and reported.
  */
-export async function syncCategoryFromSheet(category: InventoryCategory): Promise<CategorySyncResult> {
+async function alignPurchaseStock(
+  tx: Queryable,
+  cfg: CategorySheetConfig,
+  stock: StockParse,
+  result: CategorySyncResult,
+  opts: SyncOptions,
+): Promise<void> {
+  const codes = stock.records.map((s) => s.codeKey);
+  if (codes.length === 0) return;
+  const rows = await txQuery<{ id: string; current: number; sheet_qty: number; cats: number; cat: string; inventory_category: string; uom_id: string | null; item_code: string }>(
+    tx,
+    `WITH sheet AS (
+       SELECT upper(item_code) AS code, SUM(live_stock_qty) AS qty,
+              COUNT(DISTINCT category)::int AS cats, MIN(category) AS cat
+         FROM inventory_items
+        WHERE deleted_at IS NULL AND source_tab IS NOT NULL AND source_row_index IS NOT NULL
+        GROUP BY upper(item_code))
+     SELECT i.id, i.item_code, i.live_stock_qty::float8 AS current, s.qty::float8 AS sheet_qty, s.cats, s.cat,
+            i.inventory_category, i.uom_id
+       FROM items i JOIN sheet s ON s.code = upper(i.item_code)
+      WHERE i.deleted_at IS NULL AND upper(i.item_code) = ANY($1::text[])`,
+    [codes],
+  );
+  const changes: Array<{ item_id: number; target: number; delta: number; uom_id: number | null }> = [];
+  const categoryChanges: number[] = [];
+  for (const r of rows) {
+    const sheetQty = Math.round(Number(r.sheet_qty) * 10000) / 10000;
+    const target = Math.max(0, sheetQty);
+    if (sheetQty < 0) result.purchaseStock.negativeHeldAtZero.push(r.item_code);
+    const delta = Math.round((target - Number(r.current)) * 10000) / 10000;
+    if (Math.abs(delta) >= 0.0001) changes.push({ item_id: Number(r.id), target, delta, uom_id: r.uom_id ? Number(r.uom_id) : null });
+    if (r.cats === 1 && r.cat !== r.inventory_category) categoryChanges.push(Number(r.id));
+  }
+  await jsonBatch(
+    tx,
+    `UPDATE items i SET live_stock_qty = v.target, updated_at = now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(item_id bigint, target numeric) WHERE i.id = v.item_id`,
+    changes,
+  );
+  await jsonBatch(
+    tx,
+    `INSERT INTO stock_ledger (item_id, txn_type, reference_type, reference_no, inward_qty, outward_qty, balance_qty,
+                               uom_id, location, txn_date, created_by)
+     SELECT v.item_id, 'SHEET_SYNC', 'INVENTORY_SYNC', $2, GREATEST(v.delta, 0), GREATEST(-v.delta, 0), v.target,
+            v.uom_id, $3, CURRENT_DATE, $4
+       FROM jsonb_to_recordset($1::jsonb) AS v(item_id bigint, delta numeric, target numeric, uom_id bigint)`,
+    changes, [result.runId, `${cfg.category} sheet: ${cfg.stock.tab}`, opts.userId ?? null],
+  );
+  if (categoryChanges.length > 0) {
+    await tx.query(
+      `UPDATE items SET inventory_category = $2, updated_at = now() WHERE id = ANY($1::bigint[])`,
+      [categoryChanges, cfg.category],
+    );
+  }
+  result.purchaseStock.aligned = changes.length;
+  result.purchaseStock.categoryChanged = categoryChanges.length;
+}
+
+/* ── Checkpoints ────────────────────────────────────────────────────────────── */
+
+async function writeCheckpoints(
+  tx: Queryable,
+  cfg: CategorySheetConfig,
+  result: CategorySyncResult,
+  opts: SyncOptions,
+): Promise<void> {
+  const rows: Array<{ tab: string; read: number; valid: number; quarantined: number; status: string; error: string | null; report: unknown }> =
+    result.tabs.map((t) => ({
+      tab: t.tab,
+      read: t.sourceRows,
+      valid: t.validRows,
+      quarantined: t.quarantined,
+      status: t.status,
+      error: t.message ?? null,
+      report: t,
+    }));
+  rows.push({
+    tab: '(all tabs)',
+    read: result.totalRowsRead,
+    valid: result.validRecordsImported,
+    quarantined: result.quarantinedRecords,
+    status: result.status,
+    error: result.errorMessage ?? null,
+    report: {
+      items: result.items,
+      reconciliation: { ...result.reconciliation, mismatches: result.reconciliation.mismatches.slice(0, 20) },
+      purchaseStock: result.purchaseStock,
+    },
+  });
+  await jsonBatch(
+    tx,
+    `INSERT INTO inventory_sync_checkpoints (category, spreadsheet_id, tab_name, total_rows_read, valid_records_imported,
+        quarantined_records, status, error_message, sync_mode, sync_duration_ms, run_id, triggered_by, report)
+     SELECT $2, $3, v.tab, v.read, v.valid, v.quarantined, v.status, v.error, 'MANUAL', $4, $5, $6, v.report
+       FROM jsonb_to_recordset($1::jsonb) AS v(tab text, read int, valid int, quarantined int, status text, error text, report jsonb)`,
+    rows, [cfg.category, cfg.spreadsheetId, Date.now() - Date.parse(result.startedAt), result.runId, opts.userId ?? null],
+  );
+}
+
+/* ── Public entry points ────────────────────────────────────────────────────── */
+
+function emptyResult(cfg: CategorySheetConfig, runId: string, dryRun: boolean): CategorySyncResult {
+  return {
+    category: cfg.category, spreadsheetId: cfg.spreadsheetId, runId, dryRun,
+    status: 'SUCCESS', startedAt: new Date().toISOString(), durationMs: 0, tabs: [],
+    items: { inSheet: 0, inserted: 0, updated: 0, noLongerInSheet: 0, negativeInSheet: 0, linkedToPurchaseItem: 0 },
+    reconciliation: { checked: 0, matched: 0, mismatched: 0, mismatches: [] },
+    purchaseStock: { aligned: 0, negativeHeldAtZero: [], categoryChanged: 0 },
+    totalRowsRead: 0, validRecordsImported: 0, transactionsImported: 0, quarantinedRecords: 0,
+  };
+}
+
+function tabReport(kind: TabSyncReport['kind'], tab: string, range: string, firstDataRow: number): TabSyncReport {
+  return {
+    tab, kind, range, firstDataRow, sourceRows: 0, blankRows: 0, validRows: 0, excluded: {}, quarantined: 0,
+    inserted: 0, updated: 0, unchanged: 0, reversed: 0, firstRecord: null, lastRecord: null, status: 'SUCCESS',
+  };
+}
+
+async function runCategory(category: InventoryCategory, opts: SyncOptions): Promise<CategorySyncResult> {
+  const cfg = INVENTORY_SHEETS[category];
+  const result = emptyResult(cfg, opts.runId ?? newRunId(), !!opts.dryRun);
   const started = Date.now();
-  const cfg = SHEET_SOURCES[category];
-  const result: CategorySyncResult = {
-    category,
-    spreadsheetId: cfg.spreadsheetId,
-    tabsProcessed: [cfg.stockTab],
-    totalRowsRead: 0,
-    itemsUpserted: 0,
-    transactionsImported: 0,
-    quarantinedRows: 0,
-    durationMs: 0,
-    status: 'SUCCESS',
+
+  let read: CategoryRead;
+  try {
+    read = await (opts.reader ?? readCategory)(cfg);
+  } catch (err) {
+    result.status = 'FAILED';
+    result.errorMessage = `Could not read the ${category} Google Sheet: ${err instanceof Error ? err.message : String(err)}. Nothing was changed; try again.`;
+    result.durationMs = Date.now() - started;
+    logger.error(`Inventory sync ${result.runId} ${category}: ${result.errorMessage}`);
+    if (!opts.dryRun) {
+      await query(
+        `INSERT INTO inventory_sync_checkpoints (category, spreadsheet_id, tab_name, status, error_message, sync_mode,
+                                                 sync_duration_ms, run_id, triggered_by)
+         VALUES ($1, $2, '(all tabs)', 'FAILED', $3, 'MANUAL', $4, $5, $6)`,
+        [category, cfg.spreadsheetId, result.errorMessage, result.durationMs, result.runId, opts.userId ?? null],
+      ).catch(() => undefined);
+    }
+    return result;
+  }
+
+  // Classify (pure).
+  const stock = parseStockTab(cfg.stock, read.stockMain, read.stockOpening, read.stockAdjustment);
+  const stockCodes = new Set(stock.records.map((s) => s.codeKey));
+  const countedMonths = new Set(financialYearMonths());
+  const movementParses = cfg.movements.map((m, i) => parseMovementTab(m, read.movements[i], { countedMonths, stockCodes }));
+  const adjustmentParse = parseAdjustmentTab(read.adjustments, { stockCodes });
+  const allCandidates = [...stock.quarantine, ...movementParses.flatMap((p) => p.quarantine), ...adjustmentParse.quarantine];
+
+  const stockReport = tabReport('STOCK', cfg.stock.tab, read.ranges[0], cfg.stock.headerRow + 1);
+  Object.assign(stockReport, {
+    sourceRows: stock.sourceRows, blankRows: stock.blankRows, validRows: stock.records.length,
+    quarantined: stock.quarantine.length, duplicateRows: stock.duplicateRows, duplicateCodes: stock.duplicateCodes.slice(0, 50),
+    excluded: stock.quarantine.reduce<Partial<Record<ExclusionCode, number>>>((m, q) => ({ ...m, [q.code]: (m[q.code] ?? 0) + 1 }), {}),
+    firstRecord: stock.records[0] ? `row ${stock.records[0].rowNumber}: ${stock.records[0].code} ${stock.records[0].liveQty}` : null,
+    lastRecord: stock.records.length ? `row ${stock.records[stock.records.length - 1].rowNumber}: ${stock.records[stock.records.length - 1].code} ${stock.records[stock.records.length - 1].liveQty}` : null,
+  });
+  const movementReports = cfg.movements.map((m, i) => {
+    const p = movementParses[i];
+    const r = tabReport('MOVEMENT', m.tab, read.ranges[3 + i], m.firstRow);
+    Object.assign(r, {
+      sourceRows: p.sourceRows, blankRows: p.blankRows, validRows: p.records.length,
+      excluded: p.excluded, quarantined: p.quarantine.length,
+      warnings: Object.keys(p.warnings).length ? p.warnings : undefined,
+      firstRecord: describe(p.records[0]), lastRecord: describe(p.records[p.records.length - 1]),
+    });
+    return r;
+  });
+  const adjustmentReport = tabReport('ADJUSTMENT', ADJUSTMENT_TAB.tab, read.ranges[read.ranges.length - 1], ADJUSTMENT_TAB.firstRow);
+  Object.assign(adjustmentReport, {
+    sourceRows: adjustmentParse.sourceRows, blankRows: adjustmentParse.blankRows, validRows: adjustmentParse.records.length,
+    excluded: adjustmentParse.excluded, quarantined: adjustmentParse.quarantine.length,
+    firstRecord: describe(adjustmentParse.records[0]), lastRecord: describe(adjustmentParse.records[adjustmentParse.records.length - 1]),
+  });
+  result.tabs = [stockReport, ...movementReports, adjustmentReport];
+  result.totalRowsRead = result.tabs.reduce((a, t) => a + t.sourceRows, 0);
+
+  const apply = async (tx: Queryable) => {
+    const itemIdByCode = new Map<string, number>();
+    for (const r of await txQuery<{ id: string; code: string }>(
+      tx, `SELECT id, upper(item_code) AS code FROM items WHERE deleted_at IS NULL`,
+    )) itemIdByCode.set(r.code, Number(r.id));
+
+    const stockApplied = await applyStock(tx, cfg, stock, itemIdByCode, result, stockReport, opts);
+    if (stockApplied) {
+      for (let i = 0; i < cfg.movements.length; i += 1) {
+        const m = cfg.movements[i];
+        await applyMovements(tx, cfg, { tab: m.tab, slug: m.slug, txnType: m.txnType, kind: 'MOVEMENT' },
+          movementParses[i], itemIdByCode, movementReports[i], result, opts);
+      }
+      await applyMovements(tx, cfg, { tab: ADJUSTMENT_TAB.tab, slug: ADJUSTMENT_TAB.slug, txnType: ADJUSTMENT_TAB.txnType, kind: 'ADJUSTMENT' },
+        adjustmentParse, itemIdByCode, adjustmentReport, result, opts);
+      result.quarantinedRecords = await applyQuarantine(
+        tx, category, result.tabs.map((t) => t.tab), allCandidates, result.runId,
+      );
+      await reconcileCategory(tx, cfg, stock, allCandidates, result);
+      await alignPurchaseStock(tx, cfg, stock, result, opts);
+    }
+    result.validRecordsImported = result.tabs.reduce((a, t) => a + (t.kind === 'STOCK' ? 0 : t.validRows), 0);
+    result.status = result.tabs.some((t) => t.status === 'BLOCKED') ? 'PARTIAL' : 'SUCCESS';
+    if (result.status === 'PARTIAL') {
+      result.errorMessage = result.tabs.filter((t) => t.status === 'BLOCKED').map((t) => `${t.tab.trim()}: ${t.message}`).join(' ');
+    }
+    result.durationMs = Date.now() - started;
+    if (opts.dryRun) throw new DryRunRollback(result);
+    await writeCheckpoints(tx, cfg, result, opts);
   };
 
   try {
-    const sheets = await getSheetsClient();
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: cfg.spreadsheetId,
-      range: cfg.stockRange,
-      valueRenderOption: 'FORMATTED_VALUE',
-    });
-
-    const rows = res.data.values || [];
-    result.totalRowsRead = rows.length;
-
-    if (rows.length === 0) {
-      result.status = 'PARTIAL';
-      result.errorMessage = `Sheet tab ${cfg.stockTab} returned 0 rows.`;
-      return result;
-    }
-
-    const dataRows = rows.slice(cfg.headerRow);
-
-    await withTransaction(async (tx) => {
-      for (let i = 0; i < dataRows.length; i++) {
-        const row = dataRows[i];
-        if (!row || row.length === 0) continue;
-
-        const rawCode = row[cfg.codeCol];
-        if (!rawCode || String(rawCode).trim() === '' || String(rawCode).startsWith('=')) {
-          continue;
-        }
-
-        const itemCode = String(rawCode).trim();
-        const desc = cfg.descCol >= 0 && row[cfg.descCol] ? String(row[cfg.descCol]).trim() : itemCode;
-        const rawQty = cfg.qtyCol >= 0 && row[cfg.qtyCol] ? String(row[cfg.qtyCol]).replace(/,/g, '').trim() : '0';
-        const parsedQty = parseFloat(rawQty);
-
-        await tx.query('SAVEPOINT row_sp');
-        try {
-          if (isNaN(parsedQty) || parsedQty < 0) {
-            // Quarantine invalid or negative quantities to protect ledger integrity
-            await tx.query(
-              `INSERT INTO inventory_quarantine (category, source_tab, source_row_index, raw_data, quarantine_reason)
-               VALUES ($1, $2, $3, $4::jsonb, $5)`,
-              [
-                category,
-                cfg.stockTab,
-                i + cfg.headerRow + 1,
-                JSON.stringify(row),
-                parsedQty < 0 ? `Negative physical stock (${parsedQty}) quarantined to protect ledger integrity.` : `Invalid numeric quantity: "${rawQty}"`,
-              ],
-            );
-            result.quarantinedRows++;
-            await tx.query('RELEASE SAVEPOINT row_sp');
-            continue;
-          }
-
-          let parsedWeight: number | null = null;
-          if (cfg.weightCol !== undefined && cfg.weightCol >= 0 && row[cfg.weightCol]) {
-            const rawW = String(row[cfg.weightCol]).replace(/,/g, '').trim();
-            const w = parseFloat(rawW);
-            if (!isNaN(w)) parsedWeight = w;
-          }
-
-          let parsedWeight1000pc: number = 0;
-          if (cfg.weight1000pcCol !== undefined && cfg.weight1000pcCol >= 0 && row[cfg.weight1000pcCol]) {
-            const rawW1000 = String(row[cfg.weight1000pcCol]).replace(/,/g, '').trim();
-            const w1000 = parseFloat(rawW1000);
-            if (!isNaN(w1000) && w1000 > 0) parsedWeight1000pc = w1000;
-          }
-
-          let unitPrice: number = 0;
-          if (cfg.rateCol !== undefined && cfg.rateCol >= 0 && row[cfg.rateCol]) {
-            const rawR = String(row[cfg.rateCol]).replace(/,/g, '').trim();
-            const r = parseFloat(rawR);
-            if (!isNaN(r) && r > 0) unitPrice = r;
-          } else if (cfg.amountCol !== undefined && cfg.amountCol >= 0 && row[cfg.amountCol]) {
-            const rawA = String(row[cfg.amountCol]).replace(/,/g, '').trim();
-            const a = parseFloat(rawA);
-            if (!isNaN(a) && a > 0 && parsedQty > 0) {
-              unitPrice = parseFloat((a / parsedQty).toFixed(4));
-            }
-          }
-
-          const mainGroup = cfg.mainGroupCol !== undefined && cfg.mainGroupCol >= 0 && row[cfg.mainGroupCol] ? String(row[cfg.mainGroupCol]).trim() : null;
-          const rackId = cfg.rackCol !== undefined && cfg.rackCol >= 0 && row[cfg.rackCol] ? String(row[cfg.rackCol]).trim() : null;
-          const primaryUom = cfg.uomCol !== undefined && cfg.uomCol >= 0 && row[cfg.uomCol] ? String(row[cfg.uomCol]).trim() : (category === 'RM' ? 'Kg' : 'Nos');
-
-          // Check if item exists in ERP items table
-          let dbItem = await txQueryOne<{ id: number }>(
-            tx,
-            `SELECT id FROM items WHERE UPPER(item_code) = UPPER($1) AND deleted_at IS NULL`,
-            [itemCode],
-          );
-
-          if (!dbItem) {
-            // Create or update item in items master if not present
-            const created = await tx.query(
-              `INSERT INTO items (item_code, item_description, live_stock_qty, inventory_category, is_active)
-               VALUES ($1, $2, $3, $4, true)
-               ON CONFLICT (UPPER(item_code)) WHERE deleted_at IS NULL
-               DO UPDATE SET live_stock_qty = EXCLUDED.live_stock_qty, inventory_category = EXCLUDED.inventory_category
-               RETURNING id`,
-              [itemCode, desc, parsedQty, category],
-            );
-            dbItem = created.rows[0] as unknown as { id: number };
-          } else {
-            // Update items inventory_category and live_stock_qty
-            await tx.query(
-              `UPDATE items
-               SET inventory_category = $1,
-                   live_stock_qty = $2,
-                   updated_at = now()
-               WHERE id = $3`,
-              [category, parsedQty, dbItem.id],
-            );
-          }
-
-          // Upsert into dedicated inventory_items
-          await tx.query(
-            `INSERT INTO inventory_items (
-               item_id, item_code, item_description, category, primary_uom,
-               opening_stock_qty, live_stock_qty, live_weight_kg, available_qty,
-               rack_id, main_group, weight_per_1000pc_kg, unit_price,
-               source_spreadsheet_id, source_tab, source_row_index, last_sync_at
-             ) VALUES (
-               $1, $2, $3, $4, $5,
-               $6, $7, $8, $9,
-               $10, $11, $12, $13,
-               $14, $15, $16, now()
-             )
-             ON CONFLICT (item_code, category)
-             DO UPDATE SET
-               live_stock_qty = EXCLUDED.live_stock_qty,
-               live_weight_kg = COALESCE(EXCLUDED.live_weight_kg, inventory_items.live_weight_kg),
-               available_qty = GREATEST(EXCLUDED.live_stock_qty - inventory_items.allocated_qty, 0),
-               rack_id = COALESCE(EXCLUDED.rack_id, inventory_items.rack_id),
-               main_group = COALESCE(EXCLUDED.main_group, inventory_items.main_group),
-               weight_per_1000pc_kg = CASE WHEN EXCLUDED.weight_per_1000pc_kg > 0 THEN EXCLUDED.weight_per_1000pc_kg ELSE inventory_items.weight_per_1000pc_kg END,
-               unit_price = CASE WHEN EXCLUDED.unit_price > 0 THEN EXCLUDED.unit_price ELSE inventory_items.unit_price END,
-               item_description = EXCLUDED.item_description,
-               source_spreadsheet_id = EXCLUDED.source_spreadsheet_id,
-               source_tab = EXCLUDED.source_tab,
-               source_row_index = EXCLUDED.source_row_index,
-               last_sync_at = now(),
-               updated_at = now()`,
-            [
-              dbItem!.id,
-              itemCode,
-              desc,
-              category,
-              primaryUom,
-              parsedQty, // initial opening
-              parsedQty,
-              parsedWeight,
-              parsedQty,
-              rackId,
-              mainGroup,
-              parsedWeight1000pc,
-              unitPrice,
-              cfg.spreadsheetId,
-              cfg.stockTab,
-              i + cfg.headerRow + 1,
-            ],
-          );
-
-          await tx.query('RELEASE SAVEPOINT row_sp');
-          result.itemsUpserted++;
-        } catch (rowErr) {
-          await tx.query('ROLLBACK TO SAVEPOINT row_sp');
-          await tx.query(
-            `INSERT INTO inventory_quarantine (category, source_tab, source_row_index, raw_data, quarantine_reason)
-             VALUES ($1, $2, $3, $4::jsonb, $5)`,
-            [
-              category,
-              cfg.stockTab,
-              i + cfg.headerRow + 1,
-              JSON.stringify(row),
-              String(rowErr instanceof Error ? rowErr.message : rowErr),
-            ],
-          );
-          result.quarantinedRows++;
-        }
-      }
-
-      // Record live stock sync checkpoint
-      await tx.query(
-        `INSERT INTO inventory_sync_checkpoints (
-           category, spreadsheet_id, tab_name, total_rows_read,
-           valid_records_imported, quarantined_records, status, sync_duration_ms
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [
-          category,
-          cfg.spreadsheetId,
-          cfg.stockTab,
-          result.totalRowsRead,
-          result.itemsUpserted,
-          result.quarantinedRows,
-          'SUCCESS',
-          Date.now() - started,
-        ],
-      );
-
-      // Synchronize all transaction sub-tabs for this category
-      await syncCategoryTransactions(tx, sheets, category, cfg.spreadsheetId, result);
-    });
-
-    result.durationMs = Date.now() - started;
-    logger.info(
-      `Inventory Sync Complete: ${category} synced ${result.itemsUpserted} items & ${result.transactionsImported} txns in ${result.durationMs}ms`,
-    );
+    await withTransaction(apply);
   } catch (err) {
+    if (err instanceof DryRunRollback) return err.result;
     result.status = 'FAILED';
-    result.errorMessage = err instanceof Error ? err.message : String(err);
-    logger.error(`Inventory Sync Failed for ${category}: ${result.errorMessage}`);
+    result.errorMessage = `The ${category} update could not be saved: ${err instanceof Error ? err.message : String(err)}. Nothing was changed; try again.`;
+    logger.error(`Inventory sync ${result.runId} ${category} failed`, { error: result.errorMessage });
+    await query(
+      `INSERT INTO inventory_sync_checkpoints (category, spreadsheet_id, tab_name, status, error_message, sync_mode,
+                                               sync_duration_ms, run_id, triggered_by)
+       VALUES ($1, $2, '(all tabs)', 'FAILED', $3, 'MANUAL', $4, $5, $6)`,
+      [category, cfg.spreadsheetId, result.errorMessage, Date.now() - started, result.runId, opts.userId ?? null],
+    ).catch(() => undefined);
   }
-
   result.durationMs = Date.now() - started;
+  logger.info(
+    `Inventory sync ${result.runId} ${category}${opts.dryRun ? ' (dry run)' : ''}: ${result.status}; ` +
+      result.tabs.map((t) => `${t.tab.trim()} +${t.inserted}/~${t.updated}/-${t.reversed}${t.status === 'BLOCKED' ? ' BLOCKED' : ''}`).join(', ') +
+      `; items matched ${result.reconciliation.matched}/${result.reconciliation.checked}; ${result.durationMs} ms`,
+  );
   return result;
 }
 
-/**
- * Synchronize all transaction tabs for a specific category
- */
-async function syncCategoryTransactions(
-  tx: any,
-  sheets: any,
-  category: InventoryCategory,
-  spreadsheetId: string,
-  result: CategorySyncResult,
-): Promise<void> {
-  const tabs = CATEGORY_TXN_CONFIG[category] || [];
-  if (tabs.length === 0) return;
-
-  // Pre-load items master for fast key resolution
-  const existingItems = await tx.query(
-    `SELECT id, item_code FROM items WHERE deleted_at IS NULL`,
-  );
-  const itemMap = new Map<string, number>();
-  for (const itm of existingItems.rows) {
-    itemMap.set(String(itm.item_code).trim().toUpperCase(), Number(itm.id));
+async function exclusive<T>(scope: string, runId: string, fn: () => Promise<T>): Promise<T> {
+  if (activeRun) {
+    const err = new Error(`An inventory sync is already running (${activeRun.scope}, started ${activeRun.startedAt}).`);
+    (err as Error & { code?: string }).code = 'SYNC_RUNNING';
+    throw err;
   }
-
-  for (const tabDef of tabs) {
-    try {
-      const tabStart = Date.now();
-      const res = await sheets.spreadsheets.values.get({
-        spreadsheetId,
-        range: tabDef.range,
-        valueRenderOption: 'FORMATTED_VALUE',
-      });
-
-      const rows = res.data.values || [];
-      result.totalRowsRead += rows.length;
-      result.tabsProcessed.push(tabDef.tabName);
-
-      if (rows.length === 0) {
-        continue;
-      }
-
-      const txnsToInsert: Array<{
-        txn_no: string;
-        category: InventoryCategory;
-        item_id: number;
-        item_code: string;
-        txn_type: string;
-        direction: 'IN' | 'OUT';
-        quantity: number;
-        weight_kg: number | null;
-        uom: string;
-        rate: number;
-        amount: number;
-        balance_qty_after: number;
-        balance_weight_after: number | null;
-        reference_doc_type: string | null;
-        reference_doc_no: string | null;
-        from_location: string | null;
-        to_location: string | null;
-        department: string | null;
-        source_spreadsheet_id: string;
-        source_tab: string;
-        source_row_index: number;
-        notes: string | null;
-        txn_date: string;
-      }> = [];
-
-      const startRowIdx = parseInt(tabDef.range.match(/[A-Z]+(\d+)/)?.[1] || '1', 10);
-
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        if (!row || row.length === 0) continue;
-
-        const rawCode = tabDef.codeCol < row.length ? row[tabDef.codeCol] : null;
-        if (!rawCode || String(rawCode).trim() === '' || String(rawCode).startsWith('=')) {
-          continue;
-        }
-
-        const itemCode = String(rawCode).trim();
-        let qty = parseSheetNum(tabDef.qtyCol < row.length ? row[tabDef.qtyCol] : null, 0);
-        if (qty === 0 && tabDef.altQtyCol !== undefined && tabDef.altQtyCol < row.length) {
-          qty = parseSheetNum(row[tabDef.altQtyCol], 0);
-        }
-
-        if (qty <= 0) {
-          continue;
-        }
-
-        const rowIndex = startRowIdx + i;
-        const txnNo = `GS-${category}-${tabDef.slug}-R${rowIndex}`;
-
-        // Ensure item exists in items table
-        let itemId = itemMap.get(itemCode.toUpperCase());
-        const desc =
-          (tabDef.descCol !== undefined && tabDef.descCol < row.length && row[tabDef.descCol] ? String(row[tabDef.descCol]).trim() : '') ||
-          (tabDef.nameCol !== undefined && tabDef.nameCol < row.length && row[tabDef.nameCol] ? String(row[tabDef.nameCol]).trim() : '') ||
-          itemCode;
-
-        if (!itemId) {
-          const inserted = await tx.query(
-            `INSERT INTO items (item_code, item_description, live_stock_qty, inventory_category, is_active)
-             VALUES ($1, $2, 0, $3, true)
-             ON CONFLICT (UPPER(item_code)) WHERE deleted_at IS NULL
-             DO UPDATE SET inventory_category = EXCLUDED.inventory_category
-             RETURNING id`,
-            [itemCode, desc, category],
-          );
-          itemId = Number(inserted.rows[0].id);
-          itemMap.set(itemCode.toUpperCase(), itemId);
-
-          await tx.query(
-            `INSERT INTO inventory_items (
-               item_id, item_code, item_description, category, primary_uom,
-               opening_stock_qty, live_stock_qty, available_qty
-             ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0)
-             ON CONFLICT (item_code, category) DO NOTHING`,
-            [itemId, itemCode, desc, category, tabDef.fallbackUom],
-          );
-        }
-
-        // Date
-        const rawDate = tabDef.dateCol !== undefined && tabDef.dateCol < row.length ? row[tabDef.dateCol] : null;
-        const txnDate = parseSheetDate(rawDate);
-
-        // Weight
-        let weightKg: number | null = null;
-        if (tabDef.weightCol !== undefined && tabDef.weightCol < row.length && row[tabDef.weightCol]) {
-          const w = parseSheetNum(row[tabDef.weightCol], 0);
-          if (w > 0) weightKg = w;
-        } else if (category === 'RM') {
-          weightKg = qty;
-        }
-
-        // Rate & Amount
-        let rate = tabDef.rateCol !== undefined && tabDef.rateCol < row.length ? parseSheetNum(row[tabDef.rateCol], 0) : 0;
-        let amount = tabDef.amountCol !== undefined && tabDef.amountCol < row.length ? parseSheetNum(row[tabDef.amountCol], 0) : 0;
-        if (amount === 0 && rate > 0 && qty > 0) {
-          amount = parseFloat((rate * qty).toFixed(4));
-        } else if (rate === 0 && amount > 0 && qty > 0) {
-          rate = parseFloat((amount / qty).toFixed(4));
-        }
-
-        // UOM
-        let uom = tabDef.uomCol !== undefined && tabDef.uomCol < row.length && row[tabDef.uomCol]
-          ? String(row[tabDef.uomCol]).trim()
-          : tabDef.fallbackUom;
-        if (!uom) uom = tabDef.fallbackUom;
-
-        // References & Notes
-        const docNo = tabDef.docNoCol !== undefined && tabDef.docNoCol < row.length && row[tabDef.docNoCol] ? String(row[tabDef.docNoCol]).trim() : '';
-        const refDoc = tabDef.refDocCol !== undefined && tabDef.refDocCol < row.length && row[tabDef.refDocCol] ? String(row[tabDef.refDocCol]).trim() : '';
-        const supplier = tabDef.supplierCol !== undefined && tabDef.supplierCol < row.length && row[tabDef.supplierCol] ? String(row[tabDef.supplierCol]).trim() : '';
-        const po = tabDef.poCol !== undefined && tabDef.poCol < row.length && row[tabDef.poCol] ? String(row[tabDef.poCol]).trim() : '';
-        const dept = tabDef.deptCol !== undefined && tabDef.deptCol < row.length && row[tabDef.deptCol] ? String(row[tabDef.deptCol]).trim() : '';
-        const notesVal = tabDef.notesCol !== undefined && tabDef.notesCol < row.length && row[tabDef.notesCol] ? String(row[tabDef.notesCol]).trim() : '';
-        const fromLoc = tabDef.fromLocationCol !== undefined && tabDef.fromLocationCol < row.length && row[tabDef.fromLocationCol] ? String(row[tabDef.fromLocationCol]).trim() : null;
-        const toLoc = tabDef.toLocationCol !== undefined && tabDef.toLocationCol < row.length && row[tabDef.toLocationCol] ? String(row[tabDef.toLocationCol]).trim() : null;
-
-        const refDocNo = docNo || refDoc || po || null;
-        const noteParts = [
-          supplier ? `Supplier: ${supplier}` : '',
-          po ? `PO: ${po}` : '',
-          refDoc && refDoc !== docNo ? `Ref: ${refDoc}` : '',
-          notesVal ? `Type: ${notesVal}` : '',
-          desc && desc !== itemCode ? desc : '',
-        ].filter(Boolean);
-        const notes = noteParts.length > 0 ? noteParts.join(' | ') : null;
-
-        txnsToInsert.push({
-          txn_no: txnNo,
-          category,
-          item_id: itemId,
-          item_code: itemCode,
-          txn_type: tabDef.txnType,
-          direction: tabDef.direction,
-          quantity: qty,
-          weight_kg: weightKg,
-          uom,
-          rate,
-          amount,
-          balance_qty_after: 0,
-          balance_weight_after: weightKg,
-          reference_doc_type: tabDef.txnType,
-          reference_doc_no: refDocNo,
-          from_location: fromLoc,
-          to_location: toLoc,
-          department: dept || null,
-          source_spreadsheet_id: spreadsheetId,
-          source_tab: tabDef.tabName,
-          source_row_index: rowIndex,
-          notes,
-          txn_date: txnDate,
-        });
-      }
-
-      // Batch insert transactions (100 per chunk)
-      const BATCH_SIZE = 100;
-      for (let b = 0; b < txnsToInsert.length; b += BATCH_SIZE) {
-        const chunk = txnsToInsert.slice(b, b + BATCH_SIZE);
-        const valuesSql: string[] = [];
-        const params: unknown[] = [];
-        let pIdx = 1;
-
-        for (const t of chunk) {
-          valuesSql.push(`(
-            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
-            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
-            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++},
-            $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}
-          )`);
-          params.push(
-            t.txn_no,
-            t.category,
-            t.item_id,
-            t.item_code,
-            t.txn_type,
-            t.direction,
-            t.quantity,
-            t.weight_kg,
-            t.uom,
-            t.rate,
-            t.amount,
-            t.balance_qty_after,
-            t.balance_weight_after,
-            t.reference_doc_type,
-            t.reference_doc_no,
-            t.from_location,
-            t.to_location,
-            t.department,
-            t.source_spreadsheet_id,
-            t.source_tab,
-            t.source_row_index,
-            t.notes,
-            t.txn_date,
-            'Google Sheet Sync',
-          );
-        }
-
-        await tx.query(
-          `INSERT INTO inventory_transactions (
-             txn_no, category, item_id, item_code, txn_type, direction,
-             quantity, weight_kg, uom, rate, amount, balance_qty_after, balance_weight_after,
-             reference_doc_type, reference_doc_no, from_location, to_location, department,
-             source_spreadsheet_id, source_tab, source_row_index, notes, txn_date, created_by_name
-           ) VALUES ${valuesSql.join(', ')}
-           ON CONFLICT (txn_no) DO UPDATE SET
-             item_id = EXCLUDED.item_id,
-             item_code = EXCLUDED.item_code,
-             quantity = EXCLUDED.quantity,
-             weight_kg = EXCLUDED.weight_kg,
-             uom = EXCLUDED.uom,
-             rate = EXCLUDED.rate,
-             amount = EXCLUDED.amount,
-             reference_doc_no = EXCLUDED.reference_doc_no,
-             notes = EXCLUDED.notes,
-             from_location = EXCLUDED.from_location,
-             to_location = EXCLUDED.to_location,
-             department = EXCLUDED.department,
-             txn_date = EXCLUDED.txn_date,
-             source_tab = EXCLUDED.source_tab`,
-          params,
-        );
-      }
-
-      result.transactionsImported += txnsToInsert.length;
-
-      // Sync checkpoint for transaction tab
-      const tabDuration = Date.now() - tabStart;
-      await tx.query(
-        `INSERT INTO inventory_sync_checkpoints (
-           category, spreadsheet_id, tab_name, total_rows_read,
-           valid_records_imported, quarantined_records, status, sync_duration_ms
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [
-          category,
-          spreadsheetId,
-          tabDef.tabName,
-          rows.length,
-          txnsToInsert.length,
-          0,
-          'SUCCESS',
-          tabDuration,
-        ],
-      );
-
-      logger.info(
-        `Synced tab "${tabDef.tabName}" for ${category}: ${txnsToInsert.length} txns imported in ${tabDuration}ms`,
-      );
-    } catch (tabErr) {
-      logger.error(`Error syncing tab "${tabDef.tabName}" for ${category}: ${String(tabErr)}`);
-      result.quarantinedRows++;
-    }
+  activeRun = { runId, startedAt: new Date().toISOString(), scope };
+  try {
+    return await fn();
+  } finally {
+    activeRun = null;
   }
 }
 
-/**
- * Synchronize all 5 categories sequentially
- */
-export async function syncAllInventoryCategories(): Promise<Record<InventoryCategory, CategorySyncResult>> {
-  const categories: InventoryCategory[] = ['RM', 'FG', 'TRADING', 'WIP', 'GENERAL'];
-  const summary: Partial<Record<InventoryCategory, CategorySyncResult>> = {};
-
-  for (const cat of categories) {
-    summary[cat] = await syncCategoryFromSheet(cat);
-  }
-
-  return summary as Record<InventoryCategory, CategorySyncResult>;
+export async function syncCategoryFromSheet(category: InventoryCategory, opts: SyncOptions = {}): Promise<CategorySyncResult> {
+  const runId = opts.runId ?? newRunId();
+  return exclusive(category, runId, () => runCategory(category, { ...opts, runId }));
 }
+
+/** All five categories, one after another, under one run id. */
+export async function syncAllInventoryCategories(opts: SyncOptions = {}): Promise<CategorySyncResult[]> {
+  const runId = opts.runId ?? newRunId();
+  return exclusive('all categories', runId, async () => {
+    const out: CategorySyncResult[] = [];
+    for (const category of INVENTORY_CATEGORIES) out.push(await runCategory(category, { ...opts, runId }));
+    return out;
+  });
+}
+
+/** Column index of a stock tab's opening column — exported for tests and reports. */
+export const stockColumnIndex = colIndex;
+export const REPORT_ONLY_EXCLUSIONS = REPORT_ONLY;

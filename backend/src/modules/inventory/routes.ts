@@ -11,22 +11,23 @@
  * - Multi-stage approval: Store Incharge review, Purchase Head approval.
  * - Direct conversion to real Purchase Indent.
  */
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery, parsedQuery,
   listQuerySchema, offsetOf, idParam, csvIdArray, toKolkataStartOfDay, toKolkataEndOfDay,
 } from '../../core/http.js';
-import { NotFoundError, ValidationError, BusinessRuleError } from '../../core/errors.js';
+import { NotFoundError, ValidationError, BusinessRuleError, ConflictError, AuthorizationError } from '../../core/errors.js';
 import { requirePermission, requireAnyPermission } from '../../auth/middleware.js';
-import { actorFrom, auditIn } from '../../core/audit.js';
+import { actorFrom, auditIn, audit } from '../../core/audit.js';
 import { nextDocumentNumber, dateStamp, timeStamp } from '../../domain/numbering.js';
 import { toQty, toRate } from '../../domain/money.js';
 import { toShortUom } from '../../domain/uom.js';
 import { adjustStockPhysicalCount } from '../../domain/stock.js';
 import { recordInventoryMovement, INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
-import { syncCategoryFromSheet, syncAllInventoryCategories } from './sync-engine.js';
+import { syncCategoryFromSheet, syncAllInventoryCategories, activeInventorySync, type CategorySyncResult } from './sync-engine.js';
+import { EXCLUSION_TEXT } from './sheet-model.js';
 import directIssueRoutes from './direct-issue.routes.js';
 
 const router = Router();
@@ -1469,6 +1470,7 @@ router.get(
       status: z.enum(['ALL', 'NORMAL', 'BELOW_REORDER', 'CRITICAL', 'EXCESS', 'ZERO_STOCK', 'POSITIVE_STOCK']).default('ALL'),
       source: z.enum(['ALL', 'LIVE_SHEET', 'ERP_ONLY']).default('ALL'),
       mainGroup: z.string().trim().optional(),
+      recon: z.enum(['MATCHED', 'MISMATCH', 'NOT_IN_SHEET', 'ERP_ONLY']).optional(),
     }).parse(req.query);
 
     const b = new SqlBuilder();
@@ -1489,6 +1491,10 @@ router.get(
     if (q.mainGroup) {
       const mg = b.push(q.mainGroup);
       whereClause += ` AND ii.main_group = ${mg}`;
+    }
+
+    if (q.recon) {
+      whereClause += ` AND ii.recon_status = ${b.push(q.recon)}`;
     }
 
     if (q.status !== 'ALL') {
@@ -1548,6 +1554,10 @@ router.get(
         ii.source_tab,
         ii.source_row_index,
         ii.last_sync_at,
+        ii.sheet_adjustment_qty,
+        ii.computed_stock_qty,
+        ii.recon_status,
+        ii.recon_note,
         CASE
           WHEN ii.available_qty < ii.min_stock_level OR (ii.min_stock_level > 0 AND ii.available_qty = 0) THEN 'CRITICAL'
           WHEN ii.available_qty <= ii.reorder_point AND ii.reorder_point > 0 THEN 'BELOW_REORDER'
@@ -1580,10 +1590,11 @@ router.get(
     const sql = `
       SELECT
         COUNT(*)::int AS total_items,
-        COUNT(CASE WHEN source_spreadsheet_id IS NOT NULL THEN 1 END)::int AS sheet_items_count,
+        -- "In the sheet" = listed in the live-stock tab at the last sync.
+        COUNT(CASE WHEN source_row_index IS NOT NULL THEN 1 END)::int AS sheet_items_count,
         COUNT(CASE WHEN source_spreadsheet_id IS NULL THEN 1 END)::int AS unsynced_items_count,
         COALESCE(SUM(live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
-        COALESCE(SUM(CASE WHEN source_spreadsheet_id IS NOT NULL THEN live_stock_qty ELSE 0 END), 0)::numeric(18, 4) AS sheet_stock_qty,
+        COALESCE(SUM(CASE WHEN source_row_index IS NOT NULL THEN live_stock_qty ELSE 0 END), 0)::numeric(18, 4) AS sheet_stock_qty,
         COALESCE(SUM(live_weight_kg), 0)::numeric(18, 4) AS total_weight_kg,
         COALESCE(SUM(live_stock_qty * COALESCE(unit_price, 0)), 0)::numeric(18, 2) AS total_valuation,
         COUNT(CASE WHEN live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
@@ -1599,9 +1610,13 @@ router.get(
 
     const stats = await queryOne<any>(sql, [category]);
 
-    // Check last sync checkpoint
+    // Last sync run for the category (its "(all tabs)" summary row).
     const lastCheck = await queryOne<any>(
-      `SELECT * FROM inventory_sync_checkpoints WHERE category = $1 ORDER BY id DESC LIMIT 1`,
+      `SELECT id, category, spreadsheet_id, tab_name, total_rows_read, valid_records_imported, quarantined_records,
+              status, error_message, sync_duration_ms, created_at, run_id
+         FROM inventory_sync_checkpoints
+        WHERE category = $1 AND (tab_name = '(all tabs)' OR run_id IS NULL)
+        ORDER BY id DESC LIMIT 1`,
       [category],
     );
 
@@ -1611,17 +1626,37 @@ router.get(
       [category],
     );
 
-    // Check transaction counts
+    // Movement counts: POSTED entries only (reversed ones are history, not stock), with the
+    // Google Sheet rows and the movements entered in the ERP counted separately, so a card
+    // can never silently disagree with the sheet's own row count. Stock adjustments are
+    // counted on their own, not as inward/outward.
     const txnStats = await queryOne<any>(
       `SELECT
-         COUNT(CASE WHEN direction = 'IN' THEN 1 END)::int AS inward_count,
-         COALESCE(SUM(CASE WHEN direction = 'IN' THEN quantity ELSE 0 END), 0)::numeric(18, 4) AS inward_qty,
-         COUNT(CASE WHEN direction = 'OUT' THEN 1 END)::int AS outward_count,
-         COALESCE(SUM(CASE WHEN direction = 'OUT' THEN quantity ELSE 0 END), 0)::numeric(18, 4) AS outward_qty,
-         COUNT(CASE WHEN txn_type = 'PRODUCTION_INWARD' THEN 1 END)::int AS prod_inward_count,
-         COALESCE(SUM(CASE WHEN txn_type = 'PRODUCTION_INWARD' THEN quantity ELSE 0 END), 0)::numeric(18, 4) AS prod_inward_qty
+         COUNT(*) FILTER (WHERE direction = 'IN'  AND txn_type <> 'SHEET_ADJUSTMENT')::int AS inward_count,
+         COALESCE(SUM(quantity) FILTER (WHERE direction = 'IN'  AND txn_type <> 'SHEET_ADJUSTMENT'), 0)::numeric(18, 4) AS inward_qty,
+         COUNT(*) FILTER (WHERE direction = 'OUT' AND txn_type <> 'SHEET_ADJUSTMENT')::int AS outward_count,
+         COALESCE(SUM(quantity) FILTER (WHERE direction = 'OUT' AND txn_type <> 'SHEET_ADJUSTMENT'), 0)::numeric(18, 4) AS outward_qty,
+         COUNT(*) FILTER (WHERE direction = 'IN'  AND origin = 'SHEET' AND txn_type <> 'SHEET_ADJUSTMENT')::int AS sheet_inward_count,
+         COUNT(*) FILTER (WHERE direction = 'OUT' AND origin = 'SHEET' AND txn_type <> 'SHEET_ADJUSTMENT')::int AS sheet_outward_count,
+         COUNT(*) FILTER (WHERE direction = 'IN'  AND origin = 'ERP')::int AS erp_inward_count,
+         COUNT(*) FILTER (WHERE direction = 'OUT' AND origin = 'ERP')::int AS erp_outward_count,
+         COUNT(*) FILTER (WHERE direction = 'ADJUST' OR txn_type = 'SHEET_ADJUSTMENT')::int AS adjustment_count,
+         COUNT(*) FILTER (WHERE txn_type = 'PRODUCTION_INWARD')::int AS prod_inward_count,
+         COALESCE(SUM(quantity) FILTER (WHERE txn_type = 'PRODUCTION_INWARD'), 0)::numeric(18, 4) AS prod_inward_qty
        FROM inventory_transactions
-       WHERE category = $1`,
+       WHERE category = $1 AND status = 'POSTED'`,
+      [category],
+    );
+    const reversedCount = await queryOne<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM inventory_transactions WHERE category = $1 AND status = 'REVERSED'`,
+      [category],
+    );
+    const recon = await queryOne<{ matched: number; mismatched: number; not_in_sheet: number; erp_only: number }>(
+      `SELECT COUNT(*) FILTER (WHERE recon_status = 'MATCHED')::int      AS matched,
+              COUNT(*) FILTER (WHERE recon_status = 'MISMATCH')::int     AS mismatched,
+              COUNT(*) FILTER (WHERE recon_status = 'NOT_IN_SHEET')::int AS not_in_sheet,
+              COUNT(*) FILTER (WHERE recon_status = 'ERP_ONLY')::int     AS erp_only
+         FROM inventory_items WHERE category = $1 AND deleted_at IS NULL`,
       [category],
     );
 
@@ -1660,8 +1695,18 @@ router.get(
         inwardTxnQty: Number(txnStats?.inward_qty || 0),
         outwardTxnCount: txnStats?.outward_count || 0,
         outwardTxnQty: Number(txnStats?.outward_qty || 0),
+        sheetInwardTxnCount: txnStats?.sheet_inward_count || 0,
+        sheetOutwardTxnCount: txnStats?.sheet_outward_count || 0,
+        erpInwardTxnCount: txnStats?.erp_inward_count || 0,
+        erpOutwardTxnCount: txnStats?.erp_outward_count || 0,
+        adjustmentTxnCount: txnStats?.adjustment_count || 0,
+        reversedTxnCount: reversedCount?.count || 0,
         prodInwardTxnCount: txnStats?.prod_inward_count || 0,
         prodInwardTxnQty: Number(txnStats?.prod_inward_qty || 0),
+        reconMatchedCount: recon?.matched || 0,
+        reconMismatchCount: recon?.mismatched || 0,
+        notInSheetCount: recon?.not_in_sheet || 0,
+        erpOnlyItemsCount: recon?.erp_only || 0,
         lastSyncAt: stats?.last_sync_at,
       },
       mainGroups: mainGroups.map((m) => ({
@@ -1752,9 +1797,12 @@ router.get(
   '/quarantine',
   requirePermission('inventory.view'),
   asyncHandler(async (req, res) => {
+    // Defaults to the open entries — the same set the category card counts.
     const q = listQuerySchema.extend({
       category: categoryParam.optional(),
-      status: z.enum(['PENDING', 'RESOLVED', 'IGNORED', 'ALL']).default('ALL'),
+      status: z.enum(['PENDING', 'RESOLVED', 'IGNORED', 'ALL']).default('PENDING'),
+      reasonCode: z.string().trim().max(40).optional(),
+      sourceTab: z.string().trim().max(120).optional(),
     }).parse(req.query);
 
     const b = new SqlBuilder();
@@ -1770,6 +1818,16 @@ router.get(
       whereClause += ` AND resolution_status = ${s}`;
     }
 
+    if (q.reasonCode) {
+      const r = b.push(q.reasonCode);
+      whereClause += ` AND reason_code = ${r}`;
+    }
+
+    if (q.sourceTab) {
+      const t = b.push(q.sourceTab);
+      whereClause += ` AND TRIM(source_tab) = TRIM(${t})`;
+    }
+
     if (q.search) {
       const s = b.push(`%${q.search}%`);
       whereClause += ` AND (quarantine_reason ILIKE ${s} OR raw_data::text ILIKE ${s})`;
@@ -1783,15 +1841,33 @@ router.get(
     const offsetParam = b.push(offsetOf(q));
 
     const rowsSql = `
-      SELECT id, category, source_tab, source_row_index, raw_data, quarantine_reason, resolution_status, created_at
+      SELECT id, category, source_tab, source_row_index, raw_data, quarantine_reason, reason_code,
+             resolution_status, resolution_note, created_at, last_seen_at, resolved_at
       FROM inventory_quarantine
       WHERE ${whereClause}
-      ORDER BY id DESC
+      ORDER BY category, source_tab, source_row_index, id
       LIMIT ${limitParam} OFFSET ${offsetParam}
     `;
 
     const rows = await query<any>(rowsSql, b.params);
-    sendPage(res, rows, total, q.page, q.pageSize);
+    // Per-reason counts for the same filter minus the reason itself (the filter chips).
+    const rb = new SqlBuilder();
+    let reasonWhere = '1=1';
+    if (q.category) reasonWhere += ` AND category = ${rb.push(q.category)}`;
+    if (q.status !== 'ALL') reasonWhere += ` AND resolution_status = ${rb.push(q.status)}`;
+    if (q.sourceTab) reasonWhere += ` AND TRIM(source_tab) = TRIM(${rb.push(q.sourceTab)})`;
+    const byReason = await query<{ reason_code: string | null; count: number }>(
+      `SELECT reason_code, COUNT(*)::int AS count FROM inventory_quarantine
+        WHERE ${reasonWhere} GROUP BY reason_code ORDER BY count DESC`,
+      rb.params,
+    );
+    sendPage(res, rows, total, q.page, q.pageSize, {
+      byReason: byReason.map((r) => ({
+        reasonCode: r.reason_code,
+        label: r.reason_code ? (EXCLUSION_TEXT as Record<string, string>)[r.reason_code] ?? r.reason_code : 'Earlier sync (no reason code)',
+        count: r.count,
+      })),
+    });
   }),
 );
 
@@ -1814,11 +1890,16 @@ router.get(
       sourceTab: z.string().trim().optional(),
       dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
       dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      // POSTED by default — the entries that make up stock (and what the cards count).
+      status: z.enum(['POSTED', 'REVERSED', 'ALL']).default('POSTED'),
+      origin: z.enum(['SHEET', 'ERP']).optional(),
     }).parse(req.query);
 
     const b = new SqlBuilder();
     const catP = b.push(category);
     let whereClause = `category = ${catP}`;
+    if (q.status !== 'ALL') whereClause += ` AND status = ${b.push(q.status)}`;
+    if (q.origin) whereClause += ` AND origin = ${b.push(q.origin)}`;
 
     if (q.direction) {
       const dp = b.push(q.direction);
@@ -1865,11 +1946,11 @@ router.get(
         balance_qty_after, balance_weight_after,
         reference_doc_type, reference_doc_no,
         from_location, to_location, department,
-        source_tab,
+        source_tab, source_row_index, source_month, origin, reversed_at, reversal_reason,
         status, notes, created_by_name, txn_date, created_at
       FROM inventory_transactions
       WHERE ${whereClause}
-      ORDER BY id DESC
+      ORDER BY txn_date DESC, source_row_index DESC NULLS FIRST, id DESC
       LIMIT ${limitP} OFFSET ${offsetP}
     `;
 
@@ -1912,12 +1993,21 @@ router.post(
     const actor = actorFrom(req);
 
     const result = await withTransaction(async (tx) => {
-      return recordInventoryMovement(tx, {
+      const r = await recordInventoryMovement(tx, {
         ...parsed,
         category,
         userId: actor.userId,
         userName: actor.name,
       });
+      await auditIn(tx, {
+        actor,
+        action: 'CREATE',
+        entity: 'inventory_movement',
+        entityLabel: r.txnNo,
+        after: { category, itemCode: r.itemCode, direction: parsed.direction, txnType: parsed.txnType, quantity: r.quantity, balanceAfter: r.balanceQtyAfter },
+        message: `${parsed.direction} ${r.quantity} ${parsed.uom} of ${r.itemCode} (${category}, ${parsed.txnType}) recorded as ${r.txnNo}.`,
+      });
+      return r;
     });
 
     sendCreated(res, {
@@ -1927,48 +2017,136 @@ router.post(
   }),
 );
 
-// 5. POST /inventory/sync/:category - Trigger Category Google Sheets Sync
+// 5/6. POST /inventory/sync/:category and /inventory/sync-all — read the Google Sheets now.
+//   dryRun=true            : do the whole run, report what WOULD change, change nothing.
+//   applyLargeChanges=true : apply a tab the safety valve blocked (Super Admin only).
+const syncBody = z.object({
+  dryRun: z.boolean().default(false),
+  applyLargeChanges: z.boolean().default(false),
+}).default({});
+
+async function runSync(
+  req: Request,
+  scope: InventoryCategory | 'ALL',
+): Promise<CategorySyncResult[]> {
+  const body = syncBody.parse(req.body ?? {});
+  if (body.applyLargeChanges && !req.user!.roles.includes('SUPER_ADMIN')) {
+    throw AuthorizationError('Only a Super Admin can apply a sync that the safety check stopped.');
+  }
+  const opts = { dryRun: body.dryRun, applyLargeChanges: body.applyLargeChanges, userId: req.user!.id };
+  let results: CategorySyncResult[];
+  try {
+    results = scope === 'ALL' ? await syncAllInventoryCategories(opts) : [await syncCategoryFromSheet(scope, opts)];
+  } catch (err) {
+    if ((err as { code?: string }).code === 'SYNC_RUNNING') throw ConflictError((err as Error).message);
+    throw err;
+  }
+  if (!body.dryRun) {
+    const line = (r: CategorySyncResult) =>
+      `${r.category} ${r.status}: +${r.transactionsImported} new, ` +
+      `${r.tabs.reduce((a, t) => a + t.reversed, 0)} reversed, ${r.quarantinedRecords} not counted, ` +
+      `items matched ${r.reconciliation.matched}/${r.reconciliation.checked}`;
+    await audit({
+      actor: actorFrom(req), action: 'SYNC', entity: 'inventory_sync', entityLabel: results[0]?.runId,
+      after: results.map((r) => ({ category: r.category, status: r.status, runId: r.runId })),
+      message: `Inventory sync from Google Sheets${body.applyLargeChanges ? ' (large changes applied)' : ''} — ${results.map(line).join('; ')}.`,
+    });
+  }
+  return results;
+}
+
 router.post(
   '/sync/:category',
   requirePermission('inventory.adjust'),
   asyncHandler(async (req, res) => {
-    const rawCategory = (req.params.category || '').toUpperCase();
-    const parseCat = categoryParam.safeParse(rawCategory);
+    const parseCat = categoryParam.safeParse((req.params.category || '').toUpperCase());
     if (!parseCat.success) {
       throw ValidationError(`Invalid inventory category "${req.params.category}".`);
     }
-    const category = parseCat.data;
-
-    const result = await syncCategoryFromSheet(category);
+    const [result] = await runSync(req, parseCat.data);
     sendOk(res, result);
   }),
 );
 
-// 6. POST /inventory/sync-all - Trigger Sync for all 5 categories
 router.post(
   '/sync-all',
   requirePermission('inventory.adjust'),
-  asyncHandler(async (_req, res) => {
-    const results = await syncAllInventoryCategories();
-    sendOk(res, results);
+  asyncHandler(async (req, res) => {
+    sendOk(res, await runSync(req, 'ALL'));
   }),
 );
 
-// 7. GET /inventory/sync/status - Latest sync status for all categories
+// 7. GET /inventory/sync/status — the latest run per category with its per-tab reconciliation report.
 router.get(
   '/sync/status',
   requirePermission('inventory.view'),
   asyncHandler(async (_req, res) => {
-    const rows = await query<any>(`
+    const runs = await query<any>(`
       SELECT DISTINCT ON (category)
         id, category, spreadsheet_id, tab_name, total_rows_read,
         valid_records_imported, quarantined_records, status, error_message,
-        sync_duration_ms, created_at
+        sync_duration_ms, created_at, run_id, report
       FROM inventory_sync_checkpoints
+      WHERE tab_name = '(all tabs)' OR run_id IS NULL
       ORDER BY category, id DESC
     `);
+    const runIds = runs.map((r) => r.run_id).filter(Boolean);
+    const tabs = runIds.length
+      ? await query<any>(
+          `SELECT category, run_id, tab_name, total_rows_read, valid_records_imported, quarantined_records,
+                  status, error_message, report
+             FROM inventory_sync_checkpoints
+            WHERE run_id = ANY($1::text[]) AND tab_name <> '(all tabs)'
+            ORDER BY id`,
+          [runIds],
+        )
+      : [];
+    sendOk(res, {
+      running: activeInventorySync(),
+      categories: runs.map((r) => ({
+        ...r,
+        tabs: tabs.filter((t) => t.category === r.category && t.run_id === r.run_id),
+      })),
+    });
+  }),
+);
 
-    sendOk(res, rows);
+// 8. GET /inventory/reconciliation — item-by-item proof against the sheet's own live stock.
+router.get(
+  '/reconciliation',
+  requirePermission('inventory.view'),
+  asyncHandler(async (req, res) => {
+    const q = listQuerySchema.extend({
+      category: categoryParam.optional(),
+      status: z.enum(['MATCHED', 'MISMATCH', 'NOT_IN_SHEET', 'ERP_ONLY', 'ALL']).default('MISMATCH'),
+    }).parse(req.query);
+    const b = new SqlBuilder();
+    let where = 'ii.deleted_at IS NULL';
+    if (q.category) where += ` AND ii.category = ${b.push(q.category)}`;
+    if (q.status !== 'ALL') where += ` AND ii.recon_status = ${b.push(q.status)}`;
+    if (q.search) {
+      const s = b.push(`%${q.search}%`);
+      where += ` AND (ii.item_code ILIKE ${s} OR ii.item_description ILIKE ${s})`;
+    }
+    const total = (await queryOne<{ count: number }>(`SELECT COUNT(*)::int AS count FROM inventory_items ii WHERE ${where}`, b.params))?.count ?? 0;
+    const counts = await query<{ category: string; recon_status: string | null; count: number }>(
+      `SELECT category, recon_status, COUNT(*)::int AS count FROM inventory_items
+        WHERE deleted_at IS NULL GROUP BY category, recon_status ORDER BY category, recon_status`,
+    );
+    const lim = b.push(q.pageSize);
+    const off = b.push(offsetOf(q));
+    const rows = await query<any>(
+      `SELECT ii.id, ii.category, ii.item_code, ii.item_description, ii.primary_uom,
+              ii.opening_stock_qty, ii.live_stock_qty AS sheet_live_stock_qty, ii.computed_stock_qty,
+              (ii.live_stock_qty - ii.computed_stock_qty) AS difference, ii.sheet_adjustment_qty,
+              ii.recon_status, ii.recon_note, ii.recon_checked_at, ii.source_tab, ii.source_row_index, ii.sheet_row_count
+         FROM inventory_items ii
+        WHERE ${where}
+        ORDER BY ABS(COALESCE(ii.live_stock_qty - ii.computed_stock_qty, 0)) DESC, ii.category, ii.item_code
+        LIMIT ${lim} OFFSET ${off}`,
+      b.params,
+    );
+    sendPage(res, rows, total, q.page, q.pageSize, { counts });
   }),
 );
 

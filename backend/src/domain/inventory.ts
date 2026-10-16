@@ -121,8 +121,21 @@ export function classifyItemCategory(itemCode: string, mainGroup = '', descripti
   return 'GENERAL';
 }
 
+/** Stock-ledger entry type for a movement recorded from the inventory screens. */
+const LEDGER_TYPE: Record<InventoryMovementInput['direction'], string> = {
+  IN: 'INVENTORY_IN',
+  OUT: 'INVENTORY_OUT',
+  ADJUST: 'INVENTORY_ADJUST',
+};
+
 /**
- * Execute atomic inventory movement with single source of truth balance updates.
+ * Records a movement entered in the ERP against one category's stock.
+ *
+ * The category figure (inventory_items) and the Purchase item's stock
+ * (items.live_stock_qty) move by the SAME difference, and that difference is
+ * written to stock_ledger under its own entry type — so the ledger always
+ * explains the item's stock. (It used to overwrite the item's stock with the
+ * category figure and ledger an inward as "GRN_INWARD".)
  */
 export async function recordInventoryMovement(
   tx: Queryable,
@@ -137,7 +150,24 @@ export async function recordInventoryMovement(
   const rate = input.rate !== undefined && input.rate !== null ? Number(input.rate) : 0;
   const amount = input.amount !== undefined && input.amount !== null ? Number(input.amount) : qty * rate;
 
-  // 1. Lock inventory_items row
+  // 1. Lock the Purchase item, then the category row.
+  const baseItem = await txQueryOne<{
+    id: number; item_code: string; item_description: string; uom_code: string; uom_id: number | null; live_stock_qty: string;
+  }>(
+    tx,
+    `SELECT i.id, i.item_code, i.item_description, COALESCE(u.code, 'Nos') AS uom_code, i.uom_id, i.live_stock_qty
+       FROM items i
+       LEFT JOIN lookups u ON u.id = i.uom_id
+      WHERE i.id = $1 AND i.deleted_at IS NULL
+      FOR UPDATE OF i`,
+    [input.itemId],
+  );
+  if (!baseItem) {
+    throw ValidationError(
+      'This item is not in the Purchase item master, so a movement cannot be recorded in the ERP. Record it in the Google Sheet.',
+    );
+  }
+
   let invItem = await txQueryOne<{
     id: number;
     item_id: number;
@@ -150,26 +180,19 @@ export async function recordInventoryMovement(
     tx,
     `SELECT id, item_id, item_code, live_stock_qty, live_weight_kg, allocated_qty, available_qty
      FROM inventory_items
-     WHERE item_id = $1 AND category = $2
+     WHERE category = $2 AND (item_id = $1 OR (item_id IS NULL AND upper(item_code) = upper($3)))
+     ORDER BY (item_id = $1) DESC NULLS LAST
+     LIMIT 1
      FOR UPDATE`,
-    [input.itemId, input.category],
+    [input.itemId, input.category, baseItem.item_code],
   );
+  if (invItem && invItem.item_id === null) {
+    // A sheet row for the same code that was not yet linked to the Purchase item.
+    await tx.query('UPDATE inventory_items SET item_id = $2, updated_at = now() WHERE id = $1', [invItem.id, input.itemId]);
+  }
 
   // If inventory_item does not exist yet for this item & category, initialize it from items
   if (!invItem) {
-    const baseItem = await txQueryOne<{ id: number; item_code: string; item_description: string; uom_code: string }>(
-      tx,
-      `SELECT i.id, i.item_code, i.item_description, COALESCE(u.code, 'Nos') as uom_code
-       FROM items i
-       LEFT JOIN lookups u ON u.id = i.uom_id
-       WHERE i.id = $1`,
-      [input.itemId],
-    );
-
-    if (!baseItem) {
-      throw ValidationError(`Item with ID ${input.itemId} does not exist in master records.`);
-    }
-
     invItem = await txQueryOne<{
       id: number;
       item_id: number;
@@ -219,6 +242,16 @@ export async function recordInventoryMovement(
 
   const newAvailableQty = Math.max(0, newLiveQty - currentAllocated);
 
+  // The Purchase item's stock moves by the same difference as the category row.
+  const delta = Math.round((newLiveQty - currentLiveQty) * 10000) / 10000;
+  const itemStockBefore = Number(baseItem.live_stock_qty || 0);
+  const itemStockAfter = Math.round((itemStockBefore + delta) * 10000) / 10000;
+  if (itemStockAfter < 0) {
+    throw ConflictError(
+      `Not enough stock for ${baseItem.item_code}: the ERP stock is ${itemStockBefore} and this movement would take it to ${itemStockAfter}.`,
+    );
+  }
+
   // 2. Generate sequential document number
   const txnNo = await nextDocumentNumber(tx, 'INVENTORY_TXN');
 
@@ -233,14 +266,16 @@ export async function recordInventoryMovement(
     [newLiveQty, newLiveWeight, newAvailableQty, invItem!.id],
   );
 
-  // 4. Update core items table for system consistency
-  await tx.query(
-    `UPDATE items
-     SET live_stock_qty = $1,
-         updated_at = now()
-     WHERE id = $2`,
-    [newLiveQty, input.itemId],
-  );
+  // 4. Purchase item stock: same difference, never an overwrite with the category figure.
+  if (delta !== 0) {
+    await tx.query(
+      `UPDATE items
+       SET live_stock_qty = $1,
+           updated_at = now()
+       WHERE id = $2`,
+      [itemStockAfter, input.itemId],
+    );
+  }
 
   // 5. Insert into inventory_transactions ledger
   await tx.query(
@@ -290,35 +325,28 @@ export async function recordInventoryMovement(
     ],
   );
 
-  // 6. Record in stock_ledger for compatibility
-  const inwardQty = input.direction === 'IN' ? qty : 0;
-  const outwardQty = input.direction === 'OUT' ? qty : 0;
-  const allowedLedgerTypes = [
-    'GRN_INWARD', 'GRN_REVERSAL', 'REQUISITION_ISSUE', 'REQUISITION_REVERSAL',
-    'DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL', 'STOCK_ADJUSTMENT',
-  ];
-  const ledgerTxnType = allowedLedgerTypes.includes(input.txnType)
-    ? input.txnType
-    : (input.direction === 'IN' ? 'GRN_INWARD' : (input.direction === 'OUT' ? 'DIRECT_ISSUE' : 'STOCK_ADJUSTMENT'));
-
-  await tx.query(
-    `INSERT INTO stock_ledger (
-       item_id, txn_type, reference_type, reference_id, reference_no,
-       inward_qty, outward_qty, balance_qty, txn_date, created_by
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::date, CURRENT_DATE), $10)`,
-    [
-      input.itemId,
-      ledgerTxnType,
-      input.referenceDocType ?? 'INVENTORY',
-      null,
-      input.referenceDocNo ?? txnNo,
-      inwardQty,
-      outwardQty,
-      newLiveQty,
-      input.txnDate ?? null,
-      input.userId ?? null,
-    ],
-  );
+  // 6. Stock ledger: the change to the Purchase item's stock, under its real entry type
+  //    (reference = this movement's own number, so the ledger links back to it).
+  if (delta !== 0) {
+    await tx.query(
+      `INSERT INTO stock_ledger (
+         item_id, txn_type, reference_type, reference_id, reference_no,
+         inward_qty, outward_qty, balance_qty, uom_id, location, txn_date, created_by
+       ) VALUES ($1, $2, 'INVENTORY', NULL, $3, $4, $5, $6, $7, $8, COALESCE($9::date, CURRENT_DATE), $10)`,
+      [
+        input.itemId,
+        LEDGER_TYPE[input.direction],
+        txnNo,
+        Math.max(delta, 0),
+        Math.max(-delta, 0),
+        itemStockAfter,
+        baseItem.uom_id,
+        `${input.category} (${input.txnType})`,
+        input.txnDate ?? null,
+        input.userId ?? null,
+      ],
+    );
+  }
 
   return {
     txnNo,

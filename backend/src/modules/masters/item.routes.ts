@@ -186,14 +186,21 @@ router.get(
       b.addRaw(`(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p})`);
     }
 
+    // The computed balance is EVERY ledger entry's inward minus outward — direct
+    // issues, physical-count adjustments, inventory-screen movements and Google
+    // Sheet alignments (SHEET_SYNC) included. Counting only the GRN/requisition
+    // types flagged every item that had any other entry as a false mismatch.
     const rows = await query<Record<string, string>>(
       `SELECT i.id, i.item_code, i.item_description, u.code AS uom_code, i.live_stock_qty,
               COALESCE(l.grn_inward, 0)              AS grn_inward,
               COALESCE(l.grn_reversal, 0)             AS grn_reversal,
               COALESCE(l.requisition_issue, 0)        AS requisition_issue,
               COALESCE(l.requisition_reversal, 0)     AS requisition_reversal,
-              (COALESCE(l.grn_inward, 0) - COALESCE(l.grn_reversal, 0)
-               - COALESCE(l.requisition_issue, 0) + COALESCE(l.requisition_reversal, 0)) AS computed_balance
+              COALESCE(l.direct_issue_net, 0)         AS direct_issue_net,
+              COALESCE(l.adjustment_net, 0)           AS adjustment_net,
+              COALESCE(l.inventory_net, 0)            AS inventory_net,
+              COALESCE(l.sheet_sync_net, 0)           AS sheet_sync_net,
+              COALESCE(l.balance, 0)                  AS computed_balance
          FROM items i
          LEFT JOIN lookups u ON u.id = i.uom_id
          LEFT JOIN (
@@ -201,7 +208,12 @@ router.get(
                   SUM(inward_qty)  FILTER (WHERE txn_type = 'GRN_INWARD')          AS grn_inward,
                   SUM(outward_qty) FILTER (WHERE txn_type = 'GRN_REVERSAL')        AS grn_reversal,
                   SUM(outward_qty) FILTER (WHERE txn_type = 'REQUISITION_ISSUE')   AS requisition_issue,
-                  SUM(inward_qty)  FILTER (WHERE txn_type = 'REQUISITION_REVERSAL') AS requisition_reversal
+                  SUM(inward_qty)  FILTER (WHERE txn_type = 'REQUISITION_REVERSAL') AS requisition_reversal,
+                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL')) AS direct_issue_net,
+                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type = 'STOCK_ADJUSTMENT') AS adjustment_net,
+                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('INVENTORY_IN', 'INVENTORY_OUT', 'INVENTORY_ADJUST')) AS inventory_net,
+                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type = 'SHEET_SYNC') AS sheet_sync_net,
+                  SUM(inward_qty - outward_qty) AS balance
              FROM stock_ledger
             GROUP BY item_id
          ) l ON l.item_id = i.id
@@ -219,6 +231,8 @@ router.get(
           id: Number(r.id), item_code: r.item_code, item_description: r.item_description, uom_code: r.uom_code,
           grn_inward: r.grn_inward, grn_reversal: r.grn_reversal,
           requisition_issue: r.requisition_issue, requisition_reversal: r.requisition_reversal,
+          direct_issue_net: r.direct_issue_net, adjustment_net: r.adjustment_net,
+          inventory_net: r.inventory_net, sheet_sync_net: r.sheet_sync_net,
           computed_balance: r.computed_balance, current_stock: r.live_stock_qty,
           mismatch: Math.abs(computed - current) > 0.0001,
         };

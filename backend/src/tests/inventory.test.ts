@@ -289,7 +289,8 @@ describe('Enterprise Inventory Module API', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    expect(res.body.data).toBeInstanceOf(Array);
+    expect(res.body.data.categories).toBeInstanceOf(Array);
+    expect(res.body.data).toHaveProperty('running');
   });
 });
 

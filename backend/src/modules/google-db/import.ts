@@ -642,11 +642,11 @@ async function recalculate(tx: Queryable, touched: TouchedIds): Promise<void> {
            -- Each aggregate is COALESCEd individually: a FILTER matching no rows
            -- yields NULL, and one NULL term would turn the whole expression NULL,
            -- silently zeroing an item's stock instead of adding to it.
+           -- Every ledger entry type counts (direct issues, adjustments, inventory
+           -- movements, sheet alignments): summing only GRN/requisition types
+           -- would silently undo the others.
            SELECT item_id,
-                  COALESCE(SUM(inward_qty)  FILTER (WHERE txn_type = 'GRN_INWARD'), 0)
-                - COALESCE(SUM(outward_qty) FILTER (WHERE txn_type = 'GRN_REVERSAL'), 0)
-                - COALESCE(SUM(outward_qty) FILTER (WHERE txn_type = 'REQUISITION_ISSUE'), 0)
-                + COALESCE(SUM(inward_qty)  FILTER (WHERE txn_type = 'REQUISITION_REVERSAL'), 0) AS balance
+                  COALESCE(SUM(inward_qty), 0) - COALESCE(SUM(outward_qty), 0) AS balance
              FROM stock_ledger
             WHERE item_id = ANY($1)
             GROUP BY item_id

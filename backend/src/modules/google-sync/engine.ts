@@ -803,12 +803,29 @@ async function reconcileItemsMaster(ctx: { tx: Queryable; seenKeys: Set<string>;
   if (ctx.seenKeys.size === 0) return;
   const activeCodes = Array.from(ctx.seenKeys).map((k) => k.toUpperCase());
 
-  // 1. Ensure all items present in the authoritative source sheet are active
+  // 1. Ensure all items present in the authoritative source sheet are active.
+  //    A code can have several soft-deleted rows (the old inventory sync re-created
+  //    sheet codes on every run), but only ONE live row may exist per code — so an
+  //    inactive live row is re-activated, and a soft-deleted row is restored only
+  //    when the code has no live row, and then only the most recent one.
+  await ctx.tx.query(
+    `UPDATE items
+        SET is_active = TRUE
+      WHERE upper(item_code) = ANY($1::text[])
+        AND deleted_at IS NULL AND is_active = FALSE`,
+    [activeCodes],
+  );
   await ctx.tx.query(
     `UPDATE items
         SET deleted_at = NULL, is_active = TRUE
-      WHERE upper(item_code) = ANY($1::text[])
-        AND (deleted_at IS NOT NULL OR is_active = FALSE)`,
+      WHERE id IN (
+        SELECT DISTINCT ON (upper(d.item_code)) d.id
+          FROM items d
+         WHERE upper(d.item_code) = ANY($1::text[])
+           AND d.deleted_at IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM items a
+                            WHERE upper(a.item_code) = upper(d.item_code) AND a.deleted_at IS NULL)
+         ORDER BY upper(d.item_code), d.deleted_at DESC, d.id DESC)`,
     [activeCodes],
   );
 
