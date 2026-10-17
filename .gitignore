@@ -13,6 +13,10 @@ build/
 dist-next/
 dist-prev-*/
 dist-failed-*/
+# The isolated test copy serves its own build, so a deploy never moves it away;
+# UI work previews into dist-ui.
+dist-staging/
+dist-ui/
 
 # ── Secrets and environment (SRS §25, §27) ────────────────────────────────────
 # Only .env.example is ever committed.
