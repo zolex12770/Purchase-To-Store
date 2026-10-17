@@ -373,7 +373,7 @@ export const METRICS: MetricDef[] = [
   {
     key: 'requisition_issued_qty',
     label: 'Total Issued Qty',
-    description: 'Sum of actual quantity issued by Stores across every issue transaction.',
+    description: 'Sum of actual quantity issued by Stores across every issue transaction; a reversed slip returned its stock and no longer counts.',
     formula: 'Σ v_requisition_header_balance.total_issued_qty',
     unit: 'quantity',
     source: 'v_requisition_header_balance',
@@ -415,8 +415,8 @@ export const METRICS: MetricDef[] = [
   {
     key: 'requisition_issue_transaction_count',
     label: 'Issue Transactions',
-    description: 'Number of distinct store-issue events (issue slips) recorded — a requisition may have several.',
-    formula: 'COUNT(*) FROM requisition_issues',
+    description: 'Number of distinct store-issue events (issue slips) still standing — a requisition may have several; reversed slips are not counted.',
+    formula: "COUNT(*) FROM requisition_issues WHERE status = 'POSTED'",
     unit: 'count',
     source: 'requisition_issues',
     drilldown: '/requisitions/store-queue',

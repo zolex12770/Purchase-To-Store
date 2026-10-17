@@ -30,6 +30,7 @@ Base URL: `/api/v1` · JSON in, JSON out · Bearer token auth (SRS §21).
 | `BUSINESS_RULE_VIOLATION` | 422 | Well-formed but breaks a domain rule (quantity, workflow, status) |
 | `AUTHENTICATION_ERROR` | 401 | Missing, invalid or expired session |
 | `AUTHORIZATION_ERROR` | 403 | Authenticated but lacking the permission |
+| `PASSWORD_CHANGE_REQUIRED` | 403 | The account must change its password before any route but `/auth/me`, change-password, refresh and logout answers |
 | `NOT_FOUND` | 404 | No such record or endpoint |
 | `CONFLICT` | 409 | Duplicate key, or a reference that prevents the operation |
 | `INTEGRATION_ERROR` | 502 | Google Sheets or another external system |
@@ -71,7 +72,10 @@ never be parameterised in SQL, so this is the only safe way to build `ORDER BY`.
 | GET | `/auth/me` | authenticated | Identity, roles and **live** permissions (a revoked grant takes effect at once) |
 | POST | `/auth/change-password` | authenticated | Rotates own password; revokes every other session |
 
-A user whose password must be rotated is refused every non-auth route until they do.
+A user whose password must be changed (`mustChangePassword: true` in the login, refresh and
+`/auth/me` responses) is refused every other route with 403 `PASSWORD_CHANGE_REQUIRED` until they
+change it. A new account and an administrator's password reset owe that change unless the
+administrator sends `mustChangePassword: false`.
 
 ---
 
@@ -249,7 +253,7 @@ carries `meta.filters` and `meta.generatedAt` for filter context and data freshn
 | Method | Path | Permission | Notes |
 |---|---|---|---|
 | GET | `/search?q=` | authenticated | Permission-aware, grouped by entity |
-| GET/POST/PUT/DELETE | `/users` | `user.*` | Plus `/users/:id/reset-password`, `/users/:id/unlock` |
+| GET/POST/PUT/DELETE | `/users` | `user.*` | Plus `/users/:id/reset-password`, `/users/:id/unlock`. A Super Admin account is changed only by a Super Admin, and the last active one cannot be deactivated or lose the role |
 | GET/POST/PUT/DELETE | `/roles` | `role.*` | Plus `/roles/permissions` |
 | GET | `/audit`, `/audit/facets`, `/audit/entity/:entity/:id`, `/audit/:id` | `audit.view` | Includes before/after values |
 | GET/PUT | `/settings` | mixed | Branding is readable by all; the rest needs `system.admin` |

@@ -9,7 +9,9 @@
  *     - Machines (254)
  *     - User Master:
  *       * 26 Department-to-HOD rules -> lookups DEPARTMENT with extra: { hodName, hodUserId }
- *       * 497 Employees -> users table with is_active = TRUE, department_id, employee_id, employee_name
+ *       * 497 Employees -> users table (department_id, employee_id, employee_name). An
+ *         existing account keeps its active/inactive state; a new one is created
+ *         INACTIVE with no usable password, exactly as the User Master sync does.
  *       * Match HODs to users and grant HOD role
  *     - Supplier Master (1,392 unique suppliers)
  *     - Item Master (3,191 unique items with specs, UOM, HSN, QC Required, Min/Max)
@@ -25,6 +27,13 @@
  *  5. Stock ledger reconciliation & live stock update
  *  6. Mirror publication to Destination Sheet (1v-r7cdHsnWBPJhe7RgaNYgnl5T7kPhvAIIf58-q770g)
  *  7. Independent verification and read-back report
+ *
+ * It refuses to start — even as a dry run — unless ZOLEX_ALLOW_RESET_IMPORT=yes
+ * is set for that one run: it opens the database in ZOLEX_DATA_ROOT directly
+ * (the production one by default) and with --execute deletes every business
+ * transaction. Its 2026-10-14 run also set is_active = TRUE on every existing
+ * account, silently re-activating 490 users, among them one an administrator
+ * had deactivated the day before, with no audit row (AUTH-06).
  */
 import { env, paths } from '../config/env.js';
 import fs from 'node:fs';
@@ -34,6 +43,7 @@ import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 import { getDatabase, closeDatabase } from '../db/index.js';
 import { collectBackupData } from '../db/restore.js';
+import { auditIn, SYSTEM_ACTOR } from '../core/audit.js';
 
 function parseDateRobust(raw: unknown): string | null {
   if (raw === null || raw === undefined) return null;
@@ -155,6 +165,14 @@ const APPROVED_INDENT_TYPES = [
 ];
 
 async function main() {
+  if (process.env.ZOLEX_ALLOW_RESET_IMPORT !== 'yes') {
+    console.error(
+      `\nRefusing to run: this script opens the database under ${paths.root} directly and, with --execute, ` +
+      'deletes every business transaction before re-importing. Take a backup, stop the backend, and set ' +
+      'ZOLEX_ALLOW_RESET_IMPORT=yes for this one run if that is really intended.\n',
+    );
+    process.exit(1);
+  }
   const isExecute = process.argv.includes('--execute');
   const runStamp = new Date().toISOString().replace(/[:.]/g, '-');
   console.log('========================================================================');
@@ -393,6 +411,9 @@ async function main() {
     // Import 497 Employees from Cols 0, 1, 2
     const empRows = userRaw.slice(1).filter((r) => r[0] && r[0].trim() && r[1] && r[1].trim());
     let employeesImported = 0;
+    let updatedAccounts = 0;
+    const createdAccounts: string[] = [];
+    const hodRoleHolders: number[] = [];
     const userMap = new Map<string, { id: number; employeeId: string; employeeName: string }>();
 
     for (const r of empRows) {
@@ -416,18 +437,24 @@ async function main() {
       let uId: number;
       if (existing.rows.length > 0) {
         uId = existing.rows[0].id;
+        // Name and department only. Whether an account may sign in is decided
+        // in User Management, never by an import (see the header comment).
         await tx.query(
-          `UPDATE users SET employee_name = $2, department_id = COALESCE($3, department_id), is_active = TRUE WHERE id = $1`,
+          `UPDATE users SET employee_name = $2, department_id = COALESCE($3, department_id) WHERE id = $1`,
           [uId, empName, departmentId],
         );
+        updatedAccounts++;
       } else {
+        // As the User Master sync creates them: inactive, with an unusable password
+        // hash, until an administrator activates the account and sets a password.
         const ins = await tx.query(
-          `INSERT INTO users (employee_id, employee_name, designation, department_id, is_active, must_change_password)
-           VALUES ($1, $2, 'Staff', $3, TRUE, FALSE)
+          `INSERT INTO users (employee_id, employee_name, designation, department_id, password_hash, is_active, must_change_password)
+           VALUES ($1, $2, 'Staff', $3, '!', FALSE, TRUE)
            RETURNING id`,
           [empCode, empName, departmentId],
         );
         uId = ins.rows[0].id;
+        createdAccounts.push(empCode);
         // Grant employee role
         await tx.query("INSERT INTO user_roles (user_id, role_id) SELECT $1, id FROM roles WHERE code = 'EMPLOYEE' ON CONFLICT DO NOTHING", [uId]);
       }
@@ -455,6 +482,7 @@ async function main() {
           );
           if (hodRole) {
             await tx.query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [uMatch.id, hodRole]);
+            hodRoleHolders.push(Number(uMatch.id));
           }
         } else {
           await tx.query(
@@ -464,8 +492,17 @@ async function main() {
         }
       }
     }
-    console.log(`     ✓ User Master employees imported: ${employeesImported}`);
+    console.log(`     ✓ User Master employees imported: ${employeesImported} (${createdAccounts.length} new, inactive)`);
     console.log(`     ✓ Department HOD rules configured: ${deptHodRules.size}`);
+    // Account changes made outside the user API still belong in the audit trail.
+    await auditIn(tx, {
+      actor: { ...SYSTEM_ACTOR, name: 'execute_controlled_reset_and_import' },
+      action: 'IMPORT', entity: 'user', source: 'IMPORT', entityLabel: 'User Master (controlled reset import)',
+      after: { rows: employeesImported, updated: updatedAccounts, createdInactive: createdAccounts, hodRoleEnsuredFor: hodRoleHolders },
+      message: `Updated the name and department of ${updatedAccounts} existing account(s) (active state unchanged), ` +
+        `created ${createdAccounts.length} inactive account(s) with no usable password, and ensured the HOD role ` +
+        `for ${hodRoleHolders.length} department HOD(s).`,
+    });
 
     // Ensure fallback admin user exists
     const fallbackUser = (await tx.query("SELECT id FROM users WHERE employee_id IN ('10221', '10422') ORDER BY id ASC LIMIT 1")).rows[0];

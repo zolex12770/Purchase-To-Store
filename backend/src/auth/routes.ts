@@ -95,6 +95,9 @@ async function issueSession(
   res: Response,
 ): Promise<{ accessToken: string; profile: Record<string, unknown> }> {
   const { roles, permissions } = await loadUserPermissions(user.id);
+  // The real flag: the client shows only the change-password screen while it is
+  // set, and the API refuses everything else (blockIfPasswordChangeRequired).
+  const mustChangePassword = Boolean(user.must_change_password);
 
   const accessToken = signAccessToken({
     sub: user.id,
@@ -102,7 +105,7 @@ async function issueSession(
     name: user.employee_name,
     roles,
     permissions,
-    mustChangePassword: false,
+    mustChangePassword,
   });
 
   const { token: refreshToken, hash } = generateRefreshToken();
@@ -125,7 +128,7 @@ async function issueSession(
       departmentId: user.department_id,
       roles,
       permissions,
-      mustChangePassword: false,
+      mustChangePassword,
     },
   };
 }
@@ -343,7 +346,7 @@ router.get(
       department: user.department_name,
       departmentId: user.department_id,
       lastLoginAt: user.last_login_at,
-      mustChangePassword: false,
+      mustChangePassword: Boolean(user.must_change_password),
       roles,
       permissions,
     });
@@ -381,7 +384,7 @@ router.post(
       ]);
     }
 
-    const strength = checkPasswordStrength(newPassword);
+    const strength = checkPasswordStrength(newPassword, { employeeId: user.employee_id });
     if (!strength.ok) {
       throw ValidationError('Choose a stronger password.', [
         { field: 'newPassword', message: `Password must ${strength.problems.join(', ')}.` },
@@ -406,7 +409,9 @@ router.post(
       [userId],
     );
     clearRefreshCookie(res);
-    // The access token used for this very request must stop working too.
+    // The access token used for this very request must stop working too, and a
+    // password-change obligation ends now rather than when the cached state
+    // expires — the next sign-in must not still be refused.
     invalidateAuthState(userId);
 
     await audit({

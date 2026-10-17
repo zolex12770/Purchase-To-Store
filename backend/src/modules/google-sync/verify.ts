@@ -288,7 +288,7 @@ export async function verifyLiveParity(): Promise<VerificationReport> {
   ]);
   const dbReqCount = await queryOne<{ n: string }>('SELECT COUNT(*)::int AS n FROM requisition_headers');
   const dbReqLineCount = await queryOne<{ n: string }>('SELECT COUNT(*)::int AS n FROM requisition_lines');
-  const dbIssueCount = await queryOne<{ n: string }>('SELECT COUNT(*)::int AS n FROM requisition_issues');
+  const dbIssueCount = await queryOne<{ n: string }>("SELECT COUNT(*)::int AS n FROM requisition_issues WHERE status = 'POSTED'");
 
   const sourceReqHeader = (sourceReqRows[0] || []).map((h: any) => String(h).trim());
   const expectedReqHeaders = [

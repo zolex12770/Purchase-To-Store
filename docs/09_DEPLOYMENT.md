@@ -125,8 +125,18 @@ server {
 }
 ```
 
-The backend sets `trust proxy` to exactly one hop in production, so `req.ip` is the
-real client for rate limiting and audit without allowing header spoofing.
+By default (`TRUST_PROXY` unset) the backend trusts `X-Forwarded-For` only from
+loopback, so behind this nginx on the same host `req.ip` is the real client for rate
+limiting and audit, and a client reaching the API port directly cannot spoof the
+header. A proxy on another host or in a container must be named in `TRUST_PROXY`:
+its address or subnet (comma-separated), or the number of proxy hops when nothing
+else can reach the API port — `deploy/docker-compose.yml` sets `1` for its nginx
+container. Otherwise the API sees the proxy's own address for every user, and the
+sign-in rate limit becomes one budget for the whole site: 20 mistyped passwords
+anywhere close sign-in for everyone for 15 minutes. Never use `uniquelocal` on a host
+whose LAN is itself a private range (every LAN client could name any address);
+`true` is refused at boot. The value in force is logged at start-up
+(`Trust proxy  :`).
 
 ---
 
@@ -152,6 +162,8 @@ GOOGLE_SYNC_INTERVAL_MINUTES=15
 
 RATE_LIMIT_MAX=1000
 AUTH_RATE_LIMIT_MAX=20
+# Only when the reverse proxy is NOT on this machine (see §4), e.g. its address:
+# TRUST_PROXY=10.0.0.5
 LOG_LEVEL=info
 SEED_DEMO_DATA=false
 ```

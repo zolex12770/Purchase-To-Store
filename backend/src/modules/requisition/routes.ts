@@ -24,6 +24,7 @@ import {
   assertRequisitionTransition, assertRequisitionEditable, assertNotAlready, REQUISITION_ISSUABLE, type RequisitionStatus,
 } from '../../domain/status.js';
 import { toQty, dec } from '../../domain/money.js';
+import { recomputeRequisitionStatus } from '../../domain/quantities.js';
 import { issueRequisitionLine, reverseRequisitionIssueLine } from '../../domain/stock.js';
 import { loadCompanySettings } from '../../domain/company.js';
 import { renderRequisitionDocumentHtml } from './requisition-document.js';
@@ -253,8 +254,9 @@ router.get(
               (SELECT l.item_description FROM requisition_lines l WHERE l.requisition_id = h.id ORDER BY l.line_no LIMIT 1) AS first_item_description,
               (SELECT i.live_stock_qty FROM requisition_lines l JOIN items i ON i.id = l.item_id
                 WHERE l.requisition_id = h.id ORDER BY l.line_no LIMIT 1) AS first_item_available_stock,
-              (SELECT i.issue_slip_no FROM requisition_issues i WHERE i.requisition_id = h.id ORDER BY i.created_at DESC LIMIT 1) AS last_issue_slip_no,
-              (SELECT MAX(i.issue_date) FROM requisition_issues i WHERE i.requisition_id = h.id) AS last_issue_date,
+              (SELECT i.issue_slip_no FROM requisition_issues i WHERE i.requisition_id = h.id AND i.status = 'POSTED'
+                ORDER BY i.created_at DESC LIMIT 1) AS last_issue_slip_no,
+              (SELECT MAX(i.issue_date) FROM requisition_issues i WHERE i.requisition_id = h.id AND i.status = 'POSTED') AS last_issue_date,
               (CURRENT_DATE - h.requisition_date)::int AS age_days
          ${LIST_FROM}
          LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
@@ -373,8 +375,11 @@ router.get(
       [id],
     );
 
+    // Reversed slips stay in the history (marked, with who/when/why); the line
+    // balances above already ignore them.
     const issues = await query(
       `SELECT i.id, i.issue_slip_no, i.issue_date, i.remarks, i.created_at,
+              i.status, i.reversed_at, i.reversal_reason, xu.employee_name AS reversed_by_name,
               su.employee_name AS store_user_name,
               json_agg(json_build_object(
                 'itemCode', ril.item_code, 'itemDescription', ril.item_description,
@@ -384,13 +389,15 @@ router.get(
               ) ORDER BY ril.id) AS lines
          FROM requisition_issues i
          LEFT JOIN users su ON su.id = i.store_user_id
+         LEFT JOIN users xu ON xu.id = i.reversed_by
          LEFT JOIN (
            SELECT ril.*, rl.item_code, rl.item_description
              FROM requisition_issue_lines ril
              JOIN requisition_lines rl ON rl.id = ril.requisition_line_id
          ) ril ON ril.requisition_issue_id = i.id
         WHERE i.requisition_id = $1
-        GROUP BY i.id, i.issue_slip_no, i.issue_date, i.remarks, i.created_at, su.employee_name
+        GROUP BY i.id, i.issue_slip_no, i.issue_date, i.remarks, i.created_at,
+                 i.status, i.reversed_at, i.reversal_reason, xu.employee_name, su.employee_name
         ORDER BY i.created_at DESC`,
       [id],
     );
@@ -702,13 +709,14 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
         }
 
         // Unapprove (APPROVE -> REJECTED via this same REJECT route, or a
-        // CANCEL) is refused once anything has actually been issued — reverse
-        // the issue first, not the requisition (mirrors Indent/PO consumption guard).
+        // CANCEL) is refused while anything is actually issued — reverse the
+        // issue first, not the requisition (mirrors Indent/PO consumption guard).
+        // A reversed slip has given its stock back, so it no longer counts.
         if ((opts.action === 'REJECT' && header.status === 'APPROVED') || opts.action === 'CANCEL') {
           const issued = await txQueryOne<{ n: string }>(
             tx, `SELECT COUNT(*) AS n FROM requisition_issue_lines ril
                    JOIN requisition_issues ri ON ri.id = ril.requisition_issue_id
-                  WHERE ri.requisition_id = $1`, [id],
+                  WHERE ri.requisition_id = $1 AND ri.status = 'POSTED'`, [id],
           );
           if (Number(issued?.n ?? 0) > 0) {
             throw BusinessRuleError(
@@ -844,7 +852,9 @@ router.post(
         }>(
           tx,
           `SELECT rl.item_id, rl.item_code, rl.requested_qty, rl.uom_id,
-                  COALESCE((SELECT SUM(issue_qty) FROM requisition_issue_lines WHERE requisition_line_id = rl.id), 0) AS issued_qty
+                  COALESCE((SELECT SUM(ril.issue_qty) FROM requisition_issue_lines ril
+                              JOIN requisition_issues ri ON ri.id = ril.requisition_issue_id
+                             WHERE ril.requisition_line_id = rl.id AND ri.status = 'POSTED'), 0) AS issued_qty
              FROM requisition_lines rl WHERE rl.id = $1 AND rl.requisition_id = $2 FOR UPDATE`,
           [line.requisitionLineId, id],
         );
@@ -871,23 +881,100 @@ router.post(
       }
 
       // Recompute overall status from the authoritative balance view.
-      const totals = await txQueryOne<{ total_requested_qty: string; total_issued_qty: string }>(
-        tx, 'SELECT total_requested_qty, total_issued_qty FROM v_requisition_header_balance WHERE requisition_id = $1', [id],
-      );
-      const newStatus: RequisitionStatus = dec(totals?.total_issued_qty ?? 0).greaterThanOrEqualTo(dec(totals?.total_requested_qty ?? 0))
-        ? 'FULLY_ISSUED' : 'PARTIALLY_ISSUED';
-      await tx.query('UPDATE requisition_headers SET status = $2, updated_at = now(), updated_by = $3 WHERE id = $1', [id, newStatus, userId]);
+      const totals = await recomputeRequisitionStatus(tx, id, userId);
+      const newStatus = totals.to as RequisitionStatus;
 
       await auditIn(tx, {
         actor: actorFrom(req), action: 'ISSUE', entity: 'requisition', entityId: id, entityLabel: header.requisition_no,
         before: { status: header.status },
-        after: { status: newStatus, issueSlipNo, lines: issued, totalRequested: totals?.total_requested_qty, totalIssued: totals?.total_issued_qty },
+        after: { status: newStatus, issueSlipNo, lines: issued, totalRequested: totals.totalRequested, totalIssued: totals.totalIssued },
       });
 
       return { requisitionNo: header.requisition_no, issueSlipNo, status: newStatus, issueId: issueHeader.id };
     });
 
     sendCreated(res, { ...result, message: `Issue slip ${result.issueSlipNo} created against ${result.requisitionNo}.` });
+  }),
+);
+
+/* ── Issue reversal — the slip stays, marked REVERSED; its stock comes back ─────
+   The counterpart of the store issue (and of a direct-issue cancel): every line's
+   quantity returns to stock through a REQUISITION_REVERSAL ledger entry naming the
+   slip, the slip and its lines are kept exactly as issued, and the requisition's
+   status is re-derived from the slips still posted — back to APPROVED once all are
+   reversed, from where it can be cancelled. */
+
+const reverseIssueSchema = z.object({
+  reason: z.string().trim().min(5, 'Give the reason for reversing (at least 5 characters).').max(500),
+});
+
+router.post(
+  '/:id/issues/:issueId/reverse',
+  // Whoever may issue may take an issue back — the same Store right.
+  requirePermission('requisition.issue'),
+  validateBody(reverseIssueSchema),
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const issueId = idParam(req, 'issueId');
+    const { reason } = req.body as z.infer<typeof reverseIssueSchema>;
+    const userId = req.user!.id;
+
+    const result = await withTransaction(async (tx) => {
+      // Requisition first, then the slip: the issue route's lock order, so an issue
+      // and a reversal on the same requisition queue behind each other.
+      const header = await txQueryOne<{ id: number; requisition_no: string; status: RequisitionStatus }>(
+        tx, 'SELECT id, requisition_no, status FROM requisition_headers WHERE id = $1 FOR UPDATE', [id],
+      );
+      if (!header) throw NotFoundError('Requisition');
+      const slip = await txQueryOne<{ id: number; issue_slip_no: string; status: string }>(
+        tx, 'SELECT id, issue_slip_no, status FROM requisition_issues WHERE id = $1 AND requisition_id = $2 FOR UPDATE',
+        [issueId, id],
+      );
+      if (!slip) throw NotFoundError('Issue slip');
+      if (slip.status === 'REVERSED') throw BusinessRuleError(`Issue slip ${slip.issue_slip_no} is already reversed.`);
+
+      const lines = await txQuery<{ item_id: number; uom_id: number | null; issue_qty: string; item_code: string }>(
+        tx,
+        `SELECT ril.item_id, ril.uom_id, ril.issue_qty, rl.item_code
+           FROM requisition_issue_lines ril
+           JOIN requisition_lines rl ON rl.id = ril.requisition_line_id
+          WHERE ril.requisition_issue_id = $1
+          ORDER BY ril.id`,
+        [issueId],
+      );
+      const today = dateStamp(new Date());
+      for (const l of lines) {
+        await reverseRequisitionIssueLine(tx, { item_id: l.item_id, uom_id: l.uom_id }, l.issue_qty,
+          { requisitionId: id, issueSlipNo: slip.issue_slip_no, issueDate: today, userId });
+      }
+      await tx.query(
+        `UPDATE requisition_issues SET status = 'REVERSED', reversed_at = now(), reversed_by = $2, reversal_reason = $3
+          WHERE id = $1`,
+        [issueId, userId, reason],
+      );
+      const status = await recomputeRequisitionStatus(tx, id, userId);
+
+      await auditIn(tx, {
+        actor: actorFrom(req), action: 'CANCEL', entity: 'requisition_issue', entityId: issueId, entityLabel: slip.issue_slip_no,
+        before: { status: slip.status, requisitionStatus: header.status },
+        after: {
+          status: 'REVERSED', reason, requisitionNo: header.requisition_no, requisitionStatus: status.to,
+          returnedLines: lines.map((l) => ({ item: l.item_code, qty: l.issue_qty })),
+        },
+        message: `Issue slip ${slip.issue_slip_no} (${header.requisition_no}) reversed — ${lines.length} line(s) returned to stock. Reason: ${reason}`,
+      });
+
+      return {
+        issueSlipNo: slip.issue_slip_no, requisitionNo: header.requisition_no,
+        returnedLines: lines.length, status: status.to,
+      };
+    });
+
+    sendOk(res, {
+      ...result,
+      message: `Issue slip ${result.issueSlipNo} reversed; ${result.returnedLines} line(s) returned to stock. ` +
+        `${result.requisitionNo} is now ${result.status.replace(/_/g, ' ').toLowerCase()}.`,
+    });
   }),
 );
 
@@ -999,12 +1086,13 @@ async function buildIssueSlipDocument(issueId: number) {
   const header = await queryOne<Record<string, unknown>>(
     `SELECT i.*, h.requisition_no, h.employee_name, h.employee_code, h.department_name, h.hod_name,
             m.name AS machine_name, cc.name AS cost_centre_name,
-            su.employee_name AS store_user_name
+            su.employee_name AS store_user_name, xu.employee_name AS reversed_by_name
        FROM requisition_issues i
        JOIN requisition_headers h ON h.id = i.requisition_id
        LEFT JOIN lookups m ON m.id = h.machine_id
        LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
        LEFT JOIN users su ON su.id = i.store_user_id
+       LEFT JOIN users xu ON xu.id = i.reversed_by
       WHERE i.id = $1`,
     [issueId],
   );
@@ -1025,6 +1113,9 @@ async function buildIssueSlipDocument(issueId: number) {
     employee_name: h.employee_name, employee_code: h.employee_code, department_name: h.department_name,
     hod_name: h.hod_name, machine_name: h.machine_name as string | null, cost_centre_name: h.cost_centre_name as string | null,
     store_user_name: h.store_user_name,
+    reversal: h.status === 'REVERSED'
+      ? { at: (header.reversed_at as string | null) ?? null, by: (header.reversed_by_name as string | null) ?? null, reason: h.reversal_reason }
+      : null,
     lines: lines.map((l) => ({
       item_code: String(l.item_code), item_description: String(l.item_description), uom_code: l.uom_code as string | null,
       requested_qty_snapshot: String(l.requested_qty_snapshot), previously_issued_qty: String(l.previously_issued_qty),

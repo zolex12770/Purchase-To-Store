@@ -16,9 +16,14 @@ export default defineConfig({
       // The SPA talks to a same-origin /api path in development, so no CORS
       // preflight and no hard-coded backend URL in the client bundle.
       // Must match backend/.env PORT (canonically 4000 — see backend/src/config/env.ts).
+      // xfwd passes the browser's address on as X-Forwarded-For; the backend
+      // trusts it only from loopback (TRUST_PROXY unset, backend config/env.ts),
+      // so sign-in rate limits and audit rows see the real LAN client instead of
+      // 127.0.0.1.
       '/api': {
         target: apiTarget,
         changeOrigin: true,
+        xfwd: true,
       },
     },
   },
@@ -30,6 +35,7 @@ export default defineConfig({
       '/api': {
         target: apiTarget,
         changeOrigin: true,
+        xfwd: true,
       },
     },
   },

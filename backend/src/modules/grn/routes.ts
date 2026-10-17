@@ -516,9 +516,11 @@ router.get(
   }),
 );
 
+// Recording a print moves the lot's print_count, which is what tells the store a
+// label is a reprint — so it needs the print right, not merely the view right.
 router.post(
   '/labels/print',
-  requirePermission('grn.view'),
+  requirePermission('grn.print'),
   validateBody(z.object({ ids: z.array(z.number().int().positive()).min(1) })),
   asyncHandler(async (req, res) => {
     const { ids } = req.body as { ids: number[] };
@@ -537,7 +539,8 @@ router.post(
 
 router.get(
   '/labels/pdf',
-  requirePermission('grn.view'),
+  // Counts as a print (it moves print_count below), like POST /labels/print.
+  requirePermission('grn.print'),
   validateQuery(labelIdsSchema),
   asyncHandler(async (req, res) => {
     const { ids } = parsedQuery<z.infer<typeof labelIdsSchema>>(res);
@@ -618,9 +621,12 @@ router.get(
               (SELECT string_agg(DISTINCT ih.indent_no, ', ' ORDER BY ih.indent_no)
                  FROM po_indent_sources pis JOIN purchase_indent_headers ih ON ih.id = pis.indent_id
                 WHERE pis.po_line_id = gl.po_line_id) AS indent_no,
-              -- A Requisition has already issued stock against this item (Section 4) —
-              -- the received quantity can no longer be corrected on this line.
-              EXISTS (SELECT 1 FROM stock_ledger sl WHERE sl.item_id = gl.item_id AND sl.txn_type = 'REQUISITION_ISSUE') AS qty_locked
+              -- Requisitions hold a net issued quantity of this item (Section 4) — the
+              -- received quantity can no longer be corrected on this line. Same rule
+              -- as hasRequisitionConsumption: reversed issues no longer count.
+              COALESCE((SELECT SUM(sl.outward_qty - sl.inward_qty) FROM stock_ledger sl
+                         WHERE sl.item_id = gl.item_id
+                           AND sl.txn_type IN ('REQUISITION_ISSUE', 'REQUISITION_REVERSAL')), 0) > 0 AS qty_locked
          FROM grn_lines gl
          LEFT JOIN lookups u ON u.id = gl.uom_id
          LEFT JOIN v_po_line_balance b ON b.po_line_id = gl.po_line_id
@@ -1450,17 +1456,19 @@ router.post(
       }
 
       // Same real relationship as the edit-lock (Section 4): reversing a
-      // posted receipt whose item has since been issued against a
-      // Requisition would try to pull the pooled balance below what that
-      // Requisition already relied on — refuse cleanly instead of letting
-      // the item's own nonneg stock constraint fail as a raw DB error.
+      // posted receipt whose item is still issued against a Requisition
+      // would try to pull the pooled balance below what that Requisition
+      // relies on — refuse cleanly instead of letting the item's own nonneg
+      // stock constraint fail as a raw DB error. Issues that were reversed
+      // gave their stock back and no longer count.
       if (grn.status === 'POSTED') {
         for (const l of lines) {
           const consumed = await hasRequisitionConsumption(tx, l.item_id);
           if (consumed) {
             throw BusinessRuleError(
-              `${grn.grn_no} cannot be cancelled — ${l.item_code} has already been issued against a Requisition, ` +
-              `so reversing this receipt could take its stock below zero. Correct the GRN's other details instead of cancelling it.`,
+              `${grn.grn_no} cannot be cancelled — ${l.item_code} has already been issued against a Requisition ` +
+              `and that issue still stands, so reversing this receipt could take its stock below zero. ` +
+              `Reverse that issue slip first, or correct the GRN's other details instead of cancelling it.`,
               { itemCode: l.item_code },
             );
           }
@@ -1650,11 +1658,17 @@ router.get(
  * cards and date/supplier/item trend breakdowns are already served generically
  * by the existing /analytics endpoints (GrnAnalysis.tsx) and are not
  * duplicated here.
+ *
+ * These need the GRN analysis right, not just the view right: they consolidate
+ * received value by supplier and item, which a view-only role had no business
+ * reading in bulk. Every role that holds grn.analyze (Purchase Head, Store User,
+ * Management) keeps them; the GRN Analysis screen itself draws from /analytics,
+ * whose rights are unchanged.
  * ──────────────────────────────────────────────────────────────────────── */
 
 router.get(
   '/analysis/po-wise',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   validateQuery(z.object({
     search: z.string().trim().max(200).optional(),
     supplierId: csvIdArray,
@@ -1706,7 +1720,7 @@ router.get(
 
 router.get(
   '/analysis/item-wise',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   validateQuery(z.object({
     search: z.string().trim().max(200).optional(),
     page: z.coerce.number().int().min(1).default(1),
@@ -1762,7 +1776,7 @@ router.get(
 
 router.get(
   '/analysis/supplier-wise',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   validateQuery(z.object({
     search: z.string().trim().max(200).optional(),
     page: z.coerce.number().int().min(1).default(1),
@@ -1820,7 +1834,7 @@ router.get(
 
 router.get(
   '/analysis/summary',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   asyncHandler(async (_req, res) => {
     const grnCounts = await query<{ status: string; n: string }>(
       "SELECT status, COUNT(*) AS n FROM grn_headers GROUP BY status",

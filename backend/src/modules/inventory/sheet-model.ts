@@ -112,6 +112,24 @@ export function financialYearMonths(start = FY_START): string[] {
   return out;
 }
 
+const quoteTab = (tab: string) => `'${tab.replace(/'/g, "''")}'`;
+
+/**
+ * The ranges one category is read with, in the order the parsers expect: stock tab,
+ * its opening and adjustment columns, each movement tab, then 'Stock Adjustment'.
+ * Shared by the sync and scripts/compute-stock-alignment.mjs, so both read the same cells.
+ */
+export function rangesFor(cfg: CategorySheetConfig): string[] {
+  const s = cfg.stock;
+  return [
+    `${quoteTab(s.tab)}!A${s.headerRow}:${s.lastCol}`,
+    `${quoteTab(s.tab)}!${s.openingCol}${s.headerRow}:${s.openingCol}`,
+    `${quoteTab(s.tab)}!${s.adjustmentCol}${s.headerRow}:${s.adjustmentCol}`,
+    ...cfg.movements.map((m) => `${quoteTab(m.tab)}!A${m.firstRow}:Z`),
+    `${quoteTab(ADJUSTMENT_TAB.tab)}!A${ADJUSTMENT_TAB.firstRow}:K`,
+  ];
+}
+
 export const INVENTORY_SHEETS: Record<InventoryCategory, CategorySheetConfig> = {
   RM: {
     category: 'RM',

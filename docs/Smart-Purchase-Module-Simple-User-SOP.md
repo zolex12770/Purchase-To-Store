@@ -33,7 +33,7 @@ Access the Smart Purchase Module via any modern web browser at:
 3. **[Callout ③] Sign In Button:** Click **Sign In** to log in.
 
 > **Operational Standard:**  
-> Authentication connects users **directly** to the Purchase Dashboard. There is **NO mandatory password change screen**.
+> Sign-in connects users directly to the Purchase Dashboard — except the first time after an administrator has set the password (a new account or a password reset). Then a **Set a new password** screen appears first: enter a new password of your own (at least 8 characters with upper and lower case, a digit and a symbol, not containing your Employee ID) and confirm it. Nothing else opens until you do; afterwards you continue straight to the page you asked for.
 
 ---
 
@@ -54,7 +54,7 @@ After sign-in, users land directly on the **Purchase Overview Dashboard**.
 
 ## 4. USER ADMINISTRATION & MANAGEMENT
 
-System Administrators can add new employees and assign roles directly without forced first-login password changes.
+System Administrators can add new employees and assign roles directly. The first password an administrator sets (for a new account, or with **Reset password**) must be replaced by the employee at their next sign-in unless the administrator unticks **Must change this password**. Give every person their own password — never an example or a shared one; the system refuses published passwords and passwords that contain the Employee ID. Only a Super Admin can reset, edit or deactivate another Super Admin.
 
 ![User Management List](assets/sop_screenshots/purchase_03_user_management.png)
 
@@ -188,7 +188,7 @@ Analytics provide operational insights into vendor performance and spend.
 
 ## 12. USER PROFILE & VOLUNTARY PASSWORD CHANGE
 
-Users can view profile details and update passwords voluntarily from settings.
+Users can view profile details and update passwords voluntarily from settings. (A password set by an administrator must be changed at the next sign-in — see section 2.)
 
 ![User Profile Settings](assets/sop_screenshots/purchase_19_profile.png)
 

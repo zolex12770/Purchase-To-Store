@@ -18,8 +18,9 @@
  *        · per-item proof  → opening + inward − outward + adjustments vs the
  *                            sheet's live stock, stored on inventory_items
  *        · Purchase stock  → items.live_stock_qty follows the sheet total for
- *                            the code; every change is written to stock_ledger
- *                            as SHEET_SYNC, so the ledger explains each figure.
+ *                            the code, in the Item Master's unit only; every
+ *                            change is written to stock_ledger as SHEET_SYNC,
+ *                            so the ledger explains each figure.
  *   4. Record a per-tab reconciliation report (inventory_sync_checkpoints).
  *
  * Safety valve: a tab whose new reading would reverse an unusually large share of
@@ -33,12 +34,13 @@ import { env } from '../../config/env.js';
 import { logger } from '../../core/logger.js';
 import { INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
 import {
-  INVENTORY_SHEETS, ADJUSTMENT_TAB, financialYearMonths, colIndex,
+  INVENTORY_SHEETS, ADJUSTMENT_TAB, financialYearMonths, colIndex, rangesFor,
   parseStockTab, parseMovementTab, parseAdjustmentTab, reconcileItems,
   REPORT_ONLY,
   type CategorySheetConfig, type ExclusionCode, type MovementParse, type MovementRecord,
   type QuarantineCandidate, type Row, type StockParse,
 } from './sheet-model.js';
+import { sameUnit } from '../../domain/uom.js';
 
 /* ── Result shapes ──────────────────────────────────────────────────────────── */
 
@@ -75,6 +77,17 @@ export interface ItemMismatch {
   note: string;
 }
 
+/** A sheet figure left out of the Purchase stock because the sheet counts the code in another unit. */
+export interface UnitMismatch {
+  itemCode: string;
+  /** The Item Master unit (null when the item has none). */
+  itemUom: string | null;
+  /** The sheet figures not added, e.g. "WIP Nos 1472". */
+  leftOut: string;
+  /** false when no sheet counts the code in the item's unit: its stock was left as it was. */
+  aligned: boolean;
+}
+
 export interface CategorySyncResult {
   category: InventoryCategory;
   spreadsheetId: string;
@@ -86,7 +99,7 @@ export interface CategorySyncResult {
   tabs: TabSyncReport[];
   items: { inSheet: number; inserted: number; updated: number; noLongerInSheet: number; negativeInSheet: number; linkedToPurchaseItem: number };
   reconciliation: { checked: number; matched: number; mismatched: number; mismatches: ItemMismatch[] };
-  purchaseStock: { aligned: number; negativeHeldAtZero: string[]; categoryChanged: number };
+  purchaseStock: { aligned: number; negativeHeldAtZero: string[]; categoryChanged: number; unitMismatches: UnitMismatch[] };
   /** Totals kept for the screens that show a one-line toast. */
   totalRowsRead: number;
   validRecordsImported: number;
@@ -114,8 +127,6 @@ async function getSheetsClient() {
   return google.sheets({ version: 'v4', auth: auth as never });
 }
 
-const quoteTab = (tab: string) => `'${tab.replace(/'/g, "''")}'`;
-
 export interface CategoryRead {
   stockMain: Row[];
   stockOpening: Row[];
@@ -125,16 +136,7 @@ export interface CategoryRead {
   ranges: string[];
 }
 
-export function rangesFor(cfg: CategorySheetConfig): string[] {
-  const s = cfg.stock;
-  return [
-    `${quoteTab(s.tab)}!A${s.headerRow}:${s.lastCol}`,
-    `${quoteTab(s.tab)}!${s.openingCol}${s.headerRow}:${s.openingCol}`,
-    `${quoteTab(s.tab)}!${s.adjustmentCol}${s.headerRow}:${s.adjustmentCol}`,
-    ...cfg.movements.map((m) => `${quoteTab(m.tab)}!A${m.firstRow}:Z`),
-    `${quoteTab(ADJUSTMENT_TAB.tab)}!A${ADJUSTMENT_TAB.firstRow}:K`,
-  ];
-}
+export { rangesFor };
 
 async function readCategory(cfg: CategorySheetConfig): Promise<CategoryRead> {
   const sheets = await getSheetsClient();
@@ -636,6 +638,17 @@ async function reconcileCategory(
     notCounted.set(k, m);
   }
 
+  // The Item Master unit of each listed code: a row whose sheet counts another unit is
+  // not added to the Purchase stock (alignPurchaseStock), and its note says so.
+  const purchaseUnit = new Map<string, string | null>();
+  for (const r of await txQuery<{ code: string; uom: string | null }>(
+    tx,
+    `SELECT upper(i.item_code) AS code, u.code AS uom
+       FROM items i LEFT JOIN lookups u ON u.id = i.uom_id
+      WHERE i.deleted_at IS NULL AND upper(i.item_code) = ANY($1::text[])`,
+    [stock.records.map((s) => s.codeKey)],
+  )) purchaseUnit.set(r.code, r.uom);
+
   const stockByCode = new Map(stock.records.map((s) => [s.codeKey, s]));
   const rec = reconcileItems(stock.records, totals);
   const updates = rec.map((r) => {
@@ -652,6 +665,10 @@ async function reconcileCategory(
     }
     const erp = erpByCode.get(r.codeKey);
     if (erp) note = `${note ? `${note} ` : ''}${erp} movement(s) entered in the ERP are not part of the sheet figure.`;
+    if (purchaseUnit.has(r.codeKey) && !sameUnit(purchaseUnit.get(r.codeKey), s.uom)) {
+      note = `${note ? `${note} ` : ''}Not counted in the Purchase stock: this sheet counts ${s.uom}, ` +
+        `the Item Master unit is ${purchaseUnit.get(r.codeKey) ?? 'not set'}.`;
+    }
     return { code: r.codeKey, computed: r.computed, status: r.matched ? 'MATCHED' : 'MISMATCH', note };
   });
   await jsonBatch(
@@ -705,10 +722,14 @@ async function reconcileCategory(
 
 /**
  * items.live_stock_qty follows the Google Sheet: the sum of the code's live stock
- * across every category sheet that lists it. Each change is ledgered as SHEET_SYNC
- * (difference from the current figure), so the stock ledger explains it. A
- * negative sheet total is held at zero (the Purchase stock cannot be negative)
- * and reported.
+ * across the category sheets that list it IN THE ITEM MASTER'S UNIT. A figure in
+ * another unit is never added — until 2026-10-16 PTC4/0, a KG item, showed
+ * 'WIP  Stock Live'!K184 1,472 Nos plus 'RM Stock Live'!G661 264.75 Kg as
+ * 1,736.75. When no sheet counts the code in the item's unit, the item is left as
+ * it is. Both cases are reported (purchaseStock.unitMismatches, and the sheet row's
+ * recon note). Each change is ledgered as SHEET_SYNC (difference from the current
+ * figure), so the stock ledger explains it. A negative sheet total is held at zero
+ * (the Purchase stock cannot be negative) and reported.
  */
 async function alignPurchaseStock(
   tx: Queryable,
@@ -719,29 +740,53 @@ async function alignPurchaseStock(
 ): Promise<void> {
   const codes = stock.records.map((s) => s.codeKey);
   if (codes.length === 0) return;
-  const rows = await txQuery<{ id: string; current: number; sheet_qty: number; cats: number; cat: string; inventory_category: string; uom_id: string | null; item_code: string }>(
+  const rows = await txQuery<{
+    id: string; item_code: string; current: number; inventory_category: string; uom_id: string | null;
+    item_uom: string | null; category: string; sheet_uom: string | null; sheet_qty: number;
+  }>(
     tx,
     `WITH sheet AS (
-       SELECT upper(item_code) AS code, SUM(live_stock_qty) AS qty,
-              COUNT(DISTINCT category)::int AS cats, MIN(category) AS cat
+       SELECT upper(item_code) AS code, category, primary_uom, SUM(live_stock_qty) AS qty
          FROM inventory_items
         WHERE deleted_at IS NULL AND source_tab IS NOT NULL AND source_row_index IS NOT NULL
-        GROUP BY upper(item_code))
-     SELECT i.id, i.item_code, i.live_stock_qty::float8 AS current, s.qty::float8 AS sheet_qty, s.cats, s.cat,
-            i.inventory_category, i.uom_id
-       FROM items i JOIN sheet s ON s.code = upper(i.item_code)
-      WHERE i.deleted_at IS NULL AND upper(i.item_code) = ANY($1::text[])`,
+        GROUP BY upper(item_code), category, primary_uom)
+     SELECT i.id, i.item_code, i.live_stock_qty::float8 AS current, i.inventory_category, i.uom_id,
+            u.code AS item_uom, s.category, s.primary_uom AS sheet_uom, s.qty::float8 AS sheet_qty
+       FROM items i
+       JOIN sheet s ON s.code = upper(i.item_code)
+       LEFT JOIN lookups u ON u.id = i.uom_id
+      WHERE i.deleted_at IS NULL AND upper(i.item_code) = ANY($1::text[])
+      ORDER BY i.id, s.category`,
     [codes],
   );
+  const listingsByItem = new Map<string, typeof rows>();
+  for (const r of rows) {
+    const list = listingsByItem.get(r.id) ?? [];
+    list.push(r);
+    listingsByItem.set(r.id, list);
+  }
+  const round4 = (n: number) => Math.round(n * 10000) / 10000;
   const changes: Array<{ item_id: number; target: number; delta: number; uom_id: number | null }> = [];
   const categoryChanges: number[] = [];
-  for (const r of rows) {
-    const sheetQty = Math.round(Number(r.sheet_qty) * 10000) / 10000;
+  for (const listings of listingsByItem.values()) {
+    const r = listings[0];
+    if (new Set(listings.map((l) => l.category)).size === 1 && r.category !== r.inventory_category) categoryChanges.push(Number(r.id));
+    const counted = listings.filter((l) => sameUnit(r.item_uom, l.sheet_uom));
+    const leftOut = listings.filter((l) => !counted.includes(l));
+    if (leftOut.length > 0) {
+      result.purchaseStock.unitMismatches.push({
+        itemCode: r.item_code,
+        itemUom: r.item_uom,
+        leftOut: leftOut.map((l) => `${l.category} ${l.sheet_uom ?? '(no unit)'} ${round4(Number(l.sheet_qty))}`).join(', '),
+        aligned: counted.length > 0,
+      });
+    }
+    if (counted.length === 0) continue;
+    const sheetQty = round4(counted.reduce((a, l) => a + Number(l.sheet_qty), 0));
     const target = Math.max(0, sheetQty);
     if (sheetQty < 0) result.purchaseStock.negativeHeldAtZero.push(r.item_code);
-    const delta = Math.round((target - Number(r.current)) * 10000) / 10000;
+    const delta = round4(target - Number(r.current));
     if (Math.abs(delta) >= 0.0001) changes.push({ item_id: Number(r.id), target, delta, uom_id: r.uom_id ? Number(r.uom_id) : null });
-    if (r.cats === 1 && r.cat !== r.inventory_category) categoryChanges.push(Number(r.id));
   }
   await jsonBatch(
     tx,
@@ -817,7 +862,7 @@ function emptyResult(cfg: CategorySheetConfig, runId: string, dryRun: boolean): 
     status: 'SUCCESS', startedAt: new Date().toISOString(), durationMs: 0, tabs: [],
     items: { inSheet: 0, inserted: 0, updated: 0, noLongerInSheet: 0, negativeInSheet: 0, linkedToPurchaseItem: 0 },
     reconciliation: { checked: 0, matched: 0, mismatched: 0, mismatches: [] },
-    purchaseStock: { aligned: 0, negativeHeldAtZero: [], categoryChanged: 0 },
+    purchaseStock: { aligned: 0, negativeHeldAtZero: [], categoryChanged: 0, unitMismatches: [] },
     totalRowsRead: 0, validRecordsImported: 0, transactionsImported: 0, quarantinedRecords: 0,
   };
 }

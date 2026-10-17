@@ -87,6 +87,15 @@ function parseNum(raw: unknown): number {
 }
 
 export async function runLiveReimport(): Promise<ImportSummary> {
+  // The same rule as execute_controlled_reset_and_import.ts: this deletes every
+  // business table in the database under ZOLEX_DATA_ROOT (the production one by
+  // default), so it never starts without an explicit flag for that run.
+  if (process.env.ZOLEX_ALLOW_RESET_IMPORT !== 'yes') {
+    throw new Error(
+      `Refusing to run: this resets the business data of the database under ${paths.root}. ` +
+      'Take a backup, stop the backend, and set ZOLEX_ALLOW_RESET_IMPORT=yes for this one run if that is really intended.',
+    );
+  }
   const runId = 'IMPORT-' + new Date().toISOString().replace(/[:.]/g, '-');
   const summary: ImportSummary = {
     runId,
@@ -337,9 +346,11 @@ export async function runLiveReimport(): Promise<ImportSummary> {
         [existingUser.rows[0].id, empName, deptId],
       );
     } else {
+      // As the User Master sync creates them: inactive, with an unusable password
+      // hash, until an administrator activates the account and sets a password.
       const ins = await db.query(
-        `INSERT INTO users (employee_id, employee_name, designation, department_id, is_active, must_change_password)
-         VALUES ($1, $2, 'Staff', $3, TRUE, FALSE)
+        `INSERT INTO users (employee_id, employee_name, designation, department_id, password_hash, is_active, must_change_password)
+         VALUES ($1, $2, 'Staff', $3, '!', FALSE, TRUE)
          RETURNING id`,
         [code, empName, deptId],
       );

@@ -51,7 +51,16 @@ export function asyncHandler(
   fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
 ): RequestHandler {
   return (req, res, next) => {
-    void Promise.resolve(fn(req, res, next)).catch(next);
+    void Promise.resolve(fn(req, res, next)).catch((err: unknown) => {
+      // Some handlers validate with schema.parse() inline; a bad value there threw a raw
+      // ZodError that reached the error handler as HTTP 500 (/inventory/categories/RM?status=FOO,
+      // 2026-10-16). It is the caller's mistake, so it is answered like validateQuery: 422.
+      if (err instanceof z.ZodError) {
+        next(ValidationError('Please correct the highlighted fields.', zodIssues(err)));
+        return;
+      }
+      next(err);
+    });
   };
 }
 

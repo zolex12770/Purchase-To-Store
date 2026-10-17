@@ -187,11 +187,18 @@ router.get(
     }
 
     // The computed balance is EVERY ledger entry's inward minus outward — direct
-    // issues, physical-count adjustments, inventory-screen movements and Google
-    // Sheet alignments (SHEET_SYNC) included. Counting only the GRN/requisition
-    // types flagged every item that had any other entry as a false mismatch.
-    const rows = await query<Record<string, string>>(
-      `SELECT i.id, i.item_code, i.item_description, u.code AS uom_code, i.live_stock_qty,
+    // issues, physical-count adjustments, inventory-screen movements, Google
+    // Sheet alignments (SHEET_SYNC) and the one-time opening alignment included.
+    // Counting only the GRN/requisition types flagged every item that had any
+    // other entry as a false mismatch. The report covers inactive items too
+    // (2026-10-16: 305 of the 2,769 mismatches were inactive items), so the meta
+    // splits the count.
+    // The mismatch rule is evaluated on the exact numerics: in floating point a
+    // difference of exactly 0.0001 on a large figure (1,000,000.0001 vs 1,000,000)
+    // reads as more than 0.0001.
+    const rows = await query<Record<string, string> & { is_active: boolean; mismatch: boolean }>(
+      `SELECT i.id, i.item_code, i.item_description, u.code AS uom_code, i.live_stock_qty, i.is_active,
+              abs(COALESCE(l.balance, 0) - i.live_stock_qty) > 0.0001 AS mismatch,
               COALESCE(l.grn_inward, 0)              AS grn_inward,
               COALESCE(l.grn_reversal, 0)             AS grn_reversal,
               COALESCE(l.requisition_issue, 0)        AS requisition_issue,
@@ -200,6 +207,7 @@ router.get(
               COALESCE(l.adjustment_net, 0)           AS adjustment_net,
               COALESCE(l.inventory_net, 0)            AS inventory_net,
               COALESCE(l.sheet_sync_net, 0)           AS sheet_sync_net,
+              COALESCE(l.alignment_net, 0)            AS alignment_net,
               COALESCE(l.balance, 0)                  AS computed_balance
          FROM items i
          LEFT JOIN lookups u ON u.id = i.uom_id
@@ -210,9 +218,10 @@ router.get(
                   SUM(outward_qty) FILTER (WHERE txn_type = 'REQUISITION_ISSUE')   AS requisition_issue,
                   SUM(inward_qty)  FILTER (WHERE txn_type = 'REQUISITION_REVERSAL') AS requisition_reversal,
                   SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL')) AS direct_issue_net,
-                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type = 'STOCK_ADJUSTMENT') AS adjustment_net,
-                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('INVENTORY_IN', 'INVENTORY_OUT', 'INVENTORY_ADJUST')) AS inventory_net,
+                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('STOCK_ADJUSTMENT', 'STOCK_ADJUSTMENT_REVERSAL')) AS adjustment_net,
+                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('INVENTORY_IN', 'INVENTORY_OUT', 'INVENTORY_ADJUST', 'INVENTORY_REVERSAL')) AS inventory_net,
                   SUM(inward_qty - outward_qty) FILTER (WHERE txn_type = 'SHEET_SYNC') AS sheet_sync_net,
+                  SUM(inward_qty - outward_qty) FILTER (WHERE reference_type = 'OPENING_ALIGNMENT') AS alignment_net,
                   SUM(inward_qty - outward_qty) AS balance
              FROM stock_ledger
             GROUP BY item_id
@@ -223,19 +232,16 @@ router.get(
     );
 
     const data = rows
-      .map((r) => {
-        const computed = Number(r.computed_balance);
-        const current = Number(r.live_stock_qty);
-        return {
-          id: Number(r.id), item_code: r.item_code, item_description: r.item_description, uom_code: r.uom_code,
-          grn_inward: r.grn_inward, grn_reversal: r.grn_reversal,
-          requisition_issue: r.requisition_issue, requisition_reversal: r.requisition_reversal,
-          direct_issue_net: r.direct_issue_net, adjustment_net: r.adjustment_net,
-          inventory_net: r.inventory_net, sheet_sync_net: r.sheet_sync_net,
-          computed_balance: r.computed_balance, current_stock: r.live_stock_qty,
-          mismatch: Math.abs(computed - current) > 0.0001,
-        };
-      })
+      .map((r) => ({
+        id: Number(r.id), item_code: r.item_code, item_description: r.item_description, uom_code: r.uom_code,
+        is_active: r.is_active,
+        grn_inward: r.grn_inward, grn_reversal: r.grn_reversal,
+        requisition_issue: r.requisition_issue, requisition_reversal: r.requisition_reversal,
+        direct_issue_net: r.direct_issue_net, adjustment_net: r.adjustment_net,
+        inventory_net: r.inventory_net, sheet_sync_net: r.sheet_sync_net, alignment_net: r.alignment_net,
+        computed_balance: r.computed_balance, current_stock: r.live_stock_qty,
+        mismatch: r.mismatch,
+      }))
       .filter((r) => q.mismatchOnly !== 'true' || r.mismatch);
 
     const order = resolveSort(q, { itemCode: 'item_code' }, 'itemCode');
@@ -246,8 +252,11 @@ router.get(
     const offset = offsetOf(q);
     const page = data.slice(offset, offset + q.pageSize);
 
+    const mismatched = data.filter((r) => r.mismatch);
     sendPage(res, page, total, q.page, q.pageSize, {
-      mismatchCount: data.filter((r) => r.mismatch).length,
+      mismatchCount: mismatched.length,
+      activeMismatchCount: mismatched.filter((r) => r.is_active).length,
+      inactiveMismatchCount: mismatched.filter((r) => !r.is_active).length,
     });
   }),
 );
@@ -451,7 +460,7 @@ router.get(
            JOIN requisition_issues ri ON ri.id = ril.requisition_issue_id
            JOIN requisition_headers rh ON rh.id = ri.requisition_id
            LEFT JOIN users su ON su.id = ri.store_user_id
-          WHERE ril.item_id = $1
+          WHERE ril.item_id = $1 AND ri.status = 'POSTED'   -- a reversed slip issued nothing; the ledger keeps both entries
           ORDER BY ri.issue_date DESC, ril.id DESC
           LIMIT $2`,
         [id, historyLimit],

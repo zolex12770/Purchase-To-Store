@@ -8,7 +8,7 @@
  */
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { verifyAccessToken, type AccessTokenPayload } from './tokens.js';
-import { AuthenticationError, AuthorizationError } from '../core/errors.js';
+import { AuthenticationError, AuthorizationError, PasswordChangeRequiredError } from '../core/errors.js';
 import { query } from '../db/index.js';
 import { OMNIPOTENT_ROLES, PERMISSION_CODES } from './permissions.js';
 
@@ -65,16 +65,19 @@ function extractToken(req: Request): string | null {
  * refresh sessions were revoked on the spot.
  *
  * So every authenticated request also checks the account as it is NOW: still
- * active, password not changed since the token was issued, and the roles and
- * permissions currently granted. The answer is cached per user for a few
- * seconds so a busy screen costs one small lookup, not one per request, and the
- * routes that change an account call `invalidateAuthState` so those changes
- * apply immediately rather than after the cache window.                       */
+ * active, password not changed since the token was issued, whether a password
+ * change is owed, and the roles and permissions currently granted. The answer
+ * is cached per user for a few seconds so a busy screen costs one small lookup,
+ * not one per request, and the routes that change an account call
+ * `invalidateAuthState` so those changes apply immediately rather than after
+ * the cache window.                                                           */
 
 interface LiveAuthState {
   active: boolean;
   /** When the password last changed (ms since epoch), or null if never recorded. */
   passwordChangedAt: number | null;
+  /** The account must replace its password before it may use anything but the auth routes. */
+  mustChangePassword: boolean;
   roles: string[];
   permissions: string[];
   loadedAt: number;
@@ -95,8 +98,8 @@ async function loadLiveAuthState(userId: number): Promise<LiveAuthState> {
   const cached = liveAuth.get(userId);
   if (cached && Date.now() - cached.loadedAt < LIVE_AUTH_TTL_MS) return cached;
 
-  const rows = await query<{ is_active: boolean; password_changed_at: string | Date | null }>(
-    'SELECT is_active, password_changed_at FROM users WHERE id = $1 AND deleted_at IS NULL',
+  const rows = await query<{ is_active: boolean; password_changed_at: string | Date | null; must_change_password: boolean }>(
+    'SELECT is_active, password_changed_at, must_change_password FROM users WHERE id = $1 AND deleted_at IS NULL',
     [userId],
   );
   const row = rows[0];
@@ -105,6 +108,7 @@ async function loadLiveAuthState(userId: number): Promise<LiveAuthState> {
   const state: LiveAuthState = {
     active,
     passwordChangedAt: row?.password_changed_at ? new Date(row.password_changed_at).getTime() : null,
+    mustChangePassword: Boolean(row?.must_change_password),
     roles,
     permissions,
     loadedAt: Date.now(),
@@ -142,7 +146,11 @@ export const requireAuth: RequestHandler = (req, _res, next) => {
       }
       // Rights come from the database, not from the token, so a grant or a
       // removal made by an administrator is in force on the very next request.
-      req.user = toAuthUser({ ...payload, roles: state.roles, permissions: state.permissions });
+      // So does the password-change obligation: a token minted before it was set
+      // (or cleared) must not decide it.
+      req.user = toAuthUser({
+        ...payload, roles: state.roles, permissions: state.permissions, mustChangePassword: state.mustChangePassword,
+      });
       next();
     })
     .catch(next);
@@ -162,11 +170,37 @@ export const optionalAuth: RequestHandler = (req, _res, next) => {
 };
 
 /**
- * A user forced to rotate their password may only reach auth routes.
- * Applied globally after `requireAuth` so no module can forget it (SRS §6, R-07).
+ * What a user who owes a password change may still do: see who they are, change
+ * the password, and renew or end the session.
  */
-export const blockIfPasswordChangeRequired: RequestHandler = (_req, _res, next) => {
-  next();
+const PASSWORD_CHANGE_PATHS = new Set([
+  '/api/v1/auth/me', '/api/v1/auth/change-password', '/api/v1/auth/refresh', '/api/v1/auth/logout',
+]);
+
+/**
+ * A user who must change their password — a bootstrap account, or anyone an
+ * administrator has just set a password for — may reach only the auth routes
+ * above until they do (SRS §6, R-07); everything else answers 403
+ * PASSWORD_CHANGE_REQUIRED. It reads the LIVE flag `requireAuth` loaded, so the
+ * block starts on the account's next request and lifts as soon as the change
+ * succeeds (change-password calls `invalidateAuthState`).
+ *
+ * This used to be a no-op while sign-in reported mustChangePassword:false, so
+ * production recorded 33 sign-ins as "password rotation required" that still
+ * got full sessions. Applied globally after `requireAuth` so no module can
+ * forget it; the path check fails closed for anything not listed.
+ */
+export const blockIfPasswordChangeRequired: RequestHandler = (req, _res, next) => {
+  if (!req.user?.mustChangePassword) {
+    next();
+    return;
+  }
+  const path = req.originalUrl.split('?')[0]!.replace(/\/+$/, '');
+  if (PASSWORD_CHANGE_PATHS.has(path)) {
+    next();
+    return;
+  }
+  next(PasswordChangeRequiredError());
 };
 
 /** Requires ALL of the given permission codes. */

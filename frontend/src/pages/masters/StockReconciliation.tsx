@@ -26,9 +26,19 @@ interface ReconciliationRow {
   grn_reversal: string;
   requisition_issue: string;
   requisition_reversal: string;
+  /** Net of the one-time opening alignment rows (reference type OPENING_ALIGNMENT). */
+  alignment_net: string;
   computed_balance: string;
   current_stock: string;
   mismatch: boolean;
+}
+
+interface ReconciliationMeta {
+  total: number;
+  mismatchCount: number;
+  /** The report covers inactive items too; the split says where the mismatches are. */
+  activeMismatchCount: number;
+  inactiveMismatchCount: number;
 }
 
 export default function StockReconciliation() {
@@ -41,8 +51,9 @@ export default function StockReconciliation() {
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['items', 'stock-reconciliation', query],
-    queryFn: () => api.getWithMeta<ReconciliationRow[], { total: number; mismatchCount: number }>(`/items/analysis/stock-reconciliation${query}`),
+    queryFn: () => api.getWithMeta<ReconciliationRow[], ReconciliationMeta>(`/items/analysis/stock-reconciliation${query}`),
   });
+  const meta = data?.meta;
 
   return (
     <>
@@ -53,11 +64,12 @@ export default function StockReconciliation() {
       />
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
-        <StatTile label="Items reconciled" value={String(data?.meta.total ?? 0)} />
+        <StatTile label="Items reconciled" value={String(meta?.total ?? 0)} />
         <StatTile
           label="Mismatches"
-          value={String(data?.meta.mismatchCount ?? 0)}
-          tone={(data?.meta.mismatchCount ?? 0) > 0 ? 'danger' : 'success'}
+          value={String(meta?.mismatchCount ?? 0)}
+          sub={meta?.activeMismatchCount !== undefined ? `${meta.activeMismatchCount} active · ${meta.inactiveMismatchCount} inactive` : undefined}
+          tone={(meta?.mismatchCount ?? 0) > 0 ? 'danger' : 'success'}
           onClick={() => setMismatchOnly(true)}
         />
       </div>
@@ -100,6 +112,7 @@ export default function StockReconciliation() {
                     <th className="right">GRN Reversal</th>
                     <th className="right">Requisition Issue</th>
                     <th className="right">Requisition Reversal</th>
+                    <th className="right" title="One-time opening alignment from sheet evidence (2026-10)">Opening Alignment</th>
                     <th className="right">Computed Balance</th>
                     <th className="right">Current Stock</th>
                     <th className="center">Status</th>
@@ -115,6 +128,7 @@ export default function StockReconciliation() {
                       <td className="right num cell-muted">{qty(r.grn_reversal)}</td>
                       <td className="right num" style={{ color: 'var(--danger-600)' }}>{qty(r.requisition_issue)}</td>
                       <td className="right num cell-muted">{qty(r.requisition_reversal)}</td>
+                      <td className="right num cell-muted">{qty(r.alignment_net)}</td>
                       <td className="right num cell-strong">{qty(r.computed_balance)}</td>
                       <td className="right num cell-strong">{qty(r.current_stock)}</td>
                       <td className="center">

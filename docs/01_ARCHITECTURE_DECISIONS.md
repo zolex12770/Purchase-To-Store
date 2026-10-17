@@ -279,9 +279,12 @@ cost 12. Failed logins are counted and the account locks for 15 minutes after 5 
 failures (§6 "failed-login protection"). Every login, failed login, logout and token refresh is
 audited.
 
-The bootstrap administrators (Employee IDs **10221** and **10422**, password `Admin@12345`) are
-seeded with `must_change_password = true`; the API refuses every non-auth route for such a user
-until the password is rotated (§6, §25, R-07).
+The bootstrap administrators (Employee IDs **10221** and **10422**) have no default password: a new
+database gives them `BOOTSTRAP_ADMIN_PASSWORD` (12+ characters) or a random password written once
+to `bootstrap-admin-password.txt` in the data root, never to the log (`seed.ts`
+`bootstrapPassword()`). They are seeded with `must_change_password = true`, and until the password is
+changed the API answers only `/auth/me`, change-password, refresh and logout — every other route
+returns 403 `PASSWORD_CHANGE_REQUIRED` (§6, §25, R-07).
 
 ---
 

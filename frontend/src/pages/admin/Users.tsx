@@ -4,7 +4,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  Plus, Pencil, KeyRound, Unlock, UserX, Download, ShieldCheck, Clock,
+  Plus, Pencil, KeyRound, Unlock, UserX, Download, ShieldCheck, Clock, Lock,
 } from 'lucide-react';
 import { api, qs, downloadFile, ApiError, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
@@ -55,10 +55,20 @@ interface Draft {
   roleIds: number[];
 }
 
+// The administrator knows the first password they type, so by default the user
+// must replace it at first sign-in. This was false, and the reset below always
+// sent false, so administrator-chosen passwords stayed in use indefinitely.
 const EMPTY: Draft = {
   employeeId: '', employeeName: '', designation: '', email: '', mobileNo: '',
-  departmentId: null, password: '', mustChangePassword: false, isActive: true, roleIds: [],
+  departmentId: null, password: '', mustChangePassword: true, isActive: true, roleIds: [],
 };
+
+/**
+ * Shown in an empty password field instead of an example: administrators reused
+ * the example this field used to show as the real password of live accounts.
+ */
+const PASSWORD_HINT = 'At least 8 characters with upper and lower case, a digit and a symbol';
+const PASSWORD_RULES = 'Choose one for this person alone, never an example or a shared password. It may not contain the Employee ID.';
 
 export default function Users() {
   const { can, user: me, isSuperAdmin } = useAuth();
@@ -71,6 +81,7 @@ export default function Users() {
   const [detailId, setDetailId] = useState<number | null>(null);
   const [resetting, setResetting] = useState<UserRow | null>(null);
   const [newPassword, setNewPassword] = useState('');
+  const [resetMustChange, setResetMustChange] = useState(true);
   const [deactivating, setDeactivating] = useState<UserRow | null>(null);
 
   const { options: departments } = useLookupOptions('DEPARTMENT');
@@ -124,8 +135,8 @@ export default function Users() {
   });
 
   const reset = useMutation({
-    mutationFn: ({ u, pw }: { u: UserRow; pw: string }) =>
-      api.post<{ message: string }>(`/users/${u.id}/reset-password`, { newPassword: pw, mustChangePassword: false }),
+    mutationFn: ({ u, pw, mustChange }: { u: UserRow; pw: string; mustChange: boolean }) =>
+      api.post<{ message: string }>(`/users/${u.id}/reset-password`, { newPassword: pw, mustChangePassword: mustChange }),
     onSuccess: (res) => {
       toast.success('Password reset', res.message);
       setResetting(null); setNewPassword('');
@@ -212,6 +223,16 @@ export default function Users() {
       key: 'actions', header: '', align: 'right', locked: true, width: '124px',
       render: (u) => {
         const locked = u.locked_until && new Date(u.locked_until) > new Date();
+        // Only a Super Admin may change a Super Admin's account; the server refuses anyone else.
+        const mayChange = isSuperAdmin || !u.roles.some((r) => r.code === 'SUPER_ADMIN');
+        if (!mayChange) {
+          return (can('user.edit') || can('user.delete')) ? (
+            <span className="row" style={{ justifyContent: 'flex-end', color: 'var(--text-muted)' }}
+                  title="Only a Super Admin can change a Super Admin account">
+              <Lock size={13} />
+            </span>
+          ) : null;
+        }
         return (
           <div className="row" style={{ gap: 1, justifyContent: 'flex-end' }} onClick={(e) => e.stopPropagation()}>
             {can('user.edit') && (
@@ -227,7 +248,7 @@ export default function Users() {
             )}
             {can('user.edit') && (
               <Button variant="ghost" size="sm" title="Reset password"
-                      onClick={() => { setResetting(u); setNewPassword(''); }}>
+                      onClick={() => { setResetting(u); setNewPassword(''); setResetMustChange(true); }}>
                 <KeyRound size={13} />
               </Button>
             )}
@@ -468,14 +489,18 @@ export default function Users() {
             </Field>
 
             {!editing.id && (
-              <Field
-                label="Initial password" required error={errors.password} span="full"
-                hint="Minimum 8 characters with upper case, lower case, a digit and a special character"
-              >
+              <Field label="Initial password" required error={errors.password} span="full" hint={PASSWORD_RULES}>
                 <Input type="text" value={editing.password}
                        onChange={(e) => setEditing({ ...editing, password: e.target.value })}
-                       invalid={Boolean(errors.password)} placeholder="Zolex@2026" />
+                       invalid={Boolean(errors.password)} placeholder={PASSWORD_HINT} />
               </Field>
+            )}
+            {!editing.id && (
+              <div className="field-span-full">
+                <Checkbox label="Must change this password at first sign-in"
+                          checked={editing.mustChangePassword}
+                          onChange={(v) => setEditing({ ...editing, mustChangePassword: v })} />
+              </div>
             )}
 
             <div className="field-span-full">
@@ -539,21 +564,24 @@ export default function Users() {
           <>
             <Button variant="ghost" onClick={() => { setResetting(null); setNewPassword(''); }}>Cancel</Button>
             <Button variant="primary" loading={reset.isPending} disabled={newPassword.length < 8}
-                    onClick={() => resetting && reset.mutate({ u: resetting, pw: newPassword })}>
+                    onClick={() => resetting && reset.mutate({ u: resetting, pw: newPassword, mustChange: resetMustChange })}>
               Reset password
             </Button>
           </>
         }
       >
-        <Field
-          label="New password" required
-          hint="Minimum 8 characters with upper case, lower case, a digit and a special character"
-        >
-          <Input type="text" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} autoFocus placeholder="Zolex@2026" />
+        <Field label="New password" required hint={PASSWORD_RULES}>
+          <Input type="text" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} autoFocus placeholder={PASSWORD_HINT} />
         </Field>
-        <div style={{ marginTop: 'var(--sp-4)', fontSize: 'var(--text-xs)', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-          The user will be required to change this at their next sign-in, and all of their active
-          sessions will be signed out immediately.
+        <div style={{ marginTop: 'var(--sp-4)' }}>
+          <Checkbox label="Must change this password at next sign-in"
+                    checked={resetMustChange} onChange={setResetMustChange} />
+        </div>
+        <div style={{ marginTop: 'var(--sp-3)', fontSize: 'var(--text-xs)', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+          {resetMustChange
+            ? 'At their next sign-in they must replace it with a password of their own before they can do anything else.'
+            : 'They can keep using it until they change it themselves on their profile.'}
+          {' '}All of their active sessions are signed out immediately.
         </div>
       </Modal>
 

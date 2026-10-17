@@ -99,7 +99,13 @@ const REQUISITION_TRANSITIONS: Record<RequisitionStatus, RequisitionStatus[]> = 
   RETURNED:          ['DRAFT', 'PENDING_APPROVAL', 'CANCELLED'],
   // Over-issue is a deliberately supported business rule (Rule 7/26) — more
   // issue transactions may land against an already-FULLY_ISSUED requisition,
-  // and a reversal can fall a requisition back from FULLY to PARTIALLY.
+  // and a reversal can fall a requisition back from FULLY to PARTIALLY. Once
+  // every slip is reversed nothing is issued any more, so it returns to
+  // APPROVED (awaiting store issue) and can then be cancelled — but only
+  // recomputeRequisitionStatus makes that move, writing the derived status
+  // directly. APPROVED is deliberately absent here: the HOD's approve action
+  // checks this table, and must never pull an issued requisition back to
+  // APPROVED with stock still out against it (a stale approval screen).
   PARTIALLY_ISSUED:  ['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'CANCELLED'],
   FULLY_ISSUED:      ['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'CANCELLED'],
   CANCELLED:         [],

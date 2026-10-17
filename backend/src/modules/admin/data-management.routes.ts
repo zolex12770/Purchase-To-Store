@@ -8,20 +8,34 @@
  * - Soft-Delete & Restore (deleted_at timestamp toggle).
  * - Safe Hard-Delete (Permanent Purge) strictly guarded by dependency checks.
  * - System Super Admins (10221, 10422) can NEVER be deleted or deactivated.
+ * - Any other Super Admin account is changed only by a Super Admin, and the last
+ *   active Super Admin is never deactivated or deleted (super-admin-guard.ts).
  */
 import { createHash } from 'node:crypto';
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
 import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
-import { requireAnyPermission, invalidateAuthState } from '../../auth/middleware.js';
+import { requirePermission, requireSuperAdmin, invalidateAuthState } from '../../auth/middleware.js';
 import { auditIn, actorFrom } from '../../core/audit.js';
+import { assertMayChangeUsers, assertActiveSuperAdminRemains } from './super-admin-guard.js';
+import { dateStamp } from '../../domain/numbering.js';
+import {
+  VOID_DOCUMENT_TYPES, planTestDocumentVoid, applyTestDocumentVoid, type VoidPlan,
+} from './void-test-documents.js';
+import { dec, toQty } from '../../domain/money.js';
+import { activeInventorySync } from '../inventory/sync-engine.js';
+import {
+  ALIGNMENT_COMPONENT_CODES, planAlignment, applyAlignment, undoAlignment, describePlan,
+} from './stock-alignment.js';
 
 const router = Router();
 
-// Guard all data-management operations to Super Admin or administrative authorities
-router.use(requireAnyPermission('system.admin', 'user.admin', 'role.view'));
+// Hard deletes and bulk (de)activation of users, suppliers and items are system
+// administration. This accepted role.view — a read-only right — or 'user.admin',
+// which does not exist in the permission catalogue.
+router.use(requirePermission('system.admin'));
 
 const PROTECTED_EMPLOYEE_IDS = new Set(['10221', '10422']);
 
@@ -758,19 +772,55 @@ async function inspectDependencies(entity: string, id: number): Promise<{
       blockingReasons.push(`Purchase Order is referenced by ${grnRefs?.n} GRN(s). Cannot hard-delete.`);
     }
   } else if (entity === 'grn') {
+    // stock_ledger has no grn_id column — the old query failed with HTTP 500 for
+    // every GRN (staging, GRN 12379). A GRN's entries carry reference_type 'GRN'
+    // with its id, and each line's entries its grn_line_id.
     const stockRefs = await queryOne<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM stock_ledger WHERE grn_id = $1 OR (reference_id = $1 AND reference_type IN ('GRN', 'GRN_INWARD', 'GRN_REVERSAL'))`,
+      `SELECT COUNT(*) AS n FROM stock_ledger
+        WHERE (reference_type = 'GRN' AND reference_id = $1)
+           OR grn_line_id IN (SELECT id FROM grn_lines WHERE grn_id = $1)`,
       [id],
     );
     dependencies.push({ table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockRefs?.n ?? 0) });
     if (Number(stockRefs?.n ?? 0) > 0) {
-      blockingReasons.push(`GRN has ${stockRefs?.n} stock movements in the ledger. Cannot hard-delete posted inventory.`);
+      blockingReasons.push(`GRN has ${stockRefs?.n} stock movements in the ledger. Cannot hard-delete posted inventory — cancel it instead.`);
     }
   } else if (entity === 'requisitions') {
-    const issueRefs = await queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_issues WHERE requisition_id = $1', [id]);
-    dependencies.push({ table: 'requisition_issues', label: 'Material Issue Slips', count: Number(issueRefs?.n ?? 0) });
+    const [issueRefs, stockRefs] = await Promise.all([
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_issues WHERE requisition_id = $1', [id]),
+      // API issues are ledgered against the requisition; imported ones against the slip number.
+      queryOne<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM stock_ledger
+          WHERE txn_type IN ('REQUISITION_ISSUE', 'REQUISITION_REVERSAL')
+            AND ((reference_type = 'REQUISITION' AND reference_id = $1)
+                 OR reference_no IN (SELECT issue_slip_no FROM requisition_issues WHERE requisition_id = $1))`,
+        [id],
+      ),
+    ]);
+    dependencies.push(
+      { table: 'requisition_issues', label: 'Material Issue Slips', count: Number(issueRefs?.n ?? 0) },
+      { table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockRefs?.n ?? 0) },
+    );
     if (Number(issueRefs?.n ?? 0) > 0) {
       blockingReasons.push(`Requisition has ${issueRefs?.n} issued material slip(s). Cannot hard-delete.`);
+    }
+    if (Number(stockRefs?.n ?? 0) > 0) {
+      blockingReasons.push(`Requisition has ${stockRefs?.n} stock movement(s) in the ledger. Cannot hard-delete posted inventory.`);
+    }
+  } else if (entity === 'direct_issues') {
+    // Had no branch at all, so DIR-20261014-0002 (production) showed canHardDelete:
+    // deleting it returns no stock and leaves its ledger entry pointing at nothing.
+    const stockRefs = await queryOne<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM stock_ledger
+        WHERE reference_type = 'DIRECT_ISSUE' AND reference_id = $1
+          AND txn_type IN ('DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL')`,
+      [id],
+    );
+    dependencies.push({ table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockRefs?.n ?? 0) });
+    if (Number(stockRefs?.n ?? 0) > 0) {
+      blockingReasons.push(
+        `Direct issue has ${stockRefs?.n} stock movement(s) in the ledger. Cannot hard-delete posted inventory — cancel it instead, which returns the stock.`,
+      );
     }
   }
 
@@ -860,8 +910,8 @@ router.post(
     if (entity === 'users') {
       // Protect super admins
       const protectedUsers = await query<{ id: number; employee_name: string }>(
-        `SELECT id, employee_name FROM users WHERE id = ANY($1) AND employee_id IN ('10221', '10422')`,
-        [ids],
+        `SELECT id, employee_name FROM users WHERE id = ANY($1) AND employee_id = ANY($2)`,
+        [ids, [...PROTECTED_EMPLOYEE_IDS]],
       );
       if (protectedUsers.length > 0) {
         if (!isActive) {
@@ -872,9 +922,16 @@ router.post(
           }
         }
       }
+      if (!isActive && filteredIds.includes(Number(req.user!.id))) {
+        throw BusinessRuleError('You cannot deactivate your own account.');
+      }
     }
 
     await withTransaction(async (tx) => {
+      if (entity === 'users') {
+        await assertMayChangeUsers(tx, req, filteredIds);
+        if (!isActive) await assertActiveSuperAdminRemains(tx, filteredIds);
+      }
       const table = entity;
       await tx.query(
         `UPDATE ${table}
@@ -925,8 +982,8 @@ router.post(
     let filteredIds = [...ids];
     if (entity === 'users' && !restore) {
       const protectedUsers = await query<{ id: number }>(
-        `SELECT id FROM users WHERE id = ANY($1) AND employee_id IN ('10221', '10422')`,
-        [ids],
+        `SELECT id FROM users WHERE id = ANY($1) AND employee_id = ANY($2)`,
+        [ids, [...PROTECTED_EMPLOYEE_IDS]],
       );
       if (protectedUsers.length > 0) {
         const protectedSet = new Set(protectedUsers.map((u) => Number(u.id)));
@@ -935,9 +992,16 @@ router.post(
           throw BusinessRuleError('Super Admin accounts (10221, 10422) cannot be soft-deleted.');
         }
       }
+      if (filteredIds.includes(Number(req.user!.id))) {
+        throw BusinessRuleError('You cannot delete your own account.');
+      }
     }
 
     await withTransaction(async (tx) => {
+      if (entity === 'users') {
+        await assertMayChangeUsers(tx, req, filteredIds);
+        if (!restore) await assertActiveSuperAdminRemains(tx, filteredIds);
+      }
       const table = entity;
       const timestamp = restore ? null : new Date().toISOString();
       await tx.query(
@@ -996,6 +1060,11 @@ router.post(
     const { entity, id, confirm } = req.body as z.infer<typeof hardDeleteSchema>;
     if (confirm !== 'DELETE') {
       throw ValidationError('Type "DELETE" in the confirmation field to authorize permanent deletion.');
+    }
+    if (entity === 'users') {
+      if (id === Number(req.user!.id)) throw BusinessRuleError('You cannot delete your own account.');
+      await assertMayChangeUsers(undefined, req, [id]);
+      await assertActiveSuperAdminRemains(undefined, [id], 'This is the last active Super Admin and cannot be deleted.');
     }
 
     const { canHardDelete, blockingReasons } = await inspectDependencies(entity, id);
@@ -1289,6 +1358,221 @@ router.post(
       return { statusChanged };
     });
     sendOk(res, { dryRun: false, ...summary, poStatusesRederived: result.statusChanged, message: `Run #${jobId} reverted.` });
+  }),
+);
+
+/* ── Repair: ledger-only void of test stock documents ─────────────────────────
+   For TEST documents whose stock effect live stock already excludes: the
+   2026-10-14 E2E chain on item 1161480001 (GRN-20261014-0001 +20,
+   ISS-20261014-0001 -5, DIR-20261014-0002 -1), whose +14 the old inventory sync
+   took out of live stock (now 3, its sheet figure) but not out of the ledger (17).
+   The normal cancel / reversal would remove it a second time. Each document is
+   marked CANCELLED (GRN, direct issue) or REVERSED (issue slip) with the reason and
+   gets its reversal ledger rows carrying the running LEDGER balance;
+   items.live_stock_qty is never changed and nothing is deleted. It is refused unless,
+   for every affected item, ledger sum + the void equals live stock (to 0.0001): it
+   can only remove what the sheet reset already removed. Super Admin only. dryRun
+   (the default) shows the figures and a selectionHash; applying needs the typed
+   confirmation and that hash, and re-plans inside the transaction that writes. */
+
+const voidTestDocumentsSchema = z.object({
+  documents: z.array(z.object({
+    type: z.enum(VOID_DOCUMENT_TYPES),
+    number: z.string().trim().min(1, 'Give the document number.').max(60),
+  })).min(1, 'Name at least one document.').max(50),
+  reason: z.string().trim().min(5, 'Give the reason (at least 5 characters).').max(500),
+  dryRun: z.boolean().default(true),
+  confirm: z.string().optional(),
+  expectedHash: z.string().trim().regex(/^[0-9a-f]{64}$/, 'expectedHash is the selectionHash a dry run returned.').optional(),
+});
+
+function presentVoidPlan(plan: VoidPlan) {
+  // Each document line also carries its item's live stock, so a document reads on its own.
+  const liveOf = new Map(plan.items.map((i) => [i.itemId, i.liveStock]));
+  return {
+    selectionHash: plan.selectionHash,
+    canApply: plan.canApply,
+    closesExactly: plan.closesExactly,
+    blockers: plan.blockers,
+    documents: plan.documents.map((d) => ({
+      type: d.type, number: d.number, id: d.id, status: d.status, becomes: d.becomes, requisitionNo: d.requisitionNo,
+      lines: d.lines.map((l) => ({
+        itemId: l.itemId, itemCode: l.itemCode, qty: l.qty, txnType: l.txnType,
+        inwardQty: l.inwardQty, outwardQty: l.outwardQty,
+        ledgerBalanceBefore: l.balanceBeforeQty, ledgerBalanceAfter: l.balanceQty,
+        liveStock: liveOf.get(l.itemId) ?? null,
+      })),
+      ledger: d.ledger,
+      blockers: d.blockers,
+    })),
+    items: plan.items,
+  };
+}
+
+const itemFigures = (plan: VoidPlan) => plan.items
+  .map((i) => `${i.itemCode}: ledger ${i.ledgerSum} + void ${i.voidNet} = ${i.resultingLedgerSum}, live ${i.liveStock}`)
+  .join('; ');
+
+router.post(
+  '/repair/void-test-documents',
+  requireSuperAdmin(),
+  validateBody(voidTestDocumentsSchema),
+  asyncHandler(async (req, res) => {
+    const { documents, reason, dryRun, confirm, expectedHash } = req.body as z.infer<typeof voidTestDocumentsSchema>;
+    if (dryRun) {
+      // One read-only transaction, so every figure comes from the same moment.
+      const plan = await withTransaction((tx) => planTestDocumentVoid(tx, documents, { lock: false }));
+      sendOk(res, {
+        dryRun: true,
+        ...presentVoidPlan(plan),
+        message: plan.canApply
+          ? `${plan.documents.length} document(s) can be voided; the ledger would then equal live stock for every item (${itemFigures(plan)}). Nothing was changed.`
+          : `These documents cannot be voided as they stand${plan.blockers.length ? `: ${plan.blockers.join(' ')}` : ''}`
+            + `${plan.closesExactly ? '' : ` The ledger would not equal live stock (${itemFigures(plan)}).`} Nothing was changed.`,
+      });
+      return;
+    }
+    if (confirm !== 'VOID TEST DOCUMENTS') {
+      throw ValidationError('Type "VOID TEST DOCUMENTS" to confirm. Take a backup first.');
+    }
+    if (!expectedHash) {
+      throw ValidationError('Run the dry run first and pass its selectionHash as expectedHash.');
+    }
+    const result = await withTransaction(async (tx) => {
+      // Re-plan under lock: what is written is exactly what is checked here.
+      const plan = await planTestDocumentVoid(tx, documents, { lock: true });
+      if (plan.blockers.length > 0) {
+        throw ConflictError(`Nothing was voided: ${plan.blockers.join(' ')}`, { blockers: plan.blockers, selectionHash: plan.selectionHash });
+      }
+      if (plan.selectionHash !== expectedHash) {
+        throw ConflictError(
+          'The documents or their stock figures have changed since the dry run. Nothing was voided; run the dry run again and review it.',
+          { selectionHash: plan.selectionHash },
+        );
+      }
+      if (!plan.closesExactly) {
+        throw ConflictError(
+          `Nothing was voided: the ledger would not equal live stock afterwards (${itemFigures(plan)}). `
+          + 'This repair only removes what the sheet already removed from live stock; reverse documents whose stock is still live through their own cancel or reversal.',
+          { items: plan.items },
+        );
+      }
+      const applied = await applyTestDocumentVoid(tx, plan, {
+        reason, userId: req.user!.id, actor: actorFrom(req), date: dateStamp(new Date()),
+      });
+      return { plan, applied };
+    });
+    sendOk(res, {
+      dryRun: false,
+      voided: result.plan.documents.length,
+      ...presentVoidPlan(result.plan),
+      ...result.applied,
+      message: `${result.plan.documents.length} test document(s) voided; the ledger now equals live stock (${itemFigures(result.plan)}). Live stock was not changed.`,
+    });
+  }),
+);
+
+/* ── Repair: one-time stock-ledger alignment (2026-10-16 audit, SLR-8) ────────
+   Until 2026-10-16 the inventory sync overwrote items.live_stock_qty with the
+   sheet figure and wrote no ledger row, so 2,769 items' ledgers stopped
+   explaining their stock. scripts/compute-stock-alignment.mjs collects, per item,
+   the records that do (sheet opening cell, sheet rows, existing ledger rows); this
+   route posts them as STOCK_ALIGNMENT ledger rows and never touches the live
+   stock. Super Admin only. dryRun (the default) lists the accepted and refused
+   items and returns a selectionHash; applying needs the typed confirmation and
+   that hash. The rules are in stock-alignment.ts. */
+
+/**
+ * The entries file for the 2026-10-16 snapshot is 1.1 MB for 6,557 entries;
+ * with the longest references and evidence allowed below, 7,000 entries stay
+ * under 10 MB. The global parser keeps 2 MB and leaves this one route to this
+ * parser (app.ts), which runs only after the Super Admin check.
+ */
+export const STOCK_ALIGNMENT_BODY_LIMIT = '16mb';
+
+/** A signed quantity with at most 4 decimals, as a JSON number or a numeric string. */
+const alignmentQty = z.union([z.number(), z.string().trim()])
+  .transform((v) => (typeof v === 'number' ? String(v) : v))
+  .refine((v) => /^-?\d{1,14}(\.\d{1,4})?$/.test(v), 'A quantity with at most 14 digits and 4 decimals.')
+  .refine((v) => !dec(v).isZero(), 'A zero quantity explains nothing.')
+  .transform((v) => toQty(v));
+
+const stockAlignmentSchema = z.object({
+  entries: z.array(z.object({
+    itemId: z.coerce.number().int().positive(),
+    component: z.enum(ALIGNMENT_COMPONENT_CODES),
+    qty: alignmentQty,
+    reference: z.string().trim().min(1, 'Say what the entry stands for (date, month or document).').max(300),
+    evidence: z.string().trim().min(1, 'Say where the figure is recorded (sheet cell, rows, ledger ids).').max(1000),
+  })).min(1, 'No entries to post.').max(20000, 'At most 20,000 entries per request.'),
+  dryRun: z.boolean().default(true),
+  confirm: z.string().optional(),
+  expectedHash: z.string().trim().regex(/^[0-9a-f]{64}$/, 'expectedHash is the selectionHash a dry run returned.').optional(),
+});
+
+router.post(
+  '/repair/stock-alignment',
+  requireSuperAdmin(),
+  express.json({ limit: STOCK_ALIGNMENT_BODY_LIMIT }),
+  validateBody(stockAlignmentSchema),
+  asyncHandler(async (req, res) => {
+    const { entries, dryRun, confirm, expectedHash } = req.body as z.infer<typeof stockAlignmentSchema>;
+    const running = activeInventorySync();
+    if (dryRun) {
+      const plan = await planAlignment((sql, params) => query(sql, params), entries);
+      const t = plan.totals;
+      sendOk(res, {
+        dryRun: true,
+        ...describePlan(plan),
+        message: `${t.items} item(s) would be aligned with ${t.entries} ledger entr${t.entries === 1 ? 'y' : 'ies'} (net ${t.net}); `
+          + `${t.refused} item(s) refused.${running ? ' An inventory sync is running: run the dry run again once it finishes.' : ''} Nothing was changed.`,
+      });
+      return;
+    }
+    if (confirm !== 'ALIGN STOCK LEDGER') {
+      throw ValidationError('Type "ALIGN STOCK LEDGER" to confirm. Take a verified backup first.');
+    }
+    if (!expectedHash) {
+      throw ValidationError('Run the dry run first and pass its selectionHash as expectedHash.');
+    }
+    // A sync moves live stock while it runs; the plan would be checked against figures about to change.
+    if (running) {
+      throw ConflictError(`An inventory sync is running (${running.scope}, started ${running.startedAt}). Nothing was written; run the dry run again once it finishes.`);
+    }
+    const result = await withTransaction((tx) => applyAlignment(tx, entries, {
+      expectedHash, actor: actorFrom(req), userId: req.user!.id,
+    }));
+    const t = result.plan.totals;
+    sendOk(res, {
+      dryRun: false,
+      ...describePlan(result.plan),
+      rowsPosted: result.rowsPosted,
+      date: result.date,
+      message: `${t.items} item(s) aligned with ${result.rowsPosted} ledger row(s) (net ${t.net}); ${t.refused} item(s) refused. `
+        + 'Live stock was not changed.',
+    });
+  }),
+);
+
+router.post(
+  '/repair/stock-alignment/undo',
+  requireSuperAdmin(),
+  validateBody(z.object({
+    itemIds: z.array(z.coerce.number().int().positive()).min(1, 'Name the items to undo.').max(20000),
+    reason: z.string().trim().min(5, 'Say why the alignment is undone.').max(500),
+    confirm: z.string().optional(),
+  })),
+  asyncHandler(async (req, res) => {
+    const { itemIds, reason, confirm } = req.body as { itemIds: number[]; reason: string; confirm?: string };
+    if (confirm !== 'UNDO STOCK ALIGNMENT') {
+      throw ValidationError('Type "UNDO STOCK ALIGNMENT" to confirm.');
+    }
+    const result = await withTransaction((tx) => undoAlignment(tx, itemIds, { reason, actor: actorFrom(req), userId: req.user!.id }));
+    sendOk(res, {
+      ...result,
+      message: `Alignment undone for ${result.undone.length} item(s): ${result.rowsPosted} opposite ledger row(s) appended, `
+        + `nothing deleted; live stock was not changed.${result.skipped.length ? ` ${result.skipped.length} item(s) skipped.` : ''}`,
+    });
   }),
 );
 

@@ -2,6 +2,11 @@ import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 import http from 'node:http';
 import { env } from '../config/env.js';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 const MONTH_NAMES: Record<string, string> = {
   jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
@@ -67,8 +72,8 @@ function apiRequest<T = any>(
     const dataStr = body ? JSON.stringify(body) : undefined;
     const req = http.request(
       {
-        hostname: '127.0.0.1',
-        port: 4001,
+        hostname: SCRIPT_API.hostname,
+        port: SCRIPT_API.port,
         path: `/api/v1${endpoint}`,
         method,
         headers: {
@@ -131,7 +136,7 @@ async function main() {
   }
 
   // 3. Authenticate to ERP API
-  const loginRes = await apiRequest('/auth/login', 'POST', { employeeId: '10221', password: 'Admin@123' });
+  const loginRes = await apiRequest('/auth/login', 'POST', SCRIPT_LOGIN);
   const token = loginRes.data.data.accessToken;
 
   // 4. Fetch all ERP Requisition Headers

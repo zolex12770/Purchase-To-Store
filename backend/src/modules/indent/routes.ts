@@ -594,6 +594,22 @@ function transitionRoute(path: string, opts: TransitionOptions) {
         assertNotAlready('Indent', header.indent_no, header.status, opts.to);
         assertIndentTransition(header.status, opts.to);
 
+        // Reopen is for a rejected indent, or for the requester pulling their own indent
+        // back before a decision. From APPROVED it skipped UNAPPROVE's approve right and its
+        // purchase-order check, so an indent already on a PO could be sent back to DRAFT
+        // with indent.edit alone (2026-10-16 audit).
+        if (opts.action === 'REOPEN') {
+          const ownPending = header.status === 'PENDING_APPROVAL'
+            && (header.requested_by_user_id === userId || req.user!.isSuperAdmin);
+          if (header.status !== 'REJECTED' && !ownPending) {
+            throw BusinessRuleError(
+              header.status === 'APPROVED'
+                ? `Indent ${header.indent_no} is approved. Use Unapprove, which checks the purchase orders drawing on it, instead of Reopen.`
+                : `Only a rejected indent, or your own indent awaiting approval, can be reopened.`,
+            );
+          }
+        }
+
         // Separation of duties: nobody approves their own requisition (ADR-011)
         // — EXCEPT a Super Admin, who by definition already holds every
         // permission in the system and cannot be routed around by requiring a
