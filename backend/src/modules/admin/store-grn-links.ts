@@ -41,6 +41,10 @@
  * adds the lines it unlinks as UNDONE. Without it a PO whose store receipt was held
  * looked exactly like a PO nothing was received against (2,642 held lines on the
  * 2026-10-17 copy); purchase-order/receipt-evidence.ts reads it. It never links.
+ *
+ * The rules do not know about undo: while the tab still names the PO, a later run links
+ * a line taken back again. The dry run lists such lines (previouslyUndoneLines), and a
+ * run may keep them all out (keepOutUndone, the Data Management panel's default).
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { txQuery, type Queryable } from '../../db/index.js';

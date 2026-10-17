@@ -1611,7 +1611,9 @@ router.post(
    audit entry (or a run) recorded, or those of the GRN lines named, a GRN whole.
    Every apply, also one that links nothing, records the held lines as the store
    receipts awaiting link (store_grn_link_holds, migration 030); undo adds the lines
-   it unlinks there. The PO list and PO screen read that record. */
+   it unlinks there. The PO list and PO screen read that record. The dry run lists the
+   lines a Super Admin took back (previouslyUndone), which the rules would link again
+   while the tab names the same PO; keepOutUndone keeps them all out of the run. */
 
 /** The GRN tab's reader: the sync engine's own, unless the app was handed another (tests). */
 const grnTabReaderOf = (req: Request): SheetReader =>
