@@ -12,23 +12,69 @@
      6. Compatibility aliases every pre-v3 variable name still resolves, so the
                               pages restyle without being edited (spec §2.9)
 
-   THEMES ARE DEFINED ONCE. Every theme-dependent role is written as
-   light-dark(<light>, <dark>), and `color-scheme` on <html> picks the side:
-   `light dark` follows the OS, data-theme="light|dark" (lib/theme.tsx) pins
-   it. v2 wrote the whole dark palette out twice (data-theme block + media
-   query block) and the copies had drifted; there is now nothing to keep in
-   sync. light-dark() only resolves where a <color> is expected, so every
-   theme-dependent token here is a colour or a value built from colours
-   (gradients, shadows) — never a length.
+   THEMES. Each theme-dependent token is written once, its light and dark
+   values side by side:
+       --surface-1: var(--if-light, #ffffff) var(--if-dark, #1e1b18);
+   --if-light and --if-dark are space toggles, set by the THEME SWITCH below:
+   the active one is `initial`, so var() takes its fallback (the value); the
+   other is a single space, so it adds nothing. This is plain custom-property
+   CSS, which every browser on the office and shop-floor PCs supports. The
+   first v3 cut wrote light-dark(light, dark) instead, which needs Chromium/
+   Edge 123, Firefox 120 or Safari 17.5: in Chrome/Edge 109 (the last build
+   for Windows 7/8.1) or on an iPad stuck on iOS 16 every token was invalid,
+   and "Sign in" rendered white on white, inputs lost their borders and
+   badges their tones (review 2026-10-16, legacy_login.png).
+   v2 wrote the dark palette out twice (data-theme block + media query) and
+   the copies drifted; now only the two toggles are set in more than one
+   place. Two rules keep it working:
+     • A custom property is resolved where it is declared, so the token block
+       is declared on every element that sets the switch (:root, and the
+       sidebar, which is ink in both themes). A token read from another token
+       then follows that element's theme.
+     • The "off" value is one space: `--if-dark: ;`. Never `--if-dark:;`,
+       which older engines reject (esbuild keeps the space).
 
    Contrast ratios in comments are WCAG 2 relative-luminance ratios against
    white (light) or --surface-1 (dark) unless stated; text pairs need 4.5:1,
    large text and control borders 3:1.
    ========================================================================== */
 
-:root {
-  color-scheme: light dark;
+/* ══════════════ THEME SWITCH ══════════════
+   Light unless the user chose Dark, or chose System (no data-theme, see
+   lib/theme.tsx) on an OS set to dark. color-scheme follows, so native
+   scrollbars, checkboxes and date pickers match the tokens. */
+:root, .sidebar {
+  --if-light: initial;
+  --if-dark: ;
+  color-scheme: light;
+}
+/* An explicit Dark choice, and the sidebar: an ink island in both themes. */
+:root[data-theme='dark'], .sidebar {
+  --if-light: ;
+  --if-dark: initial;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --if-light: ;
+    --if-dark: initial;
+    color-scheme: dark;
+  }
+}
+/* Paper is light. With an explicit Dark choice the v3 print rule lost to
+   :root[data-theme='dark'] on specificity, and the PO list printed #f3efe8
+   ink on white (review 2026-10-16, print_po-list_explicit-dark.pdf); these
+   selectors match or outrank every rule above and come after them. */
+@media print {
+  :root, :root[data-theme], :root:not([data-theme='light']) {
+    --if-light: initial;
+    --if-dark: ;
+    color-scheme: light;
+  }
+}
 
+/* The whole block is declared on .sidebar too: see THEMES above. */
+:root, .sidebar {
   /* ══════════════ 1. PRIMITIVES ══════════════ */
 
   /* Stone — warm neutral spine, paper → ink */
@@ -165,120 +211,123 @@
   /* ══════════════ 3. SEMANTIC ROLES (light | dark) ══════════════ */
 
   /* Layered warm surfaces. Dark is selected warm charcoal, not an inversion. */
-  --bg-canvas:        light-dark(var(--stone-75), #141210);
-  --surface-1:        light-dark(#ffffff, #1e1b18);   /* cards, tables, inputs */
-  --surface-2:        light-dark(var(--stone-25), #24211d);   /* table header, card header, footers */
-  --surface-sunken:   light-dark(#f6f3ee, #191714);   /* read-only fields, wells, segmented track */
-  --surface-zebra:    light-dark(#faf8f4, #211e1a);   /* muted text on it 6.60 */
-  --surface-hover:    light-dark(#f3f1fb, #2a2638);   /* row hover, iris 4 %: muted text 6.27 */
-  --surface-selected: light-dark(var(--iris-50), #2c2748);
-  --surface-inverse:  light-dark(var(--stone-900), #f3efe8);
-  --surface-raised:   light-dark(#ffffff, #24211d);   /* popovers that are not glass */
+  --bg-canvas:        var(--if-light, var(--stone-75)) var(--if-dark, #141210);
+  --surface-1:        var(--if-light, #ffffff) var(--if-dark, #1e1b18);   /* cards, tables, inputs */
+  --surface-2:        var(--if-light, var(--stone-25)) var(--if-dark, #24211d);   /* table header, card header, footers */
+  --surface-sunken:   var(--if-light, #f6f3ee) var(--if-dark, #191714);   /* read-only fields, wells, segmented track */
+  --surface-zebra:    var(--if-light, #faf8f4) var(--if-dark, #211e1a);   /* muted text on it 6.60 */
+  --surface-hover:    var(--if-light, #f3f1fb) var(--if-dark, #2a2638);   /* row hover, iris 4 %: muted text 6.27 */
+  --surface-selected: var(--if-light, var(--iris-50)) var(--if-dark, #2c2748);
+  --surface-inverse:  var(--if-light, var(--stone-900)) var(--if-dark, #f3efe8);
+  --surface-raised:   var(--if-light, #ffffff) var(--if-dark, #24211d);   /* popovers that are not glass */
 
-  --border-subtle:  light-dark(var(--stone-150), #2c2823);
-  --border:         light-dark(var(--stone-200), #3a352f);
-  --border-strong:  light-dark(var(--stone-300), #4a443d);
-  --border-control: light-dark(var(--stone-450), #7a7268);   /* inputs, selects, checkboxes ≥ 3:1 (dark 3.62) */
-  --border-hairline: light-dark(var(--stone-100), #27241f);  /* vertical table rules */
+  --border-subtle:  var(--if-light, var(--stone-150)) var(--if-dark, #2c2823);
+  --border:         var(--if-light, var(--stone-200)) var(--if-dark, #3a352f);
+  --border-strong:  var(--if-light, var(--stone-300)) var(--if-dark, #4a443d);
+  --border-control: var(--if-light, var(--stone-450)) var(--if-dark, #7a7268);   /* inputs, selects, checkboxes ≥ 3:1 (dark 3.62) */
+  --border-hairline: var(--if-light, var(--stone-100)) var(--if-dark, #27241f);  /* vertical table rules */
   /* A translucent wash for ghost hovers, so it reads on any surface. */
-  --hover-wash: light-dark(rgb(28 26 23 / .06), rgb(255 255 255 / .07));
-  --press-wash: light-dark(rgb(28 26 23 / .10), rgb(255 255 255 / .11));
+  --hover-wash: var(--if-light, rgb(28 26 23 / .06)) var(--if-dark, rgb(255 255 255 / .07));
+  --press-wash: var(--if-light, rgb(28 26 23 / .10)) var(--if-dark, rgb(255 255 255 / .11));
 
-  --text-1: light-dark(var(--stone-900), #f3efe8);   /* primary: 17.36 | 14.96 */
-  --text-2: light-dark(var(--stone-700), #d6cfc4);   /* secondary: 10.26 | 11.09 */
-  --text-3: light-dark(var(--stone-600), #b3aa9e);   /* muted, body copy minimum: 7.00 | 7.48 */
-  --text-4: light-dark(var(--stone-500), #a0978b);   /* subtle, ≥ 12 px: 5.56 | 5.93 */
-  --text-disabled: light-dark(var(--stone-400), #6f675d);
+  --text-1: var(--if-light, var(--stone-900)) var(--if-dark, #f3efe8);   /* primary: 17.36 | 14.96 */
+  --text-2: var(--if-light, var(--stone-700)) var(--if-dark, #d6cfc4);   /* secondary: 10.26 | 11.09 */
+  --text-3: var(--if-light, var(--stone-600)) var(--if-dark, #b3aa9e);   /* muted, body copy minimum: 7.00 | 7.48 */
+  --text-4: var(--if-light, var(--stone-500)) var(--if-dark, #a0978b);   /* subtle, ≥ 12 px: 5.56 | 5.93 */
+  --text-disabled: var(--if-light, var(--stone-400)) var(--if-dark, #6f675d);
   --text-on-accent: #ffffff;
-  --text-link: light-dark(var(--iris-600), #a99ff5);  /* 6.92 | 7.32 */
-  --text-inverse: light-dark(#ffffff, var(--stone-900));
+  --text-link: var(--if-light, var(--iris-600)) var(--if-dark, #a99ff5);  /* 6.92 | 7.32 */
+  --text-inverse: var(--if-light, #ffffff) var(--if-dark, var(--stone-900));
+  /* Tooltip text on --surface-inverse: 15.15 | 15.15; its muted key 10.46 | 6.11. */
+  --text-on-inverse: var(--if-light, #f3efe8) var(--if-dark, var(--stone-900));
+  --text-on-inverse-muted: var(--if-light, #cfc8bd) var(--if-dark, var(--stone-600));
 
-  --accent:          light-dark(var(--iris-600), var(--iris-500));   /* white on it 6.92 | 4.86 */
+  --accent:          var(--if-light, var(--iris-600)) var(--if-dark, var(--iris-500));   /* white on it 6.92 | 4.86 */
   /* Dark hovers DOWN to iris-600: the lighter iris-400 the spec suggested
      leaves white button text at 3.44:1. */
-  --accent-hover:    light-dark(var(--iris-700), var(--iris-600));   /* white on it 8.93 | 6.92 */
-  --accent-subtle:   light-dark(var(--iris-50), #2c2748);
-  --accent-subtle-2: light-dark(var(--iris-100), #372f63);
-  --accent-border:   light-dark(var(--iris-200), #4e4590);
-  --accent-text:     light-dark(var(--iris-700), #c4bcf8);           /* text on --accent-subtle: 8.0 | 8.7 */
+  --accent-hover:    var(--if-light, var(--iris-700)) var(--if-dark, var(--iris-600));   /* white on it 8.93 | 6.92 */
+  --accent-subtle:   var(--if-light, var(--iris-50)) var(--if-dark, #2c2748);
+  --accent-subtle-2: var(--if-light, var(--iris-100)) var(--if-dark, #372f63);
+  --accent-border:   var(--if-light, var(--iris-200)) var(--if-dark, #4e4590);
+  --accent-text:     var(--if-light, var(--iris-700)) var(--if-dark, #c4bcf8);           /* text on --accent-subtle: 8.0 | 8.7 */
 
   /* Money and quantity semantics (text). Coral is for shortages and negative
      stock only — never an ordinary outward issue. Zero is subtle, never coloured. */
-  --value-positive: light-dark(var(--emerald-700), #7fd8b0);   /* 6.50 */
-  --value-pending:  light-dark(var(--amber-800), #f5c26b);     /* 6.80 */
-  --value-negative: light-dark(var(--coral-700), #f49a86);     /* 6.06 */
+  --value-positive: var(--if-light, var(--emerald-700)) var(--if-dark, #7fd8b0);   /* 6.50 */
+  --value-pending:  var(--if-light, var(--amber-800)) var(--if-dark, #f5c26b);     /* 6.80 */
+  --value-negative: var(--if-light, var(--coral-700)) var(--if-dark, #f49a86);     /* 6.06 */
   --value-zero:     var(--text-4);
 
   /* ══════════════ 4. STATUS TONES ══════════════
      fg passes AA on its bg and on --surface-1 in both themes (light 5.13–8.99
      on tint, 5.83–11.59 on white; dark 5.84–10.14). solid is for dots, bars and
      icons beside a label (≥ 3:1 non-text). */
-  --tone-neutral-fg:     light-dark(#4a443d, #ddd6cb);
-  --tone-neutral-bg:     light-dark(#efebe4, #2c2823);
-  --tone-neutral-border: light-dark(#ddd6cb, #45403a);
-  --tone-neutral-solid:  light-dark(var(--stone-500), #8c847a);
+  --tone-neutral-fg:     var(--if-light, #4a443d) var(--if-dark, #ddd6cb);
+  --tone-neutral-bg:     var(--if-light, #efebe4) var(--if-dark, #2c2823);
+  --tone-neutral-border: var(--if-light, #ddd6cb) var(--if-dark, #45403a);
+  --tone-neutral-solid:  var(--if-light, var(--stone-500)) var(--if-dark, #8c847a);
 
-  --tone-pending-fg:     light-dark(#8a4b00, #f5c26b);
-  --tone-pending-bg:     light-dark(#fdf3e1, #33260f);
-  --tone-pending-border: light-dark(#f6dca8, #5c4415);
-  --tone-pending-solid:  light-dark(var(--amber-500), #e8a838);
+  --tone-pending-fg:     var(--if-light, #8a4b00) var(--if-dark, #f5c26b);
+  --tone-pending-bg:     var(--if-light, #fdf3e1) var(--if-dark, #33260f);
+  --tone-pending-border: var(--if-light, #f6dca8) var(--if-dark, #5c4415);
+  --tone-pending-solid:  var(--if-light, var(--amber-500)) var(--if-dark, #e8a838);
 
-  --tone-attention-fg:     light-dark(#9a3d06, #f6a46b);
-  --tone-attention-bg:     light-dark(#fff0e6, #36210f);
-  --tone-attention-border: light-dark(#fbd1b4, #613a1b);
-  --tone-attention-solid:  light-dark(var(--orange-500), #ef8f52);
+  --tone-attention-fg:     var(--if-light, #9a3d06) var(--if-dark, #f6a46b);
+  --tone-attention-bg:     var(--if-light, #fff0e6) var(--if-dark, #36210f);
+  --tone-attention-border: var(--if-light, #fbd1b4) var(--if-dark, #613a1b);
+  --tone-attention-solid:  var(--if-light, var(--orange-500)) var(--if-dark, #ef8f52);
 
-  --tone-info-fg:     light-dark(#0b5f78, #7fcde3);
-  --tone-info-bg:     light-dark(#e6f4f8, #11303a);
-  --tone-info-border: light-dark(#bfe2ec, #1d5364);
-  --tone-info-solid:  light-dark(var(--ocean-500), #4eaecb);
+  --tone-info-fg:     var(--if-light, #0b5f78) var(--if-dark, #7fcde3);
+  --tone-info-bg:     var(--if-light, #e6f4f8) var(--if-dark, #11303a);
+  --tone-info-border: var(--if-light, #bfe2ec) var(--if-dark, #1d5364);
+  --tone-info-solid:  var(--if-light, var(--ocean-500)) var(--if-dark, #4eaecb);
 
-  --tone-progress-fg:     light-dark(#6b2f99, #d3a8f0);
-  --tone-progress-bg:     light-dark(#f5eefb, #2c1c38);
-  --tone-progress-border: light-dark(#e2cdf2, #4d3363);
-  --tone-progress-solid:  light-dark(var(--plum-500), #b17ad8);
+  --tone-progress-fg:     var(--if-light, #6b2f99) var(--if-dark, #d3a8f0);
+  --tone-progress-bg:     var(--if-light, #f5eefb) var(--if-dark, #2c1c38);
+  --tone-progress-border: var(--if-light, #e2cdf2) var(--if-dark, #4d3363);
+  --tone-progress-solid:  var(--if-light, var(--plum-500)) var(--if-dark, #b17ad8);
 
-  --tone-success-fg:     light-dark(#0b6b4f, #7fd8b0);
-  --tone-success-bg:     light-dark(#e9f7f1, #11302a);
-  --tone-success-border: light-dark(#bfe8d5, #1e5446);
-  --tone-success-solid:  light-dark(var(--emerald-500), #2fb983);
+  --tone-success-fg:     var(--if-light, #0b6b4f) var(--if-dark, #7fd8b0);
+  --tone-success-bg:     var(--if-light, #e9f7f1) var(--if-dark, #11302a);
+  --tone-success-border: var(--if-light, #bfe8d5) var(--if-dark, #1e5446);
+  --tone-success-solid:  var(--if-light, var(--emerald-500)) var(--if-dark, #2fb983);
 
-  --tone-danger-fg:     light-dark(#b3361f, #f49a86);
-  --tone-danger-bg:     light-dark(#fdeeea, #3a1a14);
-  --tone-danger-border: light-dark(#f6c9bd, #66301f);
-  --tone-danger-solid:  light-dark(var(--coral-500), #ea7a63);
+  --tone-danger-fg:     var(--if-light, #b3361f) var(--if-dark, #f49a86);
+  --tone-danger-bg:     var(--if-light, #fdeeea) var(--if-dark, #3a1a14);
+  --tone-danger-border: var(--if-light, #f6c9bd) var(--if-dark, #66301f);
+  --tone-danger-solid:  var(--if-light, var(--coral-500)) var(--if-dark, #ea7a63);
 
-  --tone-closed-fg:     light-dark(#3d3833, #c9c2b8);
-  --tone-closed-bg:     light-dark(#e7e2da, #2a2622);
-  --tone-closed-border: light-dark(#d3ccc1, #4a443d);
-  --tone-closed-solid:  light-dark(var(--stone-700), #a39b90);
+  --tone-closed-fg:     var(--if-light, #3d3833) var(--if-dark, #c9c2b8);
+  --tone-closed-bg:     var(--if-light, #e7e2da) var(--if-dark, #2a2622);
+  --tone-closed-border: var(--if-light, #d3ccc1) var(--if-dark, #4a443d);
+  --tone-closed-solid:  var(--if-light, var(--stone-700)) var(--if-dark, #a39b90);
 
-  --tone-void-fg:     light-dark(#6b645b, #a39b90);
-  --tone-void-bg:     light-dark(#f3f0ea, #24211d);
-  --tone-void-border: light-dark(#ded8ce, #3a352f);
-  --tone-void-solid:  light-dark(var(--stone-400), #6f675d);
+  --tone-void-fg:     var(--if-light, #6b645b) var(--if-dark, #a39b90);
+  --tone-void-bg:     var(--if-light, #f3f0ea) var(--if-dark, #24211d);
+  --tone-void-border: var(--if-light, #ded8ce) var(--if-dark, #3a352f);
+  --tone-void-solid:  var(--if-light, var(--stone-400)) var(--if-dark, #6f675d);
 
   /* ══════════════ 5. GLASS · GRADIENTS · ELEVATION · FOCUS · CHARTS ══════════════ */
 
   /* Glass is for chrome and overlays only: top bar, popovers, menus, modals,
      drawers, toasts. Never table cells, table headers or filter bars — v2
      blurred every sticky <th>, which is expensive on long lists. */
-  --glass-bg:        light-dark(rgb(255 253 250 / .72), rgb(30 27 24 / .70));
-  --glass-bg-strong: light-dark(rgb(255 253 250 / .88), rgb(30 27 24 / .90));
-  --glass-border:    light-dark(rgb(255 255 255 / .62), rgb(255 255 255 / .08));
-  --glass-stroke:    light-dark(rgb(28 26 23 / .08), rgb(255 255 255 / .07));
+  --glass-bg:        var(--if-light, rgb(255 253 250 / .72)) var(--if-dark, rgb(30 27 24 / .70));
+  --glass-bg-strong: var(--if-light, rgb(255 253 250 / .88)) var(--if-dark, rgb(30 27 24 / .90));
+  --glass-border:    var(--if-light, rgb(255 255 255 / .62)) var(--if-dark, rgb(255 255 255 / .08));
+  --glass-stroke:    var(--if-light, rgb(28 26 23 / .08)) var(--if-dark, rgb(255 255 255 / .07));
   --glass-blur: blur(20px) saturate(140%);
   --glass-shadow:
-    inset 0 1px 0 light-dark(rgb(255 255 255 / .70), rgb(255 255 255 / .05)),
-    0 1px 2px light-dark(rgb(28 26 23 / .06), rgb(0 0 0 / .30)),
-    0 12px 32px -16px light-dark(rgb(28 26 23 / .24), rgb(0 0 0 / .70));
+    inset 0 1px 0 var(--if-light, rgb(255 255 255 / .70)) var(--if-dark, rgb(255 255 255 / .05)),
+    0 1px 2px var(--if-light, rgb(28 26 23 / .06)) var(--if-dark, rgb(0 0 0 / .30)),
+    0 12px 32px -16px var(--if-light, rgb(28 26 23 / .24)) var(--if-dark, rgb(0 0 0 / .70));
 
   /* Canvas mesh: three faint radials (iris, teal, amber) so the paper has
      depth without a background image. */
   --bg-canvas-mesh:
-    radial-gradient(1200px 640px at 0% -12%, light-dark(rgb(110 95 219 / .10), rgb(110 95 219 / .12)), transparent 60%),
-    radial-gradient(1000px 560px at 100% -8%, light-dark(rgb(15 157 149 / .08), rgb(15 157 149 / .07)), transparent 58%),
-    radial-gradient(900px 520px at 60% 112%, light-dark(rgb(227 155 27 / .08), rgb(227 155 27 / .05)), transparent 60%);
+    radial-gradient(1200px 640px at 0% -12%, var(--if-light, rgb(110 95 219 / .10)) var(--if-dark, rgb(110 95 219 / .12)), transparent 60%),
+    radial-gradient(1000px 560px at 100% -8%, var(--if-light, rgb(15 157 149 / .08)) var(--if-dark, rgb(15 157 149 / .07)), transparent 58%),
+    radial-gradient(900px 520px at 60% 112%, var(--if-light, rgb(227 155 27 / .08)) var(--if-dark, rgb(227 155 27 / .05)), transparent 60%);
 
   /* Balanced gradients. The two multi-hue ones are re-declared in OKLCH under
      @supports at the end of this file, so violet → teal never turns muddy;
@@ -305,42 +354,42 @@
     linear-gradient(165deg, #15130f 0%, #1b1820 45%, #221c2e 100%);
 
   --shadow-0: none;
-  --shadow-1: 0 1px 2px light-dark(rgb(28 26 23 / .06), rgb(0 0 0 / .40)), 0 1px 1px light-dark(rgb(28 26 23 / .04), rgb(0 0 0 / .25));      /* cards at rest */
-  --shadow-2: 0 2px 4px light-dark(rgb(28 26 23 / .05), rgb(0 0 0 / .35)), 0 6px 16px -4px light-dark(rgb(28 26 23 / .10), rgb(0 0 0 / .50)); /* hover, popovers */
-  --shadow-3: 0 4px 10px light-dark(rgb(28 26 23 / .06), rgb(0 0 0 / .40)), 0 16px 32px -8px light-dark(rgb(28 26 23 / .16), rgb(0 0 0 / .60)); /* menus, drawers */
-  --shadow-4: 0 8px 20px light-dark(rgb(28 26 23 / .08), rgb(0 0 0 / .45)), 0 28px 64px -16px light-dark(rgb(28 26 23 / .28), rgb(0 0 0 / .70)); /* modals */
+  --shadow-1: 0 1px 2px var(--if-light, rgb(28 26 23 / .06)) var(--if-dark, rgb(0 0 0 / .40)), 0 1px 1px var(--if-light, rgb(28 26 23 / .04)) var(--if-dark, rgb(0 0 0 / .25));      /* cards at rest */
+  --shadow-2: 0 2px 4px var(--if-light, rgb(28 26 23 / .05)) var(--if-dark, rgb(0 0 0 / .35)), 0 6px 16px -4px var(--if-light, rgb(28 26 23 / .10)) var(--if-dark, rgb(0 0 0 / .50)); /* hover, popovers */
+  --shadow-3: 0 4px 10px var(--if-light, rgb(28 26 23 / .06)) var(--if-dark, rgb(0 0 0 / .40)), 0 16px 32px -8px var(--if-light, rgb(28 26 23 / .16)) var(--if-dark, rgb(0 0 0 / .60)); /* menus, drawers */
+  --shadow-4: 0 8px 20px var(--if-light, rgb(28 26 23 / .08)) var(--if-dark, rgb(0 0 0 / .45)), 0 28px 64px -16px var(--if-light, rgb(28 26 23 / .28)) var(--if-dark, rgb(0 0 0 / .70)); /* modals */
 
   /* Focus: a 2 px ring offset by 2 px, iris-600 (6.92:1 on white, 6.14 on the
      canvas); iris-400 in dark (4.6:1 on the dark surface); iris-300 on the ink
      sidebar (7.74:1). */
-  --focus-color: light-dark(var(--iris-600), var(--iris-400));
+  --focus-color: var(--if-light, var(--iris-600)) var(--if-dark, var(--iris-400));
   --focus-ring: 0 0 0 2px var(--surface-1), 0 0 0 4px var(--focus-color);
   --focus-ring-inset: inset 0 0 0 2px var(--focus-color);
   --focus-ring-on-dark: 0 0 0 2px #17151a, 0 0 0 4px var(--iris-300);
-  --focus-halo-input: 0 0 0 3px light-dark(rgb(81 69 200 / .24), rgb(138 124 230 / .34));
+  --focus-halo-input: 0 0 0 3px var(--if-light, rgb(81 69 200 / .24)) var(--if-dark, rgb(138 124 230 / .34));
 
   /* Charts. Categorical slots are validated with the dataviz six checks
      (light worst adjacent CVD ΔE 9.1, normal vision 19.6; dark 8.4 / 19.3).
      Fixed order, never cycled; slots 4–5 sit below 3:1 on white, so charts
      ship direct labels or a table view. */
-  --chart-1: light-dark(#6250d6, #9085e9);   /* iris — ordered value */
-  --chart-2: light-dark(#eb6834, #d95926);   /* orange — pending */
-  --chart-3: light-dark(#1baf7a, #199e70);   /* aqua — received */
-  --chart-4: light-dark(#eda100, #c98500);
-  --chart-5: light-dark(#e87ba4, #d55181);
+  --chart-1: var(--if-light, #6250d6) var(--if-dark, #9085e9);   /* iris — ordered value */
+  --chart-2: var(--if-light, #eb6834) var(--if-dark, #d95926);   /* orange — pending */
+  --chart-3: var(--if-light, #1baf7a) var(--if-dark, #199e70);   /* aqua — received */
+  --chart-4: var(--if-light, #eda100) var(--if-dark, #c98500);
+  --chart-5: var(--if-light, #e87ba4) var(--if-dark, #d55181);
   --chart-6: #008300;
-  --chart-7: light-dark(#2a78d6, #3987e5);
-  --chart-8: light-dark(#e34948, #e66767);
+  --chart-7: var(--if-light, #2a78d6) var(--if-dark, #3987e5);
+  --chart-8: var(--if-light, #e34948) var(--if-dark, #e66767);
   /* Ordinal ageing ramp, one hue, young → old (validated ordinal, 2.10:1 floor). */
-  --chart-age-1: light-dark(#e5a83a, #9a5d05);
-  --chart-age-2: light-dark(#cf8a12, #b8740a);
-  --chart-age-3: light-dark(#b06d07, #d48f16);
-  --chart-age-4: light-dark(#8a5203, #e8ac3c);
-  --chart-age-5: light-dark(#633a00, #f5cf80);
+  --chart-age-1: var(--if-light, #e5a83a) var(--if-dark, #9a5d05);
+  --chart-age-2: var(--if-light, #cf8a12) var(--if-dark, #b8740a);
+  --chart-age-3: var(--if-light, #b06d07) var(--if-dark, #d48f16);
+  --chart-age-4: var(--if-light, #8a5203) var(--if-dark, #e8ac3c);
+  --chart-age-5: var(--if-light, #633a00) var(--if-dark, #f5cf80);
   --chart-grid: var(--border-subtle);
   --chart-baseline: var(--border-strong);
   --chart-axis: var(--text-3);   /* ticks 11 px: 7.00:1 */
-  --chart-cursor: light-dark(rgb(28 26 23 / .05), rgb(255 255 255 / .06));
+  --chart-cursor: var(--if-light, rgb(28 26 23 / .05)) var(--if-dark, rgb(255 255 255 / .06));
 
   /* Sidebar — an ink island in both themes. */
   --sidebar-bg: var(--grad-ink);
@@ -377,41 +426,41 @@
 
   /* Brand ramp → iris. The text steps (500–900) lighten in dark so a
      `color: var(--brand-600)` link stays readable on charcoal. */
-  --brand-50:  light-dark(var(--iris-50), #2c2748);
-  --brand-100: light-dark(var(--iris-100), #372f63);
-  --brand-200: light-dark(var(--iris-200), #4e4590);
-  --brand-300: light-dark(var(--iris-300), #6458b8);
-  --brand-400: light-dark(var(--iris-400), #7d70e0);
-  --brand-500: light-dark(var(--iris-500), #9085e9);
-  --brand-600: light-dark(var(--iris-600), #a99ff5);
-  --brand-700: light-dark(var(--iris-700), #c4bcf8);
-  --brand-800: light-dark(var(--iris-800), #d9d3fb);
-  --brand-900: light-dark(var(--iris-900), #ece9fd);
+  --brand-50:  var(--if-light, var(--iris-50)) var(--if-dark, #2c2748);
+  --brand-100: var(--if-light, var(--iris-100)) var(--if-dark, #372f63);
+  --brand-200: var(--if-light, var(--iris-200)) var(--if-dark, #4e4590);
+  --brand-300: var(--if-light, var(--iris-300)) var(--if-dark, #6458b8);
+  --brand-400: var(--if-light, var(--iris-400)) var(--if-dark, #7d70e0);
+  --brand-500: var(--if-light, var(--iris-500)) var(--if-dark, #9085e9);
+  --brand-600: var(--if-light, var(--iris-600)) var(--if-dark, #a99ff5);
+  --brand-700: var(--if-light, var(--iris-700)) var(--if-dark, #c4bcf8);
+  --brand-800: var(--if-light, var(--iris-800)) var(--if-dark, #d9d3fb);
+  --brand-900: var(--if-light, var(--iris-900)) var(--if-dark, #ece9fd);
 
   /* Neutral ramp → stone; inverts in dark so ink-900 stays the strongest text. */
-  --ink-50:  light-dark(var(--stone-50), #1a1815);
-  --ink-100: light-dark(var(--stone-100), #24211d);
-  --ink-150: light-dark(var(--stone-150), #2c2823);
-  --ink-200: light-dark(var(--stone-200), #3a352f);
-  --ink-300: light-dark(var(--stone-300), #4a443d);
-  --ink-400: light-dark(var(--stone-400), #6f675d);
-  --ink-500: light-dark(var(--stone-500), #8c847a);
-  --ink-600: light-dark(var(--stone-600), #b3aa9e);
-  --ink-700: light-dark(var(--stone-700), #d6cfc4);
-  --ink-800: light-dark(var(--stone-800), #e9e4dc);
-  --ink-900: light-dark(var(--stone-900), #f3efe8);
+  --ink-50:  var(--if-light, var(--stone-50)) var(--if-dark, #1a1815);
+  --ink-100: var(--if-light, var(--stone-100)) var(--if-dark, #24211d);
+  --ink-150: var(--if-light, var(--stone-150)) var(--if-dark, #2c2823);
+  --ink-200: var(--if-light, var(--stone-200)) var(--if-dark, #3a352f);
+  --ink-300: var(--if-light, var(--stone-300)) var(--if-dark, #4a443d);
+  --ink-400: var(--if-light, var(--stone-400)) var(--if-dark, #6f675d);
+  --ink-500: var(--if-light, var(--stone-500)) var(--if-dark, #8c847a);
+  --ink-600: var(--if-light, var(--stone-600)) var(--if-dark, #b3aa9e);
+  --ink-700: var(--if-light, var(--stone-700)) var(--if-dark, #d6cfc4);
+  --ink-800: var(--if-light, var(--stone-800)) var(--if-dark, #e9e4dc);
+  --ink-900: var(--if-light, var(--stone-900)) var(--if-dark, #f3efe8);
 
   /* Semantic families. 50/100/200 = tint/border, 500 = solid, 600–900 = the
      tone's text colour, so every existing `color: var(--warning-600)` passes
      AA (v2: 3.00:1, now 6.80:1). */
   --success-50: var(--tone-success-bg);   --success-100: var(--tone-success-border);
-  --success-200: var(--tone-success-border); --success-300: light-dark(var(--emerald-300), #1e5446);
-  --success-400: light-dark(var(--emerald-400), #2fb983); --success-500: var(--tone-success-solid);
+  --success-200: var(--tone-success-border); --success-300: var(--if-light, var(--emerald-300)) var(--if-dark, #1e5446);
+  --success-400: var(--if-light, var(--emerald-400)) var(--if-dark, #2fb983); --success-500: var(--tone-success-solid);
   --success-600: var(--tone-success-fg);  --success-700: var(--tone-success-fg);
   --success-800: var(--tone-success-fg);  --success-900: var(--tone-success-fg);
 
   --warning-50: var(--tone-pending-bg);   --warning-100: var(--tone-pending-border);
-  --warning-200: var(--tone-pending-border); --warning-300: light-dark(var(--amber-300), #5c4415);
+  --warning-200: var(--tone-pending-border); --warning-300: var(--if-light, var(--amber-300)) var(--if-dark, #5c4415);
   --warning-400: var(--tone-pending-solid); --warning-500: var(--tone-pending-solid);
   --warning-600: var(--tone-pending-fg);  --warning-700: var(--tone-pending-fg);
   --warning-800: var(--tone-pending-fg);  --warning-900: var(--tone-pending-fg);
@@ -419,19 +468,19 @@
   /* danger-500 is also read as text on pages, so it takes coral-600 (5.14:1),
      not the brighter coral-500 solid (3.73:1). */
   --danger-50: var(--tone-danger-bg);     --danger-100: var(--tone-danger-border);
-  --danger-200: var(--tone-danger-border); --danger-300: light-dark(var(--coral-300), #66301f);
-  --danger-400: var(--tone-danger-solid); --danger-500: light-dark(var(--coral-600), #ea7a63);
+  --danger-200: var(--tone-danger-border); --danger-300: var(--if-light, var(--coral-300)) var(--if-dark, #66301f);
+  --danger-400: var(--tone-danger-solid); --danger-500: var(--if-light, var(--coral-600)) var(--if-dark, #ea7a63);
   --danger-600: var(--tone-danger-fg);    --danger-700: var(--tone-danger-fg);
   --danger-800: var(--tone-danger-fg);    --danger-900: var(--tone-danger-fg);
 
   --info-50: var(--tone-info-bg);         --info-100: var(--tone-info-border);
-  --info-200: var(--tone-info-border);    --info-300: light-dark(var(--ocean-300), #1d5364);
+  --info-200: var(--tone-info-border);    --info-300: var(--if-light, var(--ocean-300)) var(--if-dark, #1d5364);
   --info-400: var(--tone-info-solid);     --info-500: var(--tone-info-solid);
   --info-600: var(--tone-info-fg);        --info-700: var(--tone-info-fg);
   --info-800: var(--tone-info-fg);        --info-900: var(--tone-info-fg);
 
   --progress-50: var(--tone-progress-bg); --progress-100: var(--tone-progress-border);
-  --progress-200: var(--tone-progress-border); --progress-300: light-dark(var(--plum-300), #4d3363);
+  --progress-200: var(--tone-progress-border); --progress-300: var(--if-light, var(--plum-300)) var(--if-dark, #4d3363);
   --progress-400: var(--tone-progress-solid); --progress-500: var(--tone-progress-solid);
   --progress-600: var(--tone-progress-fg); --progress-700: var(--tone-progress-fg);
   --progress-800: var(--tone-progress-fg); --progress-900: var(--tone-progress-fg);
@@ -441,7 +490,7 @@
   --accent-50:  var(--tone-pending-bg);
   --accent-100: var(--tone-pending-border);
   --accent-200: var(--tone-pending-border);
-  --accent-300: light-dark(var(--amber-300), #5c4415);
+  --accent-300: var(--if-light, var(--amber-300)) var(--if-dark, #5c4415);
   --accent-400: var(--tone-pending-solid);
   --accent-500: var(--tone-pending-solid);
   --accent-600: var(--tone-pending-fg);
@@ -537,13 +586,8 @@
   --shadow-focus: var(--focus-halo-input);
 }
 
-/* An explicit choice from the user menu pins the scheme; with no attribute the
-   OS preference decides (color-scheme: light dark above). */
-:root[data-theme='light'] { color-scheme: light; }
-:root[data-theme='dark'] { color-scheme: dark; }
-
 @supports (background-image: linear-gradient(in oklch, red, blue)) {
-  :root {
+  :root, .sidebar {
     --grad-iris: linear-gradient(135deg in oklch, #5145c8 0%, #6e5fdb 55%, #8a5bd6 100%);
     --grad-aurora: linear-gradient(110deg in oklch, #6e5fdb 0%, #0f9d95 52%, #e39b1b 100%);
   }

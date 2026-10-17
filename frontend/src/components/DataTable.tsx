@@ -20,7 +20,10 @@ import {
   Search, Settings2, Download, Printer, X, Inbox, Rows3, Rows2,
 } from 'lucide-react';
 import { Banner, Button, EmptyState, ErrorState, IconButton, OverflowMenu, Popover, SkeletonTable } from './ui';
+import { autoFrozenRight, columnKind, planLegacyFooter, sentenceCaseHeader } from './dataTableModel';
 import type { PageMeta } from '../lib/api';
+
+export { sentenceCaseHeader } from './dataTableModel';
 
 export interface Column<T> {
   key: string;
@@ -81,8 +84,9 @@ export interface DataTableProps<T> {
 
   /**
    * Totals row. Prefer per-column `footer` renderers (plus `footerLabel`).
-   * A function receives the visible columns. A legacy `<tr>` is normalised
-   * so its cells span exactly the visible columns.
+   * A function receives the visible columns. A legacy `<tr>`, written for the
+   * default columns, has each cell placed under its own column whatever the
+   * user shows or hides (planLegacyFooter).
    */
   footer?: ReactNode | ((visible: Column<T>[]) => ReactNode);
   /** Label in the leading footer cell when columns define `footer`. */
@@ -94,9 +98,11 @@ export interface DataTableProps<T> {
   /** Freeze the first visible column (the identifier). Default on. */
   freezeFirstColumn?: boolean;
   /**
-   * Freeze the last visible column. 'auto' (default) freezes it when it is a
-   * status or actions column, so status and row actions stay in view on a
-   * table wider than the screen (audit UI-007: PO status 296 px off-screen).
+   * Freeze the last visible column. 'auto' (default) freezes a trailing
+   * status column and a narrow trailing actions column (with the status column
+   * before it), so status and row actions stay in view on a table wider than
+   * the screen (audit UI-007: PO status 296 px off-screen) — but never a wide
+   * column over the status (dataTableModel.autoFrozenRight).
    */
   freezeLastColumn?: boolean | 'auto';
 }
@@ -110,59 +116,38 @@ const write = (key: string, value: string) => {
   try { localStorage.setItem(key, value); } catch { /* quota or blocked storage */ }
 };
 
-/**
- * Sentence case for headers (spec §2.4): "Pending GRN Qty" → "Pending GRN qty".
- * Acronyms (two or more capitals, no lower case) and words with digits keep
- * their spelling.
- */
-export function sentenceCaseHeader(header: string): string {
-  return header.split(' ').map((word, i) => {
-    if (i === 0 || !word) return word;
-    const letters = word.replace(/[^A-Za-z]/g, '');
-    if (/\d/.test(word) || (letters.length >= 2 && letters === letters.toUpperCase())) return word;
-    return word.toLowerCase();
-  }).join(' ');
-}
-
-const isStatusOrActions = <T,>(c: Column<T> | undefined) =>
-  Boolean(c && (c.locked || /^(actions?|status|view|ops)$/i.test(c.key) || c.header.trim() === ''));
-
 type CellProps = { colSpan?: number; className?: string; style?: React.CSSProperties };
 
 /**
- * Re-spans a hand-built `<tr>` footer so its cells cover exactly the visible
- * columns, and freezes the cells that sit under frozen columns. The trailing
- * cells are the per-column totals, so they keep their place at the right; the
- * leading label cell absorbs the difference (PoList: colSpan 7 + 5 cells under
- * 10 visible columns becomes 5 + 5).
+ * Lays a hand-built `<tr>` totals row under the visible columns: each cell
+ * goes under the column it was written for (planLegacyFooter), and cells under
+ * frozen columns freeze too, blanks included, so a frozen column never shows
+ * another column's total sliding underneath it. A row that cannot be matched
+ * to the columns is left out rather than shown under the wrong headers.
  */
 function normaliseFooterRow(
-  node: ReactNode, cols: number, sticky: (colIndex: number) => { className: string; style?: React.CSSProperties },
+  node: ReactNode, defaultKeys: string[], visibleKeys: string[],
+  sticky: (colIndex: number) => { className: string; style?: React.CSSProperties },
 ): ReactNode {
   if (!isValidElement(node) || node.type !== 'tr') return node;
   const tr = node as ReactElement<{ children?: ReactNode }>;
   const cells = Children.toArray(tr.props.children).filter(isValidElement) as ReactElement<CellProps>[];
   if (cells.length === 0) return node;
-  const spanOf = (c: ReactElement<CellProps>) => Number(c.props.colSpan) || 1;
-  const span = cells.reduce((s, c) => s + spanOf(c), 0);
-  const first = cells[0]!;
-  const nextFirst = Math.max(1, spanOf(first) + (cols - span));
-  const spans = [nextFirst, ...cells.slice(1).map(spanOf)];
-  const out: ReactElement[] = [];
-  let col = 0;
-  cells.forEach((c, i) => {
-    const s = spans[i]!;
-    const sp = s === 1 ? sticky(col) : { className: '' };
-    out.push(cloneElement(c, {
-      key: c.key ?? `f-${i}`,
-      colSpan: s > 1 || c.props.colSpan !== undefined ? s : undefined,
+  const plan = planLegacyFooter(cells.map((c) => Number(c.props.colSpan) || 1), defaultKeys, visibleKeys);
+  if (!plan) return null;
+  return cloneElement(tr, {}, ...plan.map((slot) => {
+    const sp = slot.span === 1 ? sticky(slot.start) : { className: '', style: undefined };
+    if (slot.cell === null) {
+      return <td key={`blank-${slot.start}`} className={sp.className || undefined} style={sp.style} />;
+    }
+    const c = cells[slot.cell]!;
+    return cloneElement(c, {
+      key: c.key ?? `f-${slot.cell}`,
+      colSpan: slot.span > 1 ? slot.span : undefined,
       className: [c.props.className, sp.className].filter(Boolean).join(' ') || undefined,
       style: sp.style ? { ...c.props.style, ...sp.style } : c.props.style,
-    }));
-    col += s;
-  });
-  for (let i = col; i < cols; i++) out.push(<td key={`pad-${i}`} />);
-  return cloneElement(tr, {}, ...out);
+    });
+  }));
 }
 
 export function DataTable<T>({
@@ -249,7 +234,10 @@ export function DataTable<T>({
   const visible = useMemo(() => columns.filter((c) => !hidden.has(c.key)), [columns, hidden]);
   const configurable = columns.filter((c) => !c.locked);
 
-  /* Frozen columns: explicit `sticky`, else the defaults. */
+  /* Frozen columns: explicit `sticky`, the identifier on the left, and on the
+     right the trailing columns autoFrozenRight() picks from their measured
+     widths (set by measure() below), or the last column when asked. */
+  const [autoRight, setAutoRight] = useState<string[]>([]);
   const stickySide = useMemo(() => {
     const side: Record<string, 'left' | 'right'> = {};
     visible.forEach((c) => { if (c.sticky) side[c.key] = c.sticky; });
@@ -257,11 +245,11 @@ export function DataTable<T>({
     const last = visible[visible.length - 1];
     if (visible.length > 2) {
       if (freezeFirstColumn && first && !side[first.key]) side[first.key] = 'left';
-      const freezeLast = freezeLastColumn === 'auto' ? isStatusOrActions(last) : freezeLastColumn;
-      if (freezeLast && last && !side[last.key]) side[last.key] = 'right';
+      const right = freezeLastColumn === 'auto' ? autoRight : freezeLastColumn && last ? [last.key] : [];
+      right.forEach((k) => { if (!side[k] && visible.some((c) => c.key === k)) side[k] = 'right'; });
     }
     return side;
-  }, [visible, freezeFirstColumn, freezeLastColumn]);
+  }, [visible, freezeFirstColumn, freezeLastColumn, autoRight]);
 
   /* Client-side paging for lists that arrive whole. */
   const [clientPage, setClientPage] = useState(1);
@@ -290,6 +278,14 @@ export function DataTable<T>({
     const row = headRowRef.current;
     if (!wrap || !row) return;
     const cells = Array.from(row.children) as HTMLElement[];
+    if (freezeLastColumn === 'auto') {
+      // Freezing never changes a column's width, so this settles in one pass.
+      const right = autoFrozenRight(
+        visible.map((c, i) => ({ key: c.key, kind: columnKind(c), width: cells[i]?.offsetWidth ?? 0 })),
+        wrap.clientWidth,
+      );
+      setAutoRight((prev) => (prev.join('\n') === right.join('\n') ? prev : right));
+    }
     const next: Record<string, number> = {};
     let acc = 0;
     visible.forEach((c, i) => { if (stickySide[c.key] === 'left') { next[c.key] = acc; acc += cells[i]?.offsetWidth ?? 0; } });
@@ -302,7 +298,7 @@ export function DataTable<T>({
     const left = wrap.scrollLeft > 1;
     const right = wrap.scrollLeft + wrap.clientWidth < wrap.scrollWidth - 1;
     setOverflow((p) => (p.left === left && p.right === right ? p : { left, right }));
-  }, [visible, stickySide]);
+  }, [visible, stickySide, freezeLastColumn]);
 
   useLayoutEffect(() => {
     const wrap = wrapRef.current;
@@ -360,7 +356,12 @@ export function DataTable<T>({
   } else if (typeof footer === 'function') {
     footerNode = footer(visible);
   } else if (footer) {
-    footerNode = normaliseFooterRow(footer, visible.length, (i) => (visible[i] ? stickyProps(visible[i]!) : { className: '' }));
+    footerNode = normaliseFooterRow(
+      footer,
+      columns.filter((c) => !c.optional).map((c) => c.key),
+      visible.map((c) => c.key),
+      (i) => (visible[i] ? stickyProps(visible[i]!) : { className: '' }),
+    );
   }
 
   const showToolbar = Boolean(onSearchChange || toolbar || onExport || onPrint || configurable.length > 0);

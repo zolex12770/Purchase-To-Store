@@ -36,7 +36,7 @@ let cache: ChartTheme | null = null;
 const listeners = new Set<() => void>();
 let stop: (() => void) | null = null;
 
-/** Resolves each token to the colour it computes to right now (light-dark() included). */
+/** Resolves each token to the colour it computes to right now, on whichever side of the theme switch is active. */
 function readTheme(): ChartTheme {
   const probe = document.createElement('span');
   probe.style.display = 'none';

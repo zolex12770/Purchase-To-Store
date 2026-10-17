@@ -893,7 +893,7 @@ h1, h2, h3, h4, h5, h6 {
 .tooltip-anchor.tooltip-block { display: flex; width: 100%; min-width: 0; }
 .tooltip-anchor.tooltip-block > * { flex: 1 1 auto; min-width: 0; }
 .tooltip-lines { display: flex; flex-direction: column; gap: 4px; }
-.tooltip-lines .tl-k { color: light-dark(#cfc8bd, var(--stone-600)); font-weight: var(--fw-regular); }
+.tooltip-lines .tl-k { color: var(--text-on-inverse-muted); font-weight: var(--fw-regular); }
 .tooltip {
   position: fixed;
   z-index: var(--z-tooltip);
@@ -901,7 +901,7 @@ h1, h2, h3, h4, h5, h6 {
   padding: 5px 8px;
   border-radius: var(--radius-xs);
   background: var(--surface-inverse);
-  color: light-dark(#f3efe8, var(--stone-900));
+  color: var(--text-on-inverse);
   font-size: var(--fs-12);
   font-weight: var(--fw-medium);
   line-height: var(--lh-snug);
@@ -1274,10 +1274,10 @@ h1, h2, h3, h4, h5, h6 {
 .user-name { font-size: var(--fs-13); font-weight: var(--fw-semibold); color: var(--text-1); max-width: 150px; }
 .user-role { font-size: var(--fs-11); color: var(--text-3); max-width: 150px; text-transform: capitalize; }
 
-/* Sidebar: an ink island in both themes. color-scheme: dark makes every
-   light-dark() token inside it (focus colour, scrollbars) take its dark side. */
+/* Sidebar: an ink island in both themes. tokens.css sets the dark side of the
+   theme switch on it, so every token inside it (focus colour, scrollbars)
+   takes its dark value. */
 .sidebar {
-  color-scheme: dark;
   /* A solid ink base under the glow gradients: what text sits on if the
      gradients do not paint, and what contrast is measured against. */
   background-color: #17151a;
@@ -1319,7 +1319,14 @@ h1, h2, h3, h4, h5, h6 {
 .nav-subhead { padding: var(--space-2) var(--space-2-5) 2px 40px; font-size: var(--fs-11); font-weight: var(--fw-semibold); color: var(--sidebar-text-faint); }
 .nav-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Module identity tile: the hue at 18 % behind a 16 px icon. */
-.nav-icon { width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0; display: grid; place-items: center; color: var(--nav-hue, var(--sidebar-text)); background: color-mix(in srgb, var(--nav-hue, transparent) 18%, transparent); }
+.nav-icon { width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0; display: grid; place-items: center; color: var(--nav-hue, var(--sidebar-text)); background: rgb(255 255 255 / .07); }
+/* color-mix() needs Chromium 111 / Safari 16.2 / Firefox 113. Behind
+   @supports, because a declaration that reads var() is never dropped at
+   parse time: an older engine would discard it only after the cascade and
+   leave no background at all, instead of the plain wash above. */
+@supports (background: color-mix(in srgb, red 50%, transparent)) {
+  .nav-icon { background: color-mix(in srgb, var(--nav-hue, transparent) 18%, transparent); }
+}
 .nav-icon-sm { width: 16px; height: 16px; flex-shrink: 0; display: grid; place-items: center; color: inherit; opacity: 0.85; }
 .nav-item.is-active .nav-icon-sm { opacity: 1; color: var(--nav-hue, #ffffff); }
 .sidebar.is-rail .nav-item, .sidebar.is-rail .nav-group-btn { justify-content: center; padding: 0; }
@@ -1374,7 +1381,7 @@ h1, h2, h3, h4, h5, h6 {
 @media print {
   @page { margin: 14mm; size: A4; }
 
-  :root { color-scheme: light; }
+  /* The tokens print on their light side in every theme: tokens.css, THEME SWITCH. */
 
   body {
     background: #ffffff !important;
