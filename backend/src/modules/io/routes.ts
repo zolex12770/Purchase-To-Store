@@ -58,6 +58,7 @@ const FILTER_LABELS: Record<string, string> = {
   poId: 'Purchase orders', view: 'View', mode: 'Mode', sourceMode: 'Source', pendingOnly: 'Pending approval only',
   overdue: 'Overdue only', isActive: 'Active', qcRequired: 'QC required', state: 'State', city: 'City',
   action: 'Action', entity: 'Entity', entityId: 'Record', source: 'Source', result: 'Result',
+  excludeCancelled: 'Cancelled excluded', eligibleOnly: 'Awaiting purchase order only',
 };
 /** Paging, sorting and the file format are not filters. */
 const NOT_FILTERS = new Set(['format', 'page', 'pageSize', 'sortBy', 'sortDir', 'dateFrom', 'dateTo', 'search', 'ids']);
