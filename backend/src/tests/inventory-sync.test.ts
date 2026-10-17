@@ -20,6 +20,9 @@
  *      inward as "GRN_INWARD".
  *   7. Backups left out every inventory table, and restoring onto a database that
  *      held inventory data failed on the items foreign key.
+ *   8. The Purchase stock added a code's figures from every sheet whatever their
+ *      unit (PTC4/0, a KG item: 1,472 WIP Nos + 264.75 RM Kg = 1,736.75); only the
+ *      Item Master's unit counts now.
  *
  * Real PGlite database, migrated and seeded from scratch; the Google read is
  * replaced by in-memory sheet contents (the engine's `reader` option).
@@ -50,7 +53,7 @@ const ISS_TAB = 'Issue Register (Store Outward Entry)';
 
 /* ── In-memory General Stores spreadsheet ───────────────────────────────────── */
 
-interface StockLine { code: string; opening: number; live: number | string; adj?: number }
+interface StockLine { code: string; opening: number; live: number | string; adj?: number; uom?: string }
 function grn(month: string, no: string, date: string, code: string, qty: number | string, rate = 2): Row {
   const r: Row = new Array(21).fill('');
   r[2] = month; r[4] = no; r[5] = date; r[6] = 'Test Supplier'; r[7] = `BILL-${no}`; r[9] = code;
@@ -75,7 +78,7 @@ class Sheet {
   reader = async (cfg: CategorySheetConfig): Promise<CategoryRead> => ({
     stockMain: [
       ['Sr.No', 'Item Code', 'Item Name', 'Main Group', 'Unit', 'Rack Line ID', 'Rack ID', 'Live Stock (Qty)', 'Amount'],
-      ...this.stock.map((s, i) => [i + 1, s.code, `${s.code} name`, 'Test Group', 'Nos', '', 'R-1', s.live, ''] as Row),
+      ...this.stock.map((s, i) => [i + 1, s.code, `${s.code} name`, 'Test Group', s.uom ?? 'Nos', '', 'R-1', s.live, ''] as Row),
     ],
     stockOpening: [['Opening Stock(Qty)'], ...this.stock.map((s) => [s.opening] as Row)],
     stockAdjustment: [['Stock Adjustment'], ...this.stock.map((s) => [s.adj ?? 0] as Row)],
@@ -90,6 +93,8 @@ const sync = (extra: Record<string, unknown> = {}) => syncGeneral('GENERAL', { r
 const tab = (r: Awaited<ReturnType<typeof sync>>, name: string) => r.tabs.find((t) => t.tab === name)!;
 const itemStock = async (code: string) =>
   Number((await query<{ q: string }>(`SELECT live_stock_qty AS q FROM items WHERE item_code = $1 AND deleted_at IS NULL`, [code]))[0]?.q);
+const uomId = async (code: string) =>
+  Number((await query<{ id: string }>(`SELECT id FROM lookups WHERE category = 'UOM' AND code = $1`, [code]))[0].id);
 const posted = async (tabName: string) =>
   (await query<{ n: number }>(
     `SELECT COUNT(*)::int AS n FROM inventory_transactions WHERE category = 'GENERAL' AND source_tab = $1 AND status = 'POSTED'`,
@@ -145,11 +150,12 @@ beforeAll(async () => {
   adminToken = login.body.data.accessToken;
 
   // Purchase item master holds A, B and D — not C (a code only the inventory sheet knows).
-  for (const code of ['TSYNC-A', 'TSYNC-B', 'TSYNC-D']) {
+  // The sheet counts them in Nos; B's Item Master unit PCS is the same counted unit.
+  for (const [code, uom] of [['TSYNC-A', 'NOS'], ['TSYNC-B', 'PCS'], ['TSYNC-D', 'NOS']]) {
     await query(
-      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, is_active)
-       VALUES ($1, $2, 'GENERAL', 0, TRUE)`,
-      [code, `${code} purchase item`],
+      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, is_active, uom_id)
+       VALUES ($1, $2, 'GENERAL', 0, TRUE, $3)`,
+      [code, `${code} purchase item`, await uomId(uom)],
     );
   }
   baseline();
@@ -375,6 +381,47 @@ describe('Inventory movements entered in the ERP', () => {
       .send({ itemId: 999999, txnType: 'X', direction: 'IN', quantity: 1, uom: 'Nos' });
     expect(res.status).toBe(422);
     expect(res.body.error.message).toMatch(/not in the Purchase item master/);
+  });
+});
+
+describe('Purchase stock counts the Item Master unit only', () => {
+  it('a sheet that counts the code in another unit is reported and leaves the Purchase stock as it is', async () => {
+    await query(
+      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, is_active, uom_id)
+       VALUES ('TSYNC-U', 'TSYNC-U purchase item', 'GENERAL', 2, TRUE, $1)`,
+      [await uomId('KG')],
+    );
+    sheet.stock.push({ code: 'TSYNC-U', opening: 5, live: 5, uom: 'Nos' });
+    const r = await sync();
+    expect(r.reconciliation.mismatched).toBe(0);
+    expect(await itemStock('TSYNC-U')).toBe(2);
+    expect(r.purchaseStock.unitMismatches).toEqual([{ itemCode: 'TSYNC-U', itemUom: 'KG', leftOut: 'GENERAL Nos 5', aligned: false }]);
+    const row = await query<{ recon_status: string; recon_note: string }>(
+      `SELECT recon_status, recon_note FROM inventory_items WHERE category = 'GENERAL' AND item_code = 'TSYNC-U'`,
+    );
+    expect(row[0].recon_status).toBe('MATCHED');
+    expect(row[0].recon_note).toBe('Not counted in the Purchase stock: this sheet counts Nos, the Item Master unit is KG.');
+    const ledger = await query(`SELECT 1 FROM stock_ledger l JOIN items i ON i.id = l.item_id WHERE i.item_code = 'TSYNC-U'`);
+    expect(ledger.length).toBe(0);
+    const checkpoint = await query<{ report: { purchaseStock: { unitMismatches: unknown[] } } }>(
+      `SELECT report FROM inventory_sync_checkpoints WHERE run_id = $1 AND tab_name = '(all tabs)'`, [r.runId],
+    );
+    expect(checkpoint[0].report.purchaseStock.unitMismatches).toHaveLength(1);
+  });
+
+  it('once the Item Master unit is corrected, the next run aligns the item, ledgered', async () => {
+    await query(`UPDATE items SET uom_id = $1 WHERE item_code = 'TSYNC-U'`, [await uomId('NOS')]);
+    const r = await sync();
+    expect(r.purchaseStock.unitMismatches).toEqual([]);
+    expect(await itemStock('TSYNC-U')).toBe(5);
+    const ledger = await query<{ txn_type: string; inward_qty: string; balance_qty: string }>(
+      `SELECT l.txn_type, l.inward_qty, l.balance_qty FROM stock_ledger l JOIN items i ON i.id = l.item_id WHERE i.item_code = 'TSYNC-U'`,
+    );
+    expect(ledger.map((l) => [l.txn_type, Number(l.inward_qty), Number(l.balance_qty)])).toEqual([['SHEET_SYNC', 3, 5]]);
+    const note = await query<{ recon_note: string | null }>(
+      `SELECT recon_note FROM inventory_items WHERE category = 'GENERAL' AND item_code = 'TSYNC-U'`,
+    );
+    expect(note[0].recon_note).toBeNull();
   });
 });
 

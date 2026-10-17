@@ -133,3 +133,22 @@ export function toShortUom(raw?: string | null): string {
   const key = clean.toUpperCase().replace(/\s+/g, ' ');
   return UOM_SHORT_MAP[key] ?? clean;
 }
+
+/**
+ * Whether quantities recorded in units `a` and `b` may be added together.
+ *
+ * Letter case and the usual spellings are ignored ("KG" = "Kg" = "KGS", "MTR" =
+ * "Mtr" = "M"), and the counted units Nos / No / Pcs / Pc are one unit: the Item
+ * Master and the store sheets use them interchangeably for the same items. A
+ * missing unit matches nothing, so a figure of unknown unit is never added to
+ * another. (Until 2026-10-16 the inventory sync added PTC4/0's 1,472 Nos from the
+ * WIP sheet to its 264.75 Kg from the RM sheet.)
+ */
+export function sameUnit(a?: string | null, b?: string | null): boolean {
+  const key = (raw?: string | null) => {
+    const short = toShortUom(raw);
+    return (short === 'Pcs' ? 'Nos' : short).toUpperCase();
+  };
+  const ka = key(a);
+  return ka !== '' && ka === key(b);
+}

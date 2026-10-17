@@ -134,14 +134,16 @@ router.get(
         WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')`,
     );
 
-    // 5. Today's movement
+    // 5. Today's movement. The one-time opening alignment is a book entry dated the day it
+    // is applied (on the 2026-10-16 snapshot 6,557 rows, 13.7M in and 13.2M out), not
+    // stock that moved that day.
     const todayMovements = await queryOne<{ inward_qty: string; outward_qty: string; txns_count: string }>(
       `SELECT
          COALESCE(SUM(inward_qty), 0)::numeric(18, 4) AS inward_qty,
          COALESCE(SUM(outward_qty), 0)::numeric(18, 4) AS outward_qty,
          COUNT(*)::int AS txns_count
         FROM stock_ledger
-       WHERE txn_date = CURRENT_DATE`,
+       WHERE txn_date = CURRENT_DATE AND reference_type <> 'OPENING_ALIGNMENT'`,
     );
 
     // 6. Quarantine & Unsynced Discrepancies

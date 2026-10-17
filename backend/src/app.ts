@@ -39,6 +39,9 @@ import inventoryRoutes from './modules/inventory/routes.js';
 import dataManagementRoutes from './modules/admin/data-management.routes.js';
 import { getDatabase } from './db/index.js';
 
+/** Routes that parse their own JSON body (both mounts of data-management; Express matches paths case-insensitively). */
+const OWN_BODY_PARSER = /^\/api\/v1\/(?:admin\/)?data-management\/repair\/stock-alignment\/?$/i;
+
 export function createApp(): Express {
   const app = express();
 
@@ -113,7 +116,11 @@ export function createApp(): Express {
     }),
   );
 
-  app.use(express.json({ limit: '2mb' }));
+  // The one-time stock alignment posts ~7,000 ledger entries in one request; that
+  // route reads its own body with a larger limit, and only after its Super Admin
+  // check (data-management.routes.ts). Every other request keeps 2 MB.
+  const json = express.json({ limit: '2mb' });
+  app.use((req, res, next) => (OWN_BODY_PARSER.test(req.path) ? next() : json(req, res, next)));
   app.use(express.urlencoded({ extended: true, limit: '2mb' }));
   app.use(cookieParser());
 
