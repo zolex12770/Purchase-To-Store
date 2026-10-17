@@ -12,7 +12,7 @@
  *   active Super Admin is never deactivated or deleted (super-admin-guard.ts).
  */
 import { createHash } from 'node:crypto';
-import express, { Router } from 'express';
+import express, { Router, type Request } from 'express';
 import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
@@ -29,6 +29,11 @@ import { activeInventorySync } from '../inventory/sync-engine.js';
 import {
   ALIGNMENT_COMPONENT_CODES, planAlignment, applyAlignment, undoAlignment, describePlan,
 } from './stock-alignment.js';
+import {
+  STORE_GRN_TAB, planStoreGrnLinks, applyStoreGrnLinks, undoStoreGrnLinks, describeLinkPlan,
+  summariseLinkPlan, runIn, type SheetReader,
+} from './store-grn-links.js';
+import { readSheet } from '../google-sync/engine.js';
 
 const router = Router();
 
@@ -1580,6 +1585,101 @@ router.post(
       ...result,
       message: `Alignment undone for ${result.undone.length} item(s): ${result.rowsPosted} opposite ledger row(s) appended, `
         + `nothing deleted; live stock was not changed.${result.skipped.length ? ` ${result.skipped.length} item(s) skipped.` : ''}`,
+    });
+  }),
+);
+
+/* ── Repair: link the store's imported GRNs to their purchase orders ──────────
+   The store's GRNs were imported on 2026-10-14 from the business sheet's GRN tab
+   before their POs existed, so 6,394 of 6,404 GRN lines carry no PO link. Since the
+   PO register import of 2026-10-16 (sync job 2736) 2,000 of 2,003 POs show OPEN with
+   about Rs 79.5 Cr pending receipt, though the tab's 'Po No' column records which PO
+   each receipt was against. The evidence rules are in store-grn-links.ts. Super Admin
+   only. dryRun (the default) lists what would be linked, why every other line is not,
+   the supplier pairs that differ, the POs' statuses and the pending value before and
+   after, and a selectionHash. The reviewer may keep lines out (excludeGrnLineIds) and
+   confirm two supplier records as one company (sameSupplierPairs); the apply repeats
+   those choices with the typed confirmation and the hash, re-reads the tab and
+   re-plans in the transaction that writes. Undo takes back exactly the links one
+   audit entry (or a run) recorded, or those of the GRN lines named, a GRN whole. */
+
+/** The GRN tab's reader: the sync engine's own, unless the app was handed another (tests). */
+const grnTabReaderOf = (req: Request): SheetReader =>
+  (req.app.locals.storeGrnTabReader as SheetReader | undefined) ?? readSheet;
+
+const linkStoreGrnsSchema = z.object({
+  dryRun: z.boolean().default(true),
+  confirm: z.string().optional(),
+  expectedHash: z.string().trim().regex(/^[0-9a-f]{64}$/, 'expectedHash is the selectionHash a dry run returned.').optional(),
+  excludeGrnLineIds: z.array(z.coerce.number().int().positive()).max(20000).default([]),
+  sameSupplierPairs: z.array(z.object({
+    grnSupplierId: z.coerce.number().int().positive(),
+    poSupplierId: z.coerce.number().int().positive(),
+  })).max(1000).default([]),
+});
+
+router.post(
+  '/repair/link-store-grns',
+  requireSuperAdmin(),
+  validateBody(linkStoreGrnsSchema),
+  asyncHandler(async (req, res) => {
+    const { dryRun, confirm, expectedHash, excludeGrnLineIds, sameSupplierPairs } = req.body as z.infer<typeof linkStoreGrnsSchema>;
+    if (!dryRun) {
+      if (confirm !== 'LINK STORE GRNS') {
+        throw ValidationError('Type "LINK STORE GRNS" to confirm. Take a verified backup first.');
+      }
+      if (!expectedHash) {
+        throw ValidationError('Run the dry run first and pass its selectionHash as expectedHash.');
+      }
+    }
+    // The tab is read before the transaction opens: a Google read can take seconds,
+    // and the embedded database serves one transaction at a time.
+    const grid = await grnTabReaderOf(req)(STORE_GRN_TAB);
+    if (dryRun) {
+      // One read-only transaction, so every figure comes from the same moment.
+      const plan = await withTransaction((tx) => planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds, sameSupplierPairs }));
+      sendOk(res, { dryRun: true, ...describeLinkPlan(plan), message: `${summariseLinkPlan(plan)} Nothing was changed.` });
+      return;
+    }
+    const result = await withTransaction((tx) => applyStoreGrnLinks(tx, grid, {
+      expectedHash: expectedHash!, actor: actorFrom(req), excludeGrnLineIds, sameSupplierPairs,
+    }));
+    sendOk(res, {
+      dryRun: false,
+      linesLinked: result.linesLinked,
+      headersSet: result.headersSet,
+      headersCleared: result.headersCleared,
+      poStatusesRederived: result.poStatusesRederived,
+      runId: result.runId,
+      auditIds: result.auditIds,
+      ...describeLinkPlan(result.plan),
+      message: `${summariseLinkPlan(result.plan)} ${result.linesLinked} line(s) linked in ${result.auditIds.length} audited batch(es); `
+        + 'quantities, stock and the ledger were not changed.',
+    });
+  }),
+);
+
+router.post(
+  '/repair/link-store-grns/undo',
+  requireSuperAdmin(),
+  validateBody(z.object({
+    auditId: z.coerce.number().int().positive().optional(),
+    grnLineIds: z.array(z.coerce.number().int().positive()).min(1, 'Name the GRN lines to unlink.').max(20000).optional(),
+    reason: z.string().trim().min(5, 'Say why the links are undone.').max(500),
+    confirm: z.string().optional(),
+  }).refine((b) => (b.auditId === undefined) !== (b.grnLineIds === undefined), {
+    message: 'Give either auditId (a link batch or a run) or grnLineIds, not both.', path: ['auditId'],
+  })),
+  asyncHandler(async (req, res) => {
+    const { auditId, grnLineIds, reason, confirm } = req.body as { auditId?: number; grnLineIds?: number[]; reason: string; confirm?: string };
+    if (confirm !== 'UNDO STORE GRN LINKS') {
+      throw ValidationError('Type "UNDO STORE GRN LINKS" to confirm.');
+    }
+    const result = await withTransaction((tx) => undoStoreGrnLinks(tx, { auditId, grnLineIds }, { reason, actor: actorFrom(req) }));
+    sendOk(res, {
+      ...result,
+      message: `${result.undone.length} GRN line link(s) undone and ${result.headersRestored.length} GRN header(s) set back; `
+        + `${result.poStatusesRederived} PO status(es) re-derived.${result.skipped.length ? ` ${result.skipped.length} line(s) skipped.` : ''}`,
     });
   }),
 );
