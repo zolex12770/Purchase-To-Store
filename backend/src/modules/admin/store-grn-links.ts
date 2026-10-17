@@ -47,8 +47,8 @@ export const STORE_GRN_TAB = 'GRN';
 export const LINK_AUDIT_ENTITY = 'store_grn_link';
 /**
  * The supplier the store import gave a GRN whose tab row named none
- * (scripts/live_source_reimport.ts): 251 of the lines linked to another supplier's
- * PO in the 2026-10-17 copy carry it, and its PO is the only supplier evidence.
+ * (scripts/live_source_reimport.ts). Its PO is then the only supplier evidence: 231
+ * of the 3,752 lines the 2026-10-17 copy links carry it.
  */
 export const IMPORT_PLACEHOLDER_SUPPLIER_CODE = 'SUP-UNSPECIFIED';
 /**
@@ -353,7 +353,7 @@ export async function planStoreGrnLinks(
 
   // 1. The receipts without a PO, with their GRN's supplier and date.
   const lines = await run<GrnLineRow>(
-    `SELECT gl.id, gl.grn_id, gh.grn_no, gh.grn_date::text AS grn_date, gh.supplier_id, s.supplier_code, s.supplier_name,
+    `SELECT gl.id, gl.grn_id, gh.grn_no, to_char(gh.grn_date, 'YYYY-MM-DD') AS grn_date, gh.supplier_id, s.supplier_code, s.supplier_name,
             gl.item_id, gl.item_code, gl.item_description, gl.grn_qty::text AS grn_qty
        FROM grn_lines gl JOIN grn_headers gh ON gh.id = gl.grn_id JOIN suppliers s ON s.id = gh.supplier_id
       WHERE gl.po_line_id IS NULL AND gh.status = 'POSTED'
@@ -431,7 +431,7 @@ export async function planStoreGrnLinks(
 
   // 4. The POs named, with their supplier and date, and their lines with what they have received so far.
   const poHeaders = named.length === 0 ? [] : await run<PoHeaderRow>(
-    `SELECT h.id, h.po_no, upper(trim(h.po_no)) AS key, h.status, h.po_date::text AS po_date, h.supplier_id, s.supplier_name
+    `SELECT h.id, h.po_no, upper(trim(h.po_no)) AS key, h.status, to_char(h.po_date, 'YYYY-MM-DD') AS po_date, h.supplier_id, s.supplier_name
        FROM purchase_order_headers h JOIN suppliers s ON s.id = h.supplier_id
       WHERE upper(trim(h.po_no)) = ANY($1::text[]) ORDER BY h.id`,
     [[...new Set(named.map((n) => n.poKey))]],
