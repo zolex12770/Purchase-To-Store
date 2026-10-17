@@ -1601,7 +1601,10 @@ router.post(
    confirm two supplier records as one company (sameSupplierPairs); the apply repeats
    those choices with the typed confirmation and the hash, re-reads the tab and
    re-plans in the transaction that writes. Undo takes back exactly the links one
-   audit entry (or a run) recorded, or those of the GRN lines named, a GRN whole. */
+   audit entry (or a run) recorded, or those of the GRN lines named, a GRN whole.
+   Every apply, also one that links nothing, records the held lines as the store
+   receipts awaiting link (store_grn_link_holds, migration 030); undo adds the lines
+   it unlinks there. The PO list and PO screen read that record. */
 
 /** The GRN tab's reader: the sync engine's own, unless the app was handed another (tests). */
 const grnTabReaderOf = (req: Request): SheetReader =>
@@ -1644,6 +1647,8 @@ router.post(
     const result = await withTransaction((tx) => applyStoreGrnLinks(tx, grid, {
       expectedHash: expectedHash!, actor: actorFrom(req), excludeGrnLineIds, sameSupplierPairs,
     }));
+    const recorded = `${result.plan.totals.held} held store receipt line(s) recorded as awaiting link `
+      + `(${result.holdsRecorded} row(s), one per PO the GRN tab names), replacing the earlier record.`;
     sendOk(res, {
       dryRun: false,
       linesLinked: result.linesLinked,
@@ -1652,9 +1657,14 @@ router.post(
       poStatusesRederived: result.poStatusesRederived,
       runId: result.runId,
       auditIds: result.auditIds,
+      heldLines: result.plan.totals.held,
+      holdsRecorded: result.holdsRecorded,
       ...describeLinkPlan(result.plan),
-      message: `${summariseLinkPlan(result.plan)} ${result.linesLinked} line(s) linked in ${result.auditIds.length} audited batch(es); `
-        + 'quantities, stock and the ledger were not changed.',
+      message: result.linesLinked === 0
+        ? `Nothing was linked: no GRN line can be linked from the tab's evidence. ${recorded} `
+          + 'Quantities, stock and the ledger were not changed.'
+        : `${summariseLinkPlan(result.plan)} ${result.linesLinked} line(s) linked in ${result.auditIds.length} audited batch(es); `
+          + `${recorded} Quantities, stock and the ledger were not changed.`,
     });
   }),
 );
@@ -1679,7 +1689,8 @@ router.post(
     sendOk(res, {
       ...result,
       message: `${result.undone.length} GRN line link(s) undone and ${result.headersRestored.length} GRN header(s) set back; `
-        + `${result.poStatusesRederived} PO status(es) re-derived.${result.skipped.length ? ` ${result.skipped.length} line(s) skipped.` : ''}`,
+        + `${result.poStatusesRederived} PO status(es) re-derived; ${result.holdsRecorded} receipt line(s) recorded as awaiting link (UNDONE).`
+        + `${result.skipped.length ? ` ${result.skipped.length} line(s) skipped.` : ''}`,
     });
   }),
 );

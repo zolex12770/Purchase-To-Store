@@ -24,6 +24,7 @@ import { env } from '../../config/env.js';
 import { parseNumericInput, toRate } from '../../domain/money.js';
 import { logger } from '../../core/logger.js';
 import { assertMayChangeUsers, superAdminsAmong } from '../admin/super-admin-guard.js';
+import { poFilterSchema } from '../purchase-order/po-filter.js';
 
 const router = Router();
 
@@ -53,6 +54,9 @@ const exportQuerySchema = z.object({
   storeStatus: csvArray,
   ids: csvIdArray,
   search: z.string().trim().max(200).optional(),
+  // The Purchase Order list's own filters, parsed as the list parses them, so its
+  // export holds exactly the rows it shows (purchase-order/po-filter.ts).
+  ...poFilterSchema.pick({ mainGroupId: true, sourceMode: true, view: true, overdue: true, receiptEvidence: true }).partial().shape,
 });
 
 async function companyBranding(): Promise<{ name: string; brand: string }> {
@@ -75,6 +79,10 @@ function describeFilters(f: Record<string, unknown>): string {
   if (Array.isArray(f.itemId) && f.itemId.length) parts.push(`Items: ${f.itemId.length} selected`);
   if (Array.isArray(f.departmentId) && f.departmentId.length) parts.push(`Departments: ${f.departmentId.length} selected`);
   if (Array.isArray(f.ids) && f.ids.length) parts.push(`Specific records: ${f.ids.length}`);
+  if (f.view === 'pending' || f.view === 'complete') parts.push(`View: ${f.view}`);
+  if (f.overdue === 'true') parts.push('Overdue only');
+  if (f.receiptEvidence === 'awaiting_link') parts.push('Store receipt awaiting link');
+  if (f.receiptEvidence === 'none_recorded') parts.push('No store receipt recorded');
   if (f.search) parts.push(`Search: "${String(f.search)}"`);
   return parts.length > 0 ? parts.join('  ·  ') : 'No filters applied — full authorised dataset';
 }

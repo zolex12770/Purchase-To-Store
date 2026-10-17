@@ -7,6 +7,8 @@
  * with different filter arguments.
  */
 import { SqlBuilder } from '../../db/index.js';
+import { buildPoFilter, PO_FROM, type PoFilter } from '../purchase-order/po-filter.js';
+import { awaitingLinkCount } from '../purchase-order/receipt-evidence.js';
 
 export interface ColumnDef {
   /** Column name as returned by the query. */
@@ -36,6 +38,12 @@ export interface DatasetFilters {
   storeStatus?: string[];
   search?: string;
   ids?: number[];
+  /** The Purchase Order list's own filters (purchase-order/po-filter.ts). */
+  mainGroupId?: number[];
+  sourceMode?: PoFilter['sourceMode'];
+  view?: PoFilter['view'];
+  overdue?: PoFilter['overdue'];
+  receiptEvidence?: PoFilter['receiptEvidence'];
 }
 
 export interface DatasetDef {
@@ -262,29 +270,15 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'payment_terms', header: 'Payment Terms', width: 16 },
       { key: 'delivery_date', header: 'Delivery Date', type: 'date', width: 13 },
       { key: 'remarks', header: 'Remarks', width: 30 },
+      { key: 'store_receipts_awaiting_link', header: 'Store Receipts Awaiting Link', type: 'number', width: 16 },
     ],
     build: (f) => {
-      const b = new SqlBuilder();
+      // The list's own builder: the export of the pending view (overdue, receipt
+      // evidence, main group, search through the lines) holds exactly the rows the
+      // list shows. This export used to rebuild part of it and ignored the view, so
+      // "Export" on Pending PO wrote every PO.
+      const b = buildPoFilter(f);
       b.addIn('h.id', f.ids);
-      b.addIn('h.status', f.status);
-      b.addIn('h.supplier_id', f.supplierId);
-      b.addIn('h.po_type_id', f.poTypeId);
-      b.addIn('h.created_by', f.userId);
-      b.add('h.po_date >= ?', f.dateFrom);
-      b.add('h.po_date <= ?', f.dateTo);
-      if (f.departmentId && f.departmentId.length > 0) {
-        const p = b.push(f.departmentId);
-        b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.department_id = ANY(${p}))`);
-      }
-      if (f.costCentreId && f.costCentreId.length > 0) {
-        const p = b.push(f.costCentreId);
-        b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.cost_centre_id = ANY(${p}))`);
-      }
-      if (f.hodId && f.hodId.length > 0) {
-        const p = b.push(f.hodId);
-        b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id JOIN lookups d ON d.id = i.department_id WHERE pol.po_id = h.id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-      }
-      if (f.search) like(b, f.search, ['h.po_no', 's.supplier_name', 'h.remarks']);
       return {
         sql: `SELECT h.po_no, h.po_date, h.po_time, pt.name AS po_type_name, s.supplier_name,
                      h.status, h.source_mode,
@@ -292,10 +286,9 @@ export const DATASETS: Record<string, DatasetDef> = {
                         FROM v_po_line_sources src WHERE src.po_id = h.id) AS source_indents,
                      b.line_count, b.total_po_qty, b.total_received_qty, b.total_pending_qty,
                      b.total_amount, b.received_amount, b.pending_amount,
-                     h.payment_terms, h.delivery_date, h.remarks
-                FROM purchase_order_headers h
-                JOIN v_po_header_balance b ON b.po_id = h.id
-                JOIN suppliers s ON s.id = h.supplier_id
+                     h.payment_terms, h.delivery_date, h.remarks,
+                     ${awaitingLinkCount('h.id')} AS store_receipts_awaiting_link
+                ${PO_FROM}
                 LEFT JOIN lookups pt ON pt.id = h.po_type_id
                 ${b.where()}
                ORDER BY h.po_date DESC, h.po_no DESC`,
