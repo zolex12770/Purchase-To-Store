@@ -503,12 +503,17 @@ export default function GrnForm() {
         })),
       };
       return isEdit
-        ? api.put<{ id: number; grn_no: string }>(`/grn/${id}`, payload)
-        : api.post<{ id: number; grn_no: string }>('/grn', payload);
+        ? api.put<{ id: number; grn_no: string; qc_status?: string }>(`/grn/${id}`, payload)
+        : api.post<{ id: number; grn_no: string; qc_status?: string }>('/grn', payload);
     },
     onSuccess: (res, vars) => {
       setReview(null);
-      toast.success(vars.post ? 'GRN posted' : 'GRN saved as draft', res.grn_no);
+      // Items that need quality inspection are held out of stock until QC passes them.
+      const held = vars.post && res.qc_status === 'PENDING_QC';
+      toast.success(
+        vars.post ? 'GRN posted' : 'GRN saved as draft',
+        held ? `${res.grn_no} — items that need quality inspection are held until QC passes them.` : res.grn_no,
+      );
       void qc.invalidateQueries({ queryKey: ['grn'] });
       void qc.invalidateQueries({ queryKey: ['grn-po-items-pending'] });
       void qc.invalidateQueries({ queryKey: ['purchase-orders'] });
