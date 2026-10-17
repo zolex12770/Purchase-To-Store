@@ -55,7 +55,7 @@ export interface SyncResult {
   message: string;
 }
 
-interface ColumnMap {
+export interface ColumnMap {
   field: string;
   headers: string[];
   required?: boolean;
@@ -200,8 +200,12 @@ export async function readSheet(sheetName: string): Promise<string[][]> {
   throw IntegrationError(`Could not read sheet "${sheetName}": ${lastMessage}`);
 }
 
-/** Resolves a field's column index using its header aliases (ADR-006). */
-function resolveColumns(headerRow: string[], columns: ColumnMap[]): Map<string, number> {
+/**
+ * Resolves a field's column index using its header aliases (ADR-006). Exported for the
+ * store-GRN link repair (admin/store-grn-links.ts), which reads the GRN tab with the
+ * sync's own columns rather than a second set of header names.
+ */
+export function resolveColumns(headerRow: string[], columns: ColumnMap[]): Map<string, number> {
   const normalised = new Map<string, number>();
   headerRow.forEach((h, i) => {
     const key = h.toLowerCase().trim();
