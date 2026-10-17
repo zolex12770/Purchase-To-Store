@@ -336,6 +336,11 @@ export function Tooltip({
 
 /* ═══════════════════════════ POPOVER & MENU ═══════════════════════════ */
 
+interface PopoverPos { top?: number; bottom?: number; left: number; width?: number; minWidth?: number; maxHeight: number }
+const samePos = (a: PopoverPos, b: PopoverPos) =>
+  a.top === b.top && a.bottom === b.bottom && a.left === b.left && a.width === b.width
+  && a.minWidth === b.minWidth && a.maxHeight === b.maxHeight;
+
 /**
  * A floating panel anchored to a trigger, portaled to <body> so no card,
  * table wrapper or modal can clip it, and repositioned on any scroll. It opens
@@ -363,45 +368,61 @@ export function Popover({
   placement?: 'bottom' | 'right';
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<{ top?: number; bottom?: number; left: number; minWidth?: number; maxHeight: number } | null>(null);
+  const [pos, setPos] = useState<PopoverPos | null>(null);
 
   const place = useCallback(() => {
     const a = anchorRef.current;
     const p = panelRef.current;
     if (!a || !p) return;
     const r = a.getBoundingClientRect();
-    const pw = p.offsetWidth;
+    // A dropdown is exactly as wide as its trigger, as in v2 (the search
+    // results spanned the search box, a picker its field). As a minimum width
+    // only, it grew with whatever arrived — 654 px of search results under a
+    // 400 px box — and ran off a 390 px screen.
+    const width = matchAnchorWidth ? Math.min(Math.max(r.width, minWidth ?? 0), window.innerWidth - 16) : undefined;
+    const pw = width ?? p.offsetWidth;
     const ph = p.offsetHeight;
+    let next: PopoverPos;
     if (placement === 'right') {
       const maxHeight = window.innerHeight - 16;
-      setPos({
+      next = {
         top: Math.max(8, Math.min(r.top - 4, window.innerHeight - Math.min(ph, maxHeight) - 8)),
         left: Math.max(8, Math.min(r.right + offset, window.innerWidth - pw - 8)),
         minWidth,
         maxHeight,
-      });
-      return;
+      };
+    } else {
+      const below = window.innerHeight - r.bottom - offset - 8;
+      const aboveSpace = r.top - offset - 8;
+      const up = ph > below && aboveSpace > below;
+      let left = align === 'end' ? r.right - pw : r.left;
+      left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
+      next = {
+        top: up ? undefined : r.bottom + offset,
+        bottom: up ? window.innerHeight - r.top + offset : undefined,
+        left,
+        width,
+        minWidth: matchAnchorWidth ? undefined : minWidth,
+        maxHeight: Math.max(160, up ? aboveSpace : below),
+      };
     }
-    const below = window.innerHeight - r.bottom - offset - 8;
-    const aboveSpace = r.top - offset - 8;
-    const up = ph > below && aboveSpace > below;
-    let left = align === 'end' ? r.right - pw : r.left;
-    left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
-    setPos({
-      top: up ? undefined : r.bottom + offset,
-      bottom: up ? window.innerHeight - r.top + offset : undefined,
-      left,
-      minWidth: matchAnchorWidth ? Math.max(r.width, minWidth ?? 0) : minWidth,
-      maxHeight: Math.max(160, up ? aboveSpace : below),
-    });
+    setPos((prev) => (prev && samePos(prev, next) ? prev : next));
   }, [anchorRef, align, offset, minWidth, matchAnchorWidth, placement]);
 
   useLayoutEffect(() => {
     if (!open) { setPos(null); return; }
     place();
+    // Content that arrives after opening (search results, a server-side
+    // picker, a menu that grows) changes the panel's size: place it again so
+    // it stays on screen. In the next frame, so a resize never re-enters.
+    let frame = 0;
+    const ro = new ResizeObserver(() => { cancelAnimationFrame(frame); frame = requestAnimationFrame(place); });
+    if (panelRef.current) ro.observe(panelRef.current);
     window.addEventListener('scroll', place, true);
     window.addEventListener('resize', place);
     return () => {
+      cancelAnimationFrame(frame);
+      ro.disconnect();
       window.removeEventListener('scroll', place, true);
       window.removeEventListener('resize', place);
     };
@@ -442,6 +463,7 @@ export function Popover({
         top: pos ? pos.top : -9999,
         bottom: pos?.bottom,
         left: pos?.left ?? -9999,
+        width: pos?.width,
         minWidth: pos?.minWidth,
         maxHeight: pos?.maxHeight,
         overflowY: 'auto',
