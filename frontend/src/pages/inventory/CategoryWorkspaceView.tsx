@@ -85,7 +85,6 @@ interface CategoryTxnRow {
   created_at: string;
 }
 
-
 interface QuarantineRow {
   id: number;
   category: string;
