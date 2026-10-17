@@ -747,8 +747,8 @@ async function reconcileCategory(
  * 1,736.75. When no sheet counts the code in the item's unit, the item is left as
  * it is. An item with no Item Master unit follows its sheets when they all count the
  * code in one unit, as a single listing does (countsTowardsStock). Both cases are
- * reported (purchaseStock.unitMismatches, and the sheet row's
- * recon note). Each change is ledgered as SHEET_SYNC (difference from the current
+ * reported (purchaseStock.unitMismatches, and the sheet row's recon note).
+ * Each change is ledgered as SHEET_SYNC (difference from the current
  * figure), so the stock ledger explains it. A negative sheet total is held at zero
  * (the Purchase stock cannot be negative) and reported.
  */
