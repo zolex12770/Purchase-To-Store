@@ -16,8 +16,11 @@
  *   5. The GRN list's QC tiles count the codes GRNs store.
  *   6. The label PDF does not count a print, POST /grn/labels/print does, and a
  *      PDF's file name carries no slash or quote.
+ *   7. A save that another user's cancel or post overtook is refused: an edit
+ *      of a GRN cancelled meanwhile moves no stock and raises no inspection on
+ *      it, and a draft posted meanwhile keeps the lines it was posted with.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import request from 'supertest';
 import type { Express } from 'express';
 
@@ -522,5 +525,102 @@ describe('label printing and PDF file names', () => {
     const grnPdf = await request(app).get(api(`/grn/${grn.id}/pdf`)).set(auth(adminToken));
     expect(grnPdf.status).toBe(200);
     expect(grnPdf.headers['content-disposition']).toBe('attachment; filename="GRN-Q-1.pdf"');
+  });
+});
+
+/* ── 7. An edit overtaken by another user's post or cancel ─────────────────── */
+
+/** Waits, up to five seconds, for `done` to come true. */
+async function until(done: () => boolean): Promise<void> {
+  for (let i = 0; i < 500 && !done(); i += 1) await new Promise((r) => setTimeout(r, 10));
+  expect(done()).toBe(true);
+}
+
+/**
+ * Sends `edit`, then `other`, while a transaction holds the database the way an
+ * inventory sheet sync does, and lets go once both are waiting: the edit on the
+ * status it reads before its transaction, the other on its transaction. PGlite
+ * serves them in that order (db/driver.ts), so the other request commits
+ * between the edit's status read and the edit's own transaction.
+ */
+async function overtaken(edit: () => request.Test, other: () => request.Test): Promise<[request.Response, request.Response]> {
+  const { getDatabase, withTransaction } = await import('../db/index.js');
+  const { invalidateAuthState } = await import('../auth/middleware.js');
+  // The admin's rights are loaded afresh, so neither request asks the database
+  // anything before its route does.
+  invalidateAuthState();
+  expect((await request(app).get(api('/grn?pageSize=1')).set(auth(adminToken))).status).toBe(200);
+
+  const db = await getDatabase();
+  let release: (() => void) | undefined;
+  const held = withTransaction(() => new Promise<void>((r) => { release = r; }));
+  await until(() => release !== undefined);
+  const queries = vi.spyOn(db, 'query');
+  const transactions = vi.spyOn(db, 'transaction');
+  try {
+    const first = edit().then((r) => r);
+    await until(() => queries.mock.calls.length > 0);
+    const second = other().then((r) => r);
+    await until(() => transactions.mock.calls.length > 0);
+    release!();
+    return await Promise.all([first, second]);
+  } finally {
+    release?.();
+    await held;
+    queries.mockRestore();
+    transactions.mockRestore();
+  }
+}
+
+describe('an edit overtaken by another user', () => {
+  it('of a posted GRN cancelled meanwhile is refused, and moves no stock and raises no inspection', async () => {
+    const plain = await mkItem('TGRNQC-M1', false);
+    const qcItem = await mkItem('TGRNQC-M2', true);
+    const grn = await receive([{ itemId: plain, qty: '5' }]);
+    const [line] = await linesOf(grn.id);
+    expect(await stockOf(plain)).toBe(5);
+
+    const [edit, cancelled] = await overtaken(
+      () => editLines(grn.id, [
+        { id: line!.id, itemId: plain, grnQty: '7', rate: '10' },
+        { itemId: qcItem, grnQty: '3', rate: '10' },
+      ]),
+      () => cancel(grn.id),
+    );
+    expect(cancelled.status).toBe(200);
+    // Found in review on 2026-10-17: the edit went through on the cancelled GRN,
+    // leaving 2 of TGRNQC-M1 in stock that never arrived and a PENDING_QC
+    // inspection that no QC decision could close.
+    expect(edit.status).toBe(422);
+    expect(edit.body.error.message).toBe(`GRN ${grn.grnNo} has just been cancelled by someone else — reload it before saving.`);
+
+    expect(await grnOf(grn.id)).toEqual({ status: 'CANCELLED', qc_status: 'NOT_APPLICABLE' });
+    expect(await stockOf(plain)).toBe(0);
+    expect(await stockOf(qcItem)).toBe(0);
+    expect(await grnLedger(grn.id)).toEqual([[plain, 'GRN_INWARD', 5], [plain, 'GRN_REVERSAL', -5]]);
+    expect(await inspectionsOf(grn.id)).toEqual([]);
+    expect((await linesOf(grn.id)).map((l) => [Number(l.item_id), Number(l.grn_qty)])).toEqual([[plain, 5]]);
+  });
+
+  it('of a draft posted meanwhile is refused, and leaves the posted GRN as it was posted', async () => {
+    const qcItem = await mkItem('TGRNQC-M3', true);
+    const draft = await receive([{ itemId: qcItem, qty: '4' }], { post: false });
+
+    const [edit, posted] = await overtaken(
+      () => request(app).put(api(`/grn/${draft.id}`)).set(auth(adminToken))
+        .send({ mode: 'DIRECT', supplierId, post: true, lines: [{ itemId: qcItem, grnQty: '6', rate: '10' }] }),
+      () => request(app).post(api(`/grn/${draft.id}/post`)).set(auth(adminToken)).send({}),
+    );
+    expect(posted.status).toBe(200);
+    // Refused in words before it touches the lines the post has just received;
+    // without the check it got as far as deleting them and stopped on a
+    // foreign key, as a bare conflict.
+    expect(edit.status).toBe(422);
+    expect(edit.body.error.message).toBe(`GRN ${draft.grnNo} has just been posted by someone else — reload it before saving.`);
+
+    expect(await grnOf(draft.id)).toEqual({ status: 'POSTED', qc_status: 'PENDING_QC' });
+    expect((await linesOf(draft.id)).map((l) => Number(l.grn_qty))).toEqual([4]);
+    expect((await inspectionsOf(draft.id)).map((i) => [i.status, Number(i.received_qty)])).toEqual([['PENDING_QC', 4]]);
+    expect(await stockOf(qcItem)).toBe(0);
   });
 });

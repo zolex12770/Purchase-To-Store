@@ -1070,6 +1070,32 @@ router.post(
 );
 
 /**
+ * Locks the GRN's header and refuses the save unless the GRN is still in the
+ * status PUT /grn/:id chose its path by. That status is read before the
+ * transaction, and while a long transaction (an inventory sheet sync) holds
+ * the database, waiting requests take turns, so another user's post or cancel
+ * can commit in between. A second Post of the same draft would rewrite the
+ * lines of the GRN the first had just posted; an edit of a GRN cancelled
+ * meanwhile put stock that never arrived on it and raised a quality inspection
+ * no decision could close (review of 2026-10-17).
+ */
+async function lockGrnInStatus(
+  tx: Queryable, id: number, grnNo: string, expected: GrnStatus,
+): Promise<{ supplier_id: number; grn_date: string }> {
+  const locked = await txQueryOne<{ status: GrnStatus; supplier_id: number; grn_date: string }>(
+    tx, 'SELECT status, supplier_id, grn_date FROM grn_headers WHERE id = $1 FOR UPDATE', [id],
+  );
+  if (!locked) throw NotFoundError('GRN');
+  if (locked.status !== expected) {
+    throw BusinessRuleError(
+      `GRN ${grnNo} has just been ${statusLabel(locked.status).toLowerCase()} by someone else — reload it before saving.`,
+      { status: locked.status },
+    );
+  }
+  return locked;
+}
+
+/**
  * PUT /grn/:id for an already-POSTED GRN (Section 4). Header fields (invoice/
  * challan/vehicle/transporter/driver/LR/dates/remarks/received-by) never
  * touch stock or an MLN, so they stay editable unconditionally. Lines are
@@ -1093,10 +1119,8 @@ async function updatePostedGrn(
   body: GrnBody, userId: number,
 ): Promise<void> {
   await withTransaction(async (tx) => {
-    const header = await txQueryOne<{ supplier_id: number; grn_date: string }>(
-      tx, 'SELECT supplier_id, grn_date FROM grn_headers WHERE id = $1 FOR UPDATE', [id],
-    );
-    const supplierId = header!.supplier_id;
+    const header = await lockGrnInStatus(tx, id, before.grn_no, 'POSTED');
+    const supplierId = header.supplier_id;
 
     const existingLines = await txQuery<{
       id: number; line_no: number; po_line_id: number | null; item_id: number; item_code: string;
@@ -1158,7 +1182,7 @@ async function updatePostedGrn(
     }
 
     const maxLineNo = existingLines.reduce((m, l) => Math.max(m, l.line_no), 0);
-    const grnDate = body.grnDate ?? toDateOnly(header!.grn_date);
+    const grnDate = body.grnDate ?? toDateOnly(header.grn_date);
 
     for (const line of submittedExisting) {
       const existing = byId.get(line.id!);
@@ -1344,6 +1368,8 @@ router.put(
     const body = req.body as GrnBody;
     const userId = req.user!.id;
 
+    // This status only picks the path: each path reads it again under the row
+    // lock (lockGrnInStatus) before it writes anything.
     const before = await queryOne<{ grn_no: string; status: GrnStatus; po_id: number | null }>(
       'SELECT grn_no, status, po_id FROM grn_headers WHERE id = $1', [id],
     );
@@ -1367,17 +1393,7 @@ router.put(
     }
 
     await withTransaction(async (tx) => {
-      const locked = await txQueryOne<{ status: GrnStatus }>(
-        tx, 'SELECT status FROM grn_headers WHERE id = $1 FOR UPDATE', [id],
-      );
-      // Read again under the lock: a second Post of the same draft must not
-      // rewrite the lines of the GRN the first one has just posted.
-      if (!locked) throw NotFoundError('GRN');
-      if (locked.status !== 'DRAFT') {
-        throw BusinessRuleError(
-          `GRN ${before.grn_no} has just been ${statusLabel(locked.status).toLowerCase()} by someone else — reload it before saving.`,
-        );
-      }
+      await lockGrnInStatus(tx, id, before.grn_no, 'DRAFT');
       await tx.query('DELETE FROM grn_lines WHERE grn_id = $1', [id]);
 
       // A DRAFT contributes nothing to any PO balance, so prior quantities are
