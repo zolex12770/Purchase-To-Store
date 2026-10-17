@@ -451,7 +451,7 @@ router.get(
            JOIN requisition_issues ri ON ri.id = ril.requisition_issue_id
            JOIN requisition_headers rh ON rh.id = ri.requisition_id
            LEFT JOIN users su ON su.id = ri.store_user_id
-          WHERE ril.item_id = $1
+          WHERE ril.item_id = $1 AND ri.status = 'POSTED'   -- a reversed slip issued nothing; the ledger keeps both entries
           ORDER BY ri.issue_date DESC, ril.id DESC
           LIMIT $2`,
         [id, historyLimit],

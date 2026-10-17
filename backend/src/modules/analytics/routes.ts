@@ -273,10 +273,11 @@ router.get(
        ${rb.where()}`,
       rb.params,
     );
+    // A reversed slip handed nothing out in the end, so it is not an issue transaction.
     const [requisitionIssues] = await query<{ n: string }>(
       `SELECT COUNT(*)::int AS n FROM requisition_issues i
          JOIN requisition_headers h ON h.id = i.requisition_id
-        WHERE h.status <> 'CANCELLED'
+        WHERE h.status <> 'CANCELLED' AND i.status = 'POSTED'
           ${f.dateFrom ? "AND i.issue_date >= $1" : ''}
           ${f.dateTo ? `AND i.issue_date <= $${f.dateFrom ? 2 : 1}` : ''}`,
       [f.dateFrom, f.dateTo].filter((v) => v !== undefined) as unknown[],

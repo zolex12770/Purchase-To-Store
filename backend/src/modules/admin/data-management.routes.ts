@@ -15,8 +15,12 @@ import { z } from 'zod';
 import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
 import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
-import { requireAnyPermission, invalidateAuthState } from '../../auth/middleware.js';
+import { requireAnyPermission, requireSuperAdmin, invalidateAuthState } from '../../auth/middleware.js';
 import { auditIn, actorFrom } from '../../core/audit.js';
+import { dateStamp } from '../../domain/numbering.js';
+import {
+  VOID_DOCUMENT_TYPES, planTestDocumentVoid, applyTestDocumentVoid, type VoidPlan,
+} from './void-test-documents.js';
 
 const router = Router();
 
@@ -758,19 +762,55 @@ async function inspectDependencies(entity: string, id: number): Promise<{
       blockingReasons.push(`Purchase Order is referenced by ${grnRefs?.n} GRN(s). Cannot hard-delete.`);
     }
   } else if (entity === 'grn') {
+    // stock_ledger has no grn_id column — the old query failed with HTTP 500 for
+    // every GRN (staging, GRN 12379). A GRN's entries carry reference_type 'GRN'
+    // with its id, and each line's entries its grn_line_id.
     const stockRefs = await queryOne<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM stock_ledger WHERE grn_id = $1 OR (reference_id = $1 AND reference_type IN ('GRN', 'GRN_INWARD', 'GRN_REVERSAL'))`,
+      `SELECT COUNT(*) AS n FROM stock_ledger
+        WHERE (reference_type = 'GRN' AND reference_id = $1)
+           OR grn_line_id IN (SELECT id FROM grn_lines WHERE grn_id = $1)`,
       [id],
     );
     dependencies.push({ table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockRefs?.n ?? 0) });
     if (Number(stockRefs?.n ?? 0) > 0) {
-      blockingReasons.push(`GRN has ${stockRefs?.n} stock movements in the ledger. Cannot hard-delete posted inventory.`);
+      blockingReasons.push(`GRN has ${stockRefs?.n} stock movements in the ledger. Cannot hard-delete posted inventory — cancel it instead.`);
     }
   } else if (entity === 'requisitions') {
-    const issueRefs = await queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_issues WHERE requisition_id = $1', [id]);
-    dependencies.push({ table: 'requisition_issues', label: 'Material Issue Slips', count: Number(issueRefs?.n ?? 0) });
+    const [issueRefs, stockRefs] = await Promise.all([
+      queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_issues WHERE requisition_id = $1', [id]),
+      // API issues are ledgered against the requisition; imported ones against the slip number.
+      queryOne<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM stock_ledger
+          WHERE txn_type IN ('REQUISITION_ISSUE', 'REQUISITION_REVERSAL')
+            AND ((reference_type = 'REQUISITION' AND reference_id = $1)
+                 OR reference_no IN (SELECT issue_slip_no FROM requisition_issues WHERE requisition_id = $1))`,
+        [id],
+      ),
+    ]);
+    dependencies.push(
+      { table: 'requisition_issues', label: 'Material Issue Slips', count: Number(issueRefs?.n ?? 0) },
+      { table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockRefs?.n ?? 0) },
+    );
     if (Number(issueRefs?.n ?? 0) > 0) {
       blockingReasons.push(`Requisition has ${issueRefs?.n} issued material slip(s). Cannot hard-delete.`);
+    }
+    if (Number(stockRefs?.n ?? 0) > 0) {
+      blockingReasons.push(`Requisition has ${stockRefs?.n} stock movement(s) in the ledger. Cannot hard-delete posted inventory.`);
+    }
+  } else if (entity === 'direct_issues') {
+    // Had no branch at all, so DIR-20261014-0002 (production) showed canHardDelete:
+    // deleting it returns no stock and leaves its ledger entry pointing at nothing.
+    const stockRefs = await queryOne<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM stock_ledger
+        WHERE reference_type = 'DIRECT_ISSUE' AND reference_id = $1
+          AND txn_type IN ('DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL')`,
+      [id],
+    );
+    dependencies.push({ table: 'stock_ledger', label: 'Stock Movements posted', count: Number(stockRefs?.n ?? 0) });
+    if (Number(stockRefs?.n ?? 0) > 0) {
+      blockingReasons.push(
+        `Direct issue has ${stockRefs?.n} stock movement(s) in the ledger. Cannot hard-delete posted inventory — cancel it instead, which returns the stock.`,
+      );
     }
   }
 
@@ -1289,6 +1329,117 @@ router.post(
       return { statusChanged };
     });
     sendOk(res, { dryRun: false, ...summary, poStatusesRederived: result.statusChanged, message: `Run #${jobId} reverted.` });
+  }),
+);
+
+/* ── Repair: ledger-only void of test stock documents ─────────────────────────
+   For TEST documents whose stock effect live stock already excludes: the
+   2026-10-14 E2E chain on item 1161480001 (GRN-20261014-0001 +20,
+   ISS-20261014-0001 -5, DIR-20261014-0002 -1), whose +14 the old inventory sync
+   took out of live stock (now 3, its sheet figure) but not out of the ledger (17).
+   The normal cancel / reversal would remove it a second time. Each document is
+   marked CANCELLED (GRN, direct issue) or REVERSED (issue slip) with the reason and
+   gets its reversal ledger rows carrying the running LEDGER balance;
+   items.live_stock_qty is never changed and nothing is deleted. It is refused unless,
+   for every affected item, ledger sum + the void equals live stock (to 0.0001): it
+   can only remove what the sheet reset already removed. Super Admin only. dryRun
+   (the default) shows the figures and a selectionHash; applying needs the typed
+   confirmation and that hash, and re-plans inside the transaction that writes. */
+
+const voidTestDocumentsSchema = z.object({
+  documents: z.array(z.object({
+    type: z.enum(VOID_DOCUMENT_TYPES),
+    number: z.string().trim().min(1, 'Give the document number.').max(60),
+  })).min(1, 'Name at least one document.').max(50),
+  reason: z.string().trim().min(5, 'Give the reason (at least 5 characters).').max(500),
+  dryRun: z.boolean().default(true),
+  confirm: z.string().optional(),
+  expectedHash: z.string().trim().regex(/^[0-9a-f]{64}$/, 'expectedHash is the selectionHash a dry run returned.').optional(),
+});
+
+function presentVoidPlan(plan: VoidPlan) {
+  // Each document line also carries its item's live stock, so a document reads on its own.
+  const liveOf = new Map(plan.items.map((i) => [i.itemId, i.liveStock]));
+  return {
+    selectionHash: plan.selectionHash,
+    canApply: plan.canApply,
+    closesExactly: plan.closesExactly,
+    blockers: plan.blockers,
+    documents: plan.documents.map((d) => ({
+      type: d.type, number: d.number, id: d.id, status: d.status, becomes: d.becomes, requisitionNo: d.requisitionNo,
+      lines: d.lines.map((l) => ({
+        itemId: l.itemId, itemCode: l.itemCode, qty: l.qty, txnType: l.txnType,
+        inwardQty: l.inwardQty, outwardQty: l.outwardQty,
+        ledgerBalanceBefore: l.balanceBeforeQty, ledgerBalanceAfter: l.balanceQty,
+        liveStock: liveOf.get(l.itemId) ?? null,
+      })),
+      ledger: d.ledger,
+      blockers: d.blockers,
+    })),
+    items: plan.items,
+  };
+}
+
+const itemFigures = (plan: VoidPlan) => plan.items
+  .map((i) => `${i.itemCode}: ledger ${i.ledgerSum} + void ${i.voidNet} = ${i.resultingLedgerSum}, live ${i.liveStock}`)
+  .join('; ');
+
+router.post(
+  '/repair/void-test-documents',
+  requireSuperAdmin(),
+  validateBody(voidTestDocumentsSchema),
+  asyncHandler(async (req, res) => {
+    const { documents, reason, dryRun, confirm, expectedHash } = req.body as z.infer<typeof voidTestDocumentsSchema>;
+    if (dryRun) {
+      // One read-only transaction, so every figure comes from the same moment.
+      const plan = await withTransaction((tx) => planTestDocumentVoid(tx, documents, { lock: false }));
+      sendOk(res, {
+        dryRun: true,
+        ...presentVoidPlan(plan),
+        message: plan.canApply
+          ? `${plan.documents.length} document(s) can be voided; the ledger would then equal live stock for every item (${itemFigures(plan)}). Nothing was changed.`
+          : `These documents cannot be voided as they stand${plan.blockers.length ? `: ${plan.blockers.join(' ')}` : ''}`
+            + `${plan.closesExactly ? '' : ` The ledger would not equal live stock (${itemFigures(plan)}).`} Nothing was changed.`,
+      });
+      return;
+    }
+    if (confirm !== 'VOID TEST DOCUMENTS') {
+      throw ValidationError('Type "VOID TEST DOCUMENTS" to confirm. Take a backup first.');
+    }
+    if (!expectedHash) {
+      throw ValidationError('Run the dry run first and pass its selectionHash as expectedHash.');
+    }
+    const result = await withTransaction(async (tx) => {
+      // Re-plan under lock: what is written is exactly what is checked here.
+      const plan = await planTestDocumentVoid(tx, documents, { lock: true });
+      if (plan.blockers.length > 0) {
+        throw ConflictError(`Nothing was voided: ${plan.blockers.join(' ')}`, { blockers: plan.blockers, selectionHash: plan.selectionHash });
+      }
+      if (plan.selectionHash !== expectedHash) {
+        throw ConflictError(
+          'The documents or their stock figures have changed since the dry run. Nothing was voided; run the dry run again and review it.',
+          { selectionHash: plan.selectionHash },
+        );
+      }
+      if (!plan.closesExactly) {
+        throw ConflictError(
+          `Nothing was voided: the ledger would not equal live stock afterwards (${itemFigures(plan)}). `
+          + 'This repair only removes what the sheet already removed from live stock; reverse documents whose stock is still live through their own cancel or reversal.',
+          { items: plan.items },
+        );
+      }
+      const applied = await applyTestDocumentVoid(tx, plan, {
+        reason, userId: req.user!.id, actor: actorFrom(req), date: dateStamp(new Date()),
+      });
+      return { plan, applied };
+    });
+    sendOk(res, {
+      dryRun: false,
+      voided: result.plan.documents.length,
+      ...presentVoidPlan(result.plan),
+      ...result.applied,
+      message: `${result.plan.documents.length} test document(s) voided; the ledger now equals live stock (${itemFigures(result.plan)}). Live stock was not changed.`,
+    });
   }),
 );
 

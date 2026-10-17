@@ -463,6 +463,7 @@ export async function publishDestinationSheet(targetTab?: string) {
           FROM requisition_issue_lines ril
           JOIN requisition_issues ri ON ri.id = ril.requisition_issue_id
          WHERE ril.requisition_line_id = rl.id
+           AND ri.status = 'POSTED'   -- a reversed slip returned its stock (migration 027)
       ) iss ON TRUE
      ORDER BY rl.id ASC
   `);

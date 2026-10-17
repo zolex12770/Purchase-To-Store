@@ -36,6 +36,7 @@ export const REQUISITION: BusinessView = {
            FROM requisition_issue_lines ril
            JOIN requisition_issues      ri ON ri.id = ril.requisition_issue_id
           WHERE ril.requisition_line_id = b.requisition_line_id
+            AND ri.status = 'POSTED'   -- matches Issued Qty, which ignores reversed slips
        ) iss ON TRUE`,
   orderBy: 'b.requisition_line_id',
   primaryKey: ['Requisition ID', 'Requisition Line ID'],
