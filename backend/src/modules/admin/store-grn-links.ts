@@ -23,7 +23,9 @@
  *   · the PO is dated no more than 30 days after the receipt;
  *   · the PO line has then received no more than it ordered (+0.0001), counting at
  *     once every receipt the tab assigns to it, so the result never depends on which
- *     receipt happens to be counted first;
+ *     receipt happens to be counted first. A receipt the reviewer keeps out, or one
+ *     held by an earlier check, is not counted: that is how a reviewer who finds the
+ *     wrong receipt on an over-received line lets the others through;
  *   · every other unlinked line of its GRN is linked too. GET /grn/:id calls a GRN
  *     with any linked line a PO GRN, and PUT /grn/:id then wants a PO line on every
  *     line, so a GRN linked in part could no longer be saved from the GRN screen.
@@ -70,7 +72,7 @@ const DAY_MS = 86_400_000;
 /** Reads one tab of the business sheet: the sync engine's readSheet, or a test's grid. */
 export type SheetReader = (sheetName: string) => Promise<string[][]>;
 
-/** In the order the checks run; a line is held by the first one it fails. */
+/** A held line carries the first of these checks it fails; GRN_PARTLY_HELD comes last, over whole GRNs. */
 export const HOLD_REASONS = {
   EXCLUDED: 'The reviewer kept it out of this run (excludeGrnLineIds).',
   NOT_ON_TAB: 'Its GRN number and item are not on the GRN tab.',
