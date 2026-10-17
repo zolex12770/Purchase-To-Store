@@ -68,10 +68,15 @@ const focusablesIn = (root: HTMLElement): HTMLElement[] =>
   Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE))
     .filter((el) => el.getClientRects().length > 0 && !el.closest('[aria-hidden="true"]'));
 
+/** The Tab stops: focusable and not taken out of the order (a roving radio, a listbox option). */
+const tabbablesIn = (root: HTMLElement): HTMLElement[] => focusablesIn(root).filter((el) => el.tabIndex >= 0);
+
 const traps: HTMLElement[] = [];
 
 function onTrapKeyDown(e: KeyboardEvent) {
-  if (e.key !== 'Tab' || traps.length === 0) return;
+  // A Tab already handled inside (a dropdown leaving its panel for the next
+  // field) has put focus where it belongs; moving it again would skip a field.
+  if (e.key !== 'Tab' || traps.length === 0 || e.defaultPrevented) return;
   const root = traps[traps.length - 1]!;
   const active = document.activeElement as HTMLElement | null;
   // Focus inside a dropdown portaled out of the dialog is that dropdown's business.
@@ -228,15 +233,24 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
 export const IconButton = forwardRef<HTMLButtonElement, Omit<ButtonProps, 'children' | 'icon' | 'iconRight'> & {
   label: string;
   icon: ReactNode;
-  /** Tooltip text; defaults to `label`. `false` for none (e.g. a dialog's close button). */
+  /**
+   * Tooltip text; defaults to `label`. `false` for none, for good (a dialog's
+   * close button) or for now (while the button's own popover is open).
+   */
   tooltip?: ReactNode | false;
 }>(function IconButton({ label, icon, tooltip, variant = 'ghost', size = 'sm', ...rest }, ref) {
-  const button = (
-    <Button ref={ref} variant={variant} size={size} aria-label={label} {...rest}>
-      {icon}
-    </Button>
+  // Always inside the Tooltip, even with none to show. Returning the bare
+  // button for `false` changed the root element whenever the bell or a ⋯ menu
+  // opened or closed, so React remounted the focused button: focus fell to
+  // <body>, Escape focused a node about to go, and a dialog opened from the
+  // menu had no trigger to return to (review 2026-10-17).
+  return (
+    <Tooltip content={tooltip === false ? null : (tooltip ?? label)}>
+      <Button ref={ref} variant={variant} size={size} aria-label={label} {...rest}>
+        {icon}
+      </Button>
+    </Tooltip>
   );
-  return tooltip === false ? button : <Tooltip content={tooltip ?? label}>{button}</Tooltip>;
 });
 
 /* ═══════════════════════════ TOOLTIP ══════════════════════════════════ */
@@ -250,17 +264,18 @@ function isFocusVisible(el: HTMLElement): boolean {
  * Hover and keyboard-focus tooltip (spec §3.15): inverse surface, 400 ms
  * delay on hover, immediate on focus, dismissed by Escape. Replaces multi-line
  * native `title=` tooltips, which keyboard users never see.
+ *
+ * The trigger is wrapped the same way whatever `content` and `disabled` say,
+ * so switching the tooltip off never remounts the trigger (IconButton).
  */
 export function Tooltip({
   content, children, placement = 'top', delay = 400, block, disabled = false,
 }: {
+  /** Empty (null, '' or false) shows nothing, like `disabled`. */
   content: ReactNode; children: ReactElement; placement?: 'top' | 'bottom'; delay?: number;
   /** Anchor fills its container (a tooltip over a whole card in a grid cell). */
   block?: boolean;
-  /**
-   * Shows nothing for now (say, while the trigger's own menu is open) but keeps
-   * the same wrapper, so the trigger is not remounted and keeps its focus.
-   */
+  /** Shows nothing for now (say, while the trigger's own menu is open). */
   disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
@@ -269,9 +284,10 @@ export function Tooltip({
   const bubbleRef = useRef<HTMLDivElement>(null);
   const timer = useRef<number | undefined>(undefined);
   const id = useId();
+  const off = disabled || content === null || content === undefined || content === '' || content === false;
 
   const show = (immediate: boolean) => {
-    if (disabled) return;
+    if (off) return;
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => setOpen(true), immediate ? 0 : delay);
   };
@@ -281,10 +297,10 @@ export function Tooltip({
   };
   useEffect(() => () => window.clearTimeout(timer.current), []);
   useEffect(() => {
-    if (!disabled) return;
+    if (!off) return;
     window.clearTimeout(timer.current);
     setOpen(false);
-  }, [disabled]);
+  }, [off]);
 
   useLayoutEffect(() => {
     if (!open) { setPos(null); return; }
@@ -300,10 +316,9 @@ export function Tooltip({
     setPos({ left, top });
   }, [open, placement, content]);
 
-  if (content === null || content === undefined || content === '') return children;
-
+  const shown = open && !off;
   const trigger = cloneElement(children as ReactElement<{ 'aria-describedby'?: string }>, {
-    'aria-describedby': open ? id : (children.props as { 'aria-describedby'?: string })['aria-describedby'],
+    'aria-describedby': shown ? id : (children.props as { 'aria-describedby'?: string })['aria-describedby'],
   });
 
   return (
@@ -318,7 +333,7 @@ export function Tooltip({
       onKeyDown={(e) => { if (e.key === 'Escape') hide(); }}
     >
       {trigger}
-      {open && createPortal(
+      {shown && createPortal(
         <div
           ref={bubbleRef}
           id={id}
@@ -342,9 +357,51 @@ const samePos = (a: PopoverPos, b: PopoverPos) =>
   && a.minWidth === b.minWidth && a.maxHeight === b.maxHeight;
 
 /**
+ * Where Tab goes from inside a popover panel. `before` and `after` count the
+ * panel's Tab stops ahead of and behind the focus; in a menu, the whole menu
+ * is one stop (arrow keys move inside it, Tab leaves it: WAI-ARIA menu
+ * button). Returns the index of the panel stop to focus, 'native' for the
+ * browser's own move (which also steps through the parts of a date field),
+ * or 'leave' when Tab leaves the panel.
+ */
+export function panelTabStep(
+  { count, before, after, inMenu }: { count: number; before: number; after: number; inMenu: boolean },
+  backward: boolean,
+): number | 'native' | 'leave' {
+  if (backward ? before === 0 : after === 0) return 'leave';
+  if (!inMenu) return 'native';
+  return backward ? before - 1 : count - after;
+}
+
+const follows = (a: Node, b: Node) => Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+/** The trigger, or the last stop inside it when it is a container (the search box). */
+const triggerStop = (anchor: HTMLElement): HTMLElement =>
+  (anchor.matches(FOCUSABLE) ? anchor : tabbablesIn(anchor).pop() ?? anchor);
+
+/**
+ * The Tab stop after the trigger: in the dialog it sits in, if any (a picker
+ * in a form moves on to the next field, wrapping as the dialog's trap does),
+ * else in the page.
+ */
+function stopAfter(anchor: HTMLElement, panel: HTMLElement): HTMLElement {
+  const dialog = [...traps].reverse().find((t) => t.contains(anchor));
+  const stops = tabbablesIn(dialog ?? document.body).filter((el) => !panel.contains(el));
+  return stops.find((el) => !anchor.contains(el) && follows(anchor, el)) ?? (dialog ? stops[0] : undefined) ?? anchor;
+}
+
+/**
  * A floating panel anchored to a trigger, portaled to <body> so no card,
  * table wrapper or modal can clip it, and repositioned on any scroll. It opens
  * below the trigger, or beside it (`placement="right"`, the sidebar rail).
+ *
+ * For the keyboard it sits right after its trigger. As the last thing in
+ * <body>, its content came after the whole page in the browser's own order
+ * (the bell's items 17 Tabs on, Columns 40, Date range 46) and Tab out of a
+ * menu landed on the skip link at the top (review 2026-10-17). So: Tab on the
+ * trigger enters the open panel; Shift+Tab out of it closes it and returns to
+ * the trigger; Tab past its end closes it and moves on to whatever follows
+ * the trigger.
  */
 export function Popover({
   anchorRef, open, onClose, children, align = 'start', offset = 6, minWidth, matchAnchorWidth,
@@ -444,6 +501,48 @@ export function Popover({
     if (restoreFocus) anchorRef.current?.focus();
   });
 
+  // Tab on the trigger itself (not on a field inside a container trigger,
+  // like the search box) enters the open panel.
+  useEffect(() => {
+    const anchor = anchorRef.current;
+    if (!open || !anchor) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab' || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.defaultPrevented || e.target !== anchor) return;
+      const first = panelRef.current ? tabbablesIn(panelRef.current)[0] : undefined;
+      if (!first) return;
+      e.preventDefault();
+      first.focus();
+    };
+    anchor.addEventListener('keydown', onKey);
+    return () => anchor.removeEventListener('keydown', onKey);
+  }, [open, anchorRef]);
+
+  const onPanelKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'Tab' || e.altKey || e.ctrlKey || e.metaKey || e.defaultPrevented) return;
+    const panel = panelRef.current;
+    const anchor = anchorRef.current;
+    const focus = e.target as HTMLElement;
+    // React bubbles events out of a nested portal too; only this panel's own.
+    if (!panel || !anchor || !panel.contains(focus)) return;
+    const menu = focus.closest<HTMLElement>('[role="menu"]');
+    const inMenu = Boolean(menu && panel.contains(menu));
+    const unit = inMenu ? menu! : focus;
+    const stops = tabbablesIn(panel);
+    const step = panelTabStep({
+      count: stops.length,
+      before: stops.filter((s) => !unit.contains(s) && follows(s, unit)).length,
+      after: stops.filter((s) => s !== unit && !(inMenu && unit.contains(s)) && follows(unit, s)).length,
+      inMenu,
+    }, e.shiftKey);
+    if (step === 'native') return;
+    e.preventDefault();
+    if (step !== 'leave') { stops[step]?.focus(); return; }
+    // Found before closing: the panel and its stops are still on screen.
+    const next = e.shiftKey ? triggerStop(anchor) : stopAfter(anchor, panel);
+    onClose();
+    next.focus();
+  };
+
   if (!open) return null;
   // The first pass is measured off-screen, but VISIBLE: React applies a
   // field's autoFocus during that commit, and a visibility:hidden panel cannot
@@ -457,6 +556,7 @@ export function Popover({
       role={role}
       id={id}
       aria-label={label}
+      onKeyDown={onPanelKeyDown}
       style={{
         position: 'fixed',
         zIndex: 'var(--z-popover)' as unknown as number,
@@ -596,7 +696,7 @@ export function OverflowMenu({
           role="menu"
           aria-label={typeof triggerLabel === 'string' ? triggerLabel : label}
           className="menu-list"
-          onKeyDown={(e) => { menuKeyNav(e); if (e.key === 'Tab') setOpen(false); }}
+          onKeyDown={menuKeyNav}
         >
           <MenuList items={visible} onAction={run} header={header} />
         </div>
@@ -925,7 +1025,6 @@ export function SearchSelect({
                 if (e.key === 'ArrowDown') { e.preventDefault(); setHighlight((h) => Math.min(h + 1, filtered.length - 1)); }
                 else if (e.key === 'ArrowUp') { e.preventDefault(); setHighlight((h) => Math.max(h - 1, 0)); }
                 else if (e.key === 'Enter') { e.preventDefault(); const o = filtered[highlight]; if (o) choose(o); }
-                else if (e.key === 'Tab') close();
               }}
             />
           </div>

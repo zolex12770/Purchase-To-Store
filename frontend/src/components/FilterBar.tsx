@@ -288,7 +288,7 @@ function AddFilterMenu({ options, onPick }: { options: { key: FilterKey; label: 
         Filter
       </Button>
       <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)}>
-        <div id={menuId} role="menu" aria-label="Add a filter" className="menu-list" onKeyDown={(e) => { menuKeyNav(e); if (e.key === 'Tab') setOpen(false); }}>
+        <div id={menuId} role="menu" aria-label="Add a filter" className="menu-list" onKeyDown={menuKeyNav}>
           <MenuList
             items={options.map((o) => ({ key: o.key, label: o.label }))}
             onAction={(a) => { setOpen(false); onPick(a.key as FilterKey); }}

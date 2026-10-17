@@ -248,7 +248,7 @@ function RailGroup({ group, activeTo, current }: { group: NavGroup; activeTo: st
           role="menu"
           aria-label={group.label}
           className="menu-list"
-          onKeyDown={(e) => { menuKeyNav(e); if (e.key === 'Tab') setOpen(false); }}
+          onKeyDown={menuKeyNav}
         >
           <div className="menu-label">{group.label}</div>
           {group.items.map((i) => {
@@ -413,7 +413,7 @@ function UserMenu({ onSignOut }: { onSignOut: () => void }) {
           role="menu"
           aria-label="Account"
           className="menu-list"
-          onKeyDown={(e) => { menuKeyNav(e); if (e.key === 'Tab') setOpen(false); }}
+          onKeyDown={menuKeyNav}
         >
           <MenuList items={items} onAction={(a) => { setOpen(false); a.onClick?.(); }} />
         </div>
@@ -746,15 +746,28 @@ function NotificationBell() {
   const allowed = can('dashboard.analyze');
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
 
-  const { data } = useQuery({
+  const { data, isError } = useQuery({
     queryKey: ['analytics', 'exceptions', 'bell'],
     queryFn: () => api.get<ExceptionRow[]>('/analytics/exceptions'),
     enabled: allowed,
     refetchInterval: 120_000,
     staleTime: 60_000,
   });
+
+  // Focus moves to the first item as the panel opens (to the panel itself
+  // when it lists none), as in a menu: opened from the keyboard, focus stayed
+  // on the bell and the items came 17 Tabs later (review 2026-10-17).
+  useEffect(() => {
+    if (!open) return;
+    const raf = requestAnimationFrame(() => {
+      const panel = panelRef.current;
+      (panel?.querySelector<HTMLElement>('.notif-item') ?? panel)?.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [open]);
 
   const alerts = (data ?? []).filter((e) => e.count > 0);
   if (!allowed) return null;
@@ -774,14 +787,16 @@ function NotificationBell() {
       {alerts.length > 0 && <span className="count-badge" aria-hidden>{alerts.length}</span>}
 
       <Popover anchorRef={triggerRef} open={open} onClose={() => setOpen(false)} align="end" minWidth={340} role="dialog" label="Attention required">
-        <div style={{ width: 340 }}>
+        <div ref={panelRef} tabIndex={-1} style={{ width: 340, outline: 'none' }}>
           <div style={{ padding: 'var(--space-3) var(--space-4)', borderBottom: '1px solid var(--border-subtle)' }}>
             <div style={{ fontSize: 'var(--fs-14)', fontWeight: 600, color: 'var(--text-1)' }}>Attention required</div>
             <div style={{ fontSize: 'var(--fs-12)', color: 'var(--text-3)', marginTop: 1 }}>Operational exceptions across procurement</div>
           </div>
           {alerts.length === 0 ? (
             <div style={{ padding: 'var(--space-6)', textAlign: 'center', fontSize: 'var(--fs-13)', color: 'var(--text-3)' }}>
-              Nothing needs attention right now.
+              {/* "Nothing needs attention" only once the list has loaded:
+                  it was also what a failed or pending load said. */}
+              {data ? 'Nothing needs attention right now.' : isError ? 'Could not load the exceptions. The bell tries again every two minutes.' : 'Loading…'}
             </div>
           ) : (
             alerts.map((a) => (
