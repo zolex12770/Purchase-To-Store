@@ -233,6 +233,7 @@ function RailGroup({ group, activeTo, current }: { group: NavGroup; activeTo: st
           className={`nav-group-btn ${current ? 'is-current is-collapsed' : ''}`}
           onClick={() => setOpen((v) => !v)}
           aria-label={group.label}
+          aria-current={current ? 'true' : undefined}
           aria-haspopup="menu"
           aria-expanded={open}
           aria-controls={open ? menuId : undefined}
