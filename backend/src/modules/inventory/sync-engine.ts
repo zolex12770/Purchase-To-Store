@@ -40,7 +40,7 @@ import {
   type CategorySheetConfig, type ExclusionCode, type MovementParse, type MovementRecord,
   type QuarantineCandidate, type Row, type StockParse,
 } from './sheet-model.js';
-import { sameUnit } from '../../domain/uom.js';
+import { countsTowardsStock, toShortUom } from '../../domain/uom.js';
 
 /* ── Result shapes ──────────────────────────────────────────────────────────── */
 
@@ -652,6 +652,18 @@ async function reconcileCategory(
       WHERE i.deleted_at IS NULL AND upper(i.item_code) = ANY($1::text[])`,
     [stock.records.map((s) => s.codeKey)],
   )) purchaseUnit.set(r.code, r.uom);
+  // Every sheet listing's unit per code (the listings alignPurchaseStock adds up): an item
+  // with no Item Master unit counts them only when they share one unit.
+  const listingUnits = new Map<string, Array<string | null>>();
+  for (const r of await txQuery<{ code: string; uom: string | null }>(
+    tx,
+    `SELECT upper(item_code) AS code, primary_uom AS uom FROM inventory_items
+      WHERE deleted_at IS NULL AND source_tab IS NOT NULL AND source_row_index IS NOT NULL
+        AND upper(item_code) = ANY($1::text[])
+      GROUP BY upper(item_code), category, primary_uom
+      ORDER BY upper(item_code), category, primary_uom`,
+    [stock.records.map((s) => s.codeKey)],
+  )) listingUnits.set(r.code, [...(listingUnits.get(r.code) ?? []), r.uom]);
 
   const stockByCode = new Map(stock.records.map((s) => [s.codeKey, s]));
   const rec = reconcileItems(stock.records, totals);
@@ -669,9 +681,12 @@ async function reconcileCategory(
     }
     const erp = erpByCode.get(r.codeKey);
     if (erp) note = `${note ? `${note} ` : ''}${erp} movement(s) entered in the ERP are not part of the sheet figure.`;
-    if (purchaseUnit.has(r.codeKey) && !sameUnit(purchaseUnit.get(r.codeKey), s.uom)) {
-      note = `${note ? `${note} ` : ''}Not counted in the Purchase stock: this sheet counts ${s.uom}, ` +
-        `the Item Master unit is ${purchaseUnit.get(r.codeKey) ?? 'not set'}.`;
+    const itemUnit = purchaseUnit.get(r.codeKey);
+    const units = listingUnits.get(r.codeKey) ?? [s.uom];
+    if (purchaseUnit.has(r.codeKey) && !countsTowardsStock(itemUnit, s.uom, units)) {
+      note = `${note ? `${note} ` : ''}Not counted in the Purchase stock: ` + (toShortUom(itemUnit)
+        ? `this sheet counts ${s.uom}, the Item Master unit is ${itemUnit}.`
+        : `the Item Master has no unit and the sheets count this code in different units (${units.map((u) => u || '(no unit)').join(', ')}).`);
     }
     return { code: r.codeKey, computed: r.computed, status: r.matched ? 'MATCHED' : 'MISMATCH', note };
   });
@@ -730,7 +745,9 @@ async function reconcileCategory(
  * another unit is never added — until 2026-10-16 PTC4/0, a KG item, showed
  * 'WIP  Stock Live'!K184 1,472 Nos plus 'RM Stock Live'!G661 264.75 Kg as
  * 1,736.75. When no sheet counts the code in the item's unit, the item is left as
- * it is. Both cases are reported (purchaseStock.unitMismatches, and the sheet row's
+ * it is. An item with no Item Master unit follows its sheets when they all count the
+ * code in one unit, as a single listing does (countsTowardsStock). Both cases are
+ * reported (purchaseStock.unitMismatches, and the sheet row's
  * recon note). Each change is ledgered as SHEET_SYNC (difference from the current
  * figure), so the stock ledger explains it. A negative sheet total is held at zero
  * (the Purchase stock cannot be negative) and reported.
@@ -775,7 +792,7 @@ async function alignPurchaseStock(
   for (const listings of listingsByItem.values()) {
     const r = listings[0];
     if (new Set(listings.map((l) => l.category)).size === 1 && r.category !== r.inventory_category) categoryChanges.push(Number(r.id));
-    const counted = listings.filter((l) => sameUnit(r.item_uom, l.sheet_uom));
+    const counted = listings.filter((l) => countsTowardsStock(r.item_uom, l.sheet_uom, listings.map((x) => x.sheet_uom)));
     const leftOut = listings.filter((l) => !counted.includes(l));
     if (leftOut.length > 0) {
       result.purchaseStock.unitMismatches.push({

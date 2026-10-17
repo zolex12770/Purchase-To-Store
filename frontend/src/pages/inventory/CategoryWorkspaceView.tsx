@@ -14,6 +14,7 @@ import {
   Modal, Field, Textarea, Select, Input
 } from '../../components/ui';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
+import { describeSync, type SyncResult } from '../../lib/describeSync';
 
 export type InventoryCategoryKey = 'RM' | 'FG' | 'WIP' | 'TRADING' | 'GENERAL';
 
@@ -84,17 +85,6 @@ interface CategoryTxnRow {
   created_at: string;
 }
 
-/** What one sync run reports back (see backend sync-engine.ts). */
-interface SyncResult {
-  category: string;
-  status: 'SUCCESS' | 'PARTIAL' | 'FAILED';
-  durationMs: number;
-  transactionsImported: number;
-  quarantinedRecords: number;
-  tabs: Array<{ tab: string; reversed: number; status: string; message?: string }>;
-  reconciliation: { checked: number; matched: number; mismatched: number };
-  errorMessage?: string;
-}
 
 interface QuarantineRow {
   id: number;
@@ -109,12 +99,8 @@ interface QuarantineRow {
   last_seen_at: string | null;
 }
 
-/** One-line, plain-language result of a sync for a toast. */
-export function describeSync(r: SyncResult): string {
-  const reversed = r.tabs.reduce((a, t) => a + t.reversed, 0);
-  return `${r.category}: ${count(r.transactionsImported)} new entries, ${count(reversed)} removed, ` +
-    `${count(r.quarantinedRecords)} rows not counted. ${count(r.reconciliation.matched)} of ${count(r.reconciliation.checked)} items match the sheet.`;
-}
+/** One-line, plain-language result of a sync for a toast (lib/describeSync.ts). */
+export { describeSync };
 
 interface CategorySummary {
   category: string;
@@ -594,7 +580,14 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
         width: '130px',
         render: (r) => {
           // Opening + inward − outward + adjustments, from the sheet's own rows, against its live stock.
-          if (r.recon_status === 'MATCHED') return <Badge tone="success" plain>Matches sheet</Badge>;
+          // A matching row can still carry a note: above all that its figure is not in the Purchase
+          // stock because this sheet counts another unit (it showed a plain 'Matches sheet' before).
+          if (r.recon_status === 'MATCHED') {
+            if (r.recon_note?.includes('Not counted in the Purchase stock')) {
+              return <span title={r.recon_note}><Badge tone="warning">Unit differs</Badge></span>;
+            }
+            return <span title={r.recon_note ?? undefined}><Badge tone="success" plain>Matches sheet</Badge></span>;
+          }
           if (r.recon_status === 'MISMATCH') {
             const diff = Number(r.live_stock_qty || 0) - Number(r.computed_stock_qty || 0);
             return (

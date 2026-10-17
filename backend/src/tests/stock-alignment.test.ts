@@ -311,7 +311,9 @@ describe('Stock-ledger alignment — dry run, apply, re-run, undo', () => {
     const dry = await request(app).post(ALIGN).set(auth(adminToken)).send({ entries });
     expect(dry.body.data.accepted).toEqual([]);
     const reasons = Object.fromEntries(dry.body.data.refused.map((r: { itemCode: string; reason: string }) => [r.itemCode, r.reason]));
-    for (const code of ['ALN-A', 'ALN-B', 'ALN-D']) expect(reasons[code]).toMatch(/^Already aligned on \d{4}-\d{2}-\d{2} \(\d+ OPENING_ALIGNMENT ledger row\(s\)\); an item is aligned once only\.$/);
+    for (const code of ['ALN-A', 'ALN-B', 'ALN-D']) {
+      expect(reasons[code]).toMatch(/^Already aligned on \d{4}-\d{2}-\d{2} \(\d+ OPENING_ALIGNMENT ledger row\(s\) in place\); undo that alignment before aligning the item again\.$/);
+    }
     const rowsBefore = await alignmentRows();
     const res = await request(app).post(ALIGN).set(auth(adminToken))
       .send({ entries, dryRun: false, confirm: 'ALIGN STOCK LEDGER', expectedHash: dry.body.data.selectionHash });
@@ -355,10 +357,43 @@ describe('Stock-ledger alignment — dry run, apply, re-run, undo', () => {
       .send({ itemIds: [ids['ALN-A']], reason: 'Opening figure disputed', confirm: 'UNDO STOCK ALIGNMENT' });
     expect(again.status).toBe(422);
     expect(again.body.error.details.skipped[0].reason).toBe('Its alignment has already been undone.');
-    const realign = await request(app).post(ALIGN).set(auth(adminToken)).send({ entries: entries.filter((e) => e.itemId === ids['ALN-A']) });
-    expect(realign.body.data.accepted).toEqual([]);
-    expect(realign.body.data.refused[0].reason).toMatch(/^Already aligned on .*, undone on \d{4}-\d{2}-\d{2}\); an item is aligned once only\.$/);
     expect(await count(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE entity = 'stock_alignment' AND action = 'CANCEL'`)).toBe(1);
+  });
+
+  // An undone alignment no longer blocks the item (2026-10-17 review): counting every
+  // original row left a disputed, undone item unalignable for good.
+  it('after an undo the item is aligned again from corrected evidence, once, and can be undone again', async () => {
+    const corrected: Entry[] = [
+      { itemId: ids['ALN-A'], component: 'OPENING', qty: 101, reference: '2026-04-01', evidence: 'General Item Live Stock!BI1088 (corrected)' },
+      { itemId: ids['ALN-A'], component: 'SHEET_ISSUES', qty: -33, reference: 'May-26', evidence: 'Issue Register (Store Outward Entry) rows 7,8,9,10' },
+      { itemId: ids['ALN-A'], component: 'SHEET_ADJUSTMENT', qty: -5, reference: '2026-07-03', evidence: 'Stock Adjustment row 2 (GENERAL sheet)' },
+    ];
+    const dry = await request(app).post(ALIGN).set(auth(adminToken)).send({ entries: corrected });
+    expect(dry.status).toBe(200);
+    expect(dry.body.data.refused).toEqual([]);
+    expect(dry.body.data.accepted).toEqual([
+      expect.objectContaining({ itemCode: 'ALN-A', ledgerBalance: '51.0000', entriesNet: '63.0000', liveStock: '114.0000', difference: '0.0000', entries: 3 }),
+    ]);
+    const res = await request(app).post(ALIGN).set(auth(adminToken))
+      .send({ entries: corrected, dryRun: false, confirm: 'ALIGN STOCK LEDGER', expectedHash: dry.body.data.selectionHash });
+    expect(res.status).toBe(200);
+    expect(res.body.data.rowsPosted).toBe(3);
+    expect(await ledgerOf('ALN-A')).toBe('114.0000');
+    expect(await allLive()).toEqual(liveBefore);
+    const row = (await recon()).data.find((r: { item_code: string }) => r.item_code === 'ALN-A');
+    expect(row).toMatchObject({ mismatch: false, alignment_net: '63.0000' });
+
+    // In place again: refused until undone, naming only the rows still in place.
+    const rerun = await request(app).post(ALIGN).set(auth(adminToken)).send({ entries: corrected });
+    expect(rerun.body.data.accepted).toEqual([]);
+    expect(rerun.body.data.refused[0].reason).toMatch(/^Already aligned on \d{4}-\d{2}-\d{2} \(3 OPENING_ALIGNMENT ledger row\(s\) in place\)/);
+    // A second undo reverses the new rows only; the first three stay reversed once.
+    const undo = await request(app).post(UNDO).set(auth(adminToken))
+      .send({ itemIds: [ids['ALN-A']], reason: 'Checking the second alignment', confirm: 'UNDO STOCK ALIGNMENT' });
+    expect(undo.status).toBe(200);
+    expect(undo.body.data.undone).toEqual([{ itemId: ids['ALN-A'], itemCode: 'ALN-A', rowsReversed: 3, net: '-63.0000' }]);
+    expect(await ledgerOf('ALN-A')).toBe('51.0000');
+    expect(await count(`SELECT COUNT(*)::int AS n FROM stock_ledger WHERE item_id = $1 AND txn_type = 'STOCK_ALIGNMENT'`, [ids['ALN-A']])).toBe(12);
   });
 });
 
@@ -417,5 +452,95 @@ describe('Purchase stock across sheets (SLR-4)', () => {
       { item_code: 'CHM086-T', recon_note: 'Not counted in the Purchase stock: this sheet counts Kg, the Item Master unit is LTR.' },
       { item_code: 'PTC4/0-T', recon_note: null },
     ]);
+  });
+
+  // 2026-10-17 review: sameUnit refused every item with no Item Master unit, so an item
+  // created without one stopped following the only sheet that lists it.
+  it('an item with no Item Master unit follows a sheet when nothing is mixed; different units count none', async () => {
+    await query(
+      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, is_active, uom_id)
+       VALUES ('NOUNIT-1-T', 'No unit, one sheet', 'RM', 0, TRUE, NULL)`,
+    );
+    const mixed = Number((await query<{ id: string }>(
+      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, is_active, uom_id)
+       VALUES ('NOUNIT-2-T', 'No unit, two sheets', 'RM', 5, TRUE, NULL) RETURNING id`,
+    ))[0].id);
+    await query(
+      `INSERT INTO inventory_items (item_id, item_code, item_description, category, primary_uom, live_stock_qty,
+                                    source_tab, source_row_index, source_spreadsheet_id)
+       VALUES ($1, 'NOUNIT-2-T', 'No unit, two sheets', 'WIP', 'Nos', 40, 'WIP  Stock Live', 185, 'test')`, [mixed],
+    );
+
+    const r = await syncCategory('RM', {
+      reader: rmReader([
+        { code: 'PTC4/0-T', live: 264.75 }, { code: 'CHM086-T', live: 80 },
+        { code: 'NOUNIT-1-T', live: 25 }, { code: 'NOUNIT-2-T', live: 12 },
+      ]),
+      userId: null,
+    });
+    expect(r.status).toBe('SUCCESS');
+    expect(await liveOf('NOUNIT-1-T')).toBe('25.0000');
+    expect(await liveOf('NOUNIT-2-T')).toBe('5.0000');
+    expect(r.purchaseStock.unitMismatches).toContainEqual({ itemCode: 'NOUNIT-2-T', itemUom: null, leftOut: 'RM Kg 12, WIP Nos 40', aligned: false });
+    expect(r.purchaseStock.unitMismatches.map((m) => m.itemCode)).not.toContain('NOUNIT-1-T');
+    const notes = Object.fromEntries((await query<{ item_code: string; recon_note: string | null }>(
+      `SELECT item_code, recon_note FROM inventory_items WHERE category = 'RM' AND item_code LIKE 'NOUNIT-%'`,
+    )).map((n) => [n.item_code, n.recon_note]));
+    expect(notes).toEqual({
+      'NOUNIT-1-T': null,
+      'NOUNIT-2-T': 'Not counted in the Purchase stock: the Item Master has no unit and the sheets count this code in different units (Kg, Nos).',
+    });
+  });
+});
+
+/* ── The reconciliation report: every ledger entry type in exactly one column ── */
+
+describe('Stock reconciliation columns', () => {
+  it('each txn_type the stock_ledger CHECK allows lands in exactly one column', async () => {
+    const { RECONCILIATION_COLUMNS } = await import('../modules/masters/item.routes.js');
+    const def = (await query<{ def: string }>(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'chk_stock_ledger_type'`,
+    ))[0].def;
+    const allowed = [...def.matchAll(/'([A-Z_]+)'/g)].map((m) => m[1]).sort();
+    expect(allowed).toHaveLength(14);
+    // Equal as sorted lists: every allowed type is mapped, none twice, nothing unknown.
+    expect(RECONCILIATION_COLUMNS.flatMap((c) => [...c.types]).sort()).toEqual(allowed);
+  });
+
+  it('nets each column over both quantity columns, so the columns add up to the computed balance', async () => {
+    const { RECONCILIATION_COLUMNS } = await import('../modules/masters/item.routes.js');
+    const id = Number((await query<{ id: string }>(
+      `INSERT INTO items (item_code, item_description, inventory_category, live_stock_qty, is_active)
+       VALUES ('RECON-ALL-T', 'Every ledger type', 'GENERAL', 17, TRUE) RETURNING id`,
+    ))[0].id);
+    // One row of every type; some carry the "other" quantity column too.
+    const rows: Array<[string, string, number, number]> = [
+      ['GRN_INWARD', 'GRN', 10, 0], ['GRN_INWARD', 'GRN', 0, 1], ['GRN_REVERSAL', 'GRN', 0, 2],
+      ['REQUISITION_ISSUE', 'REQUISITION', 0, 3], ['REQUISITION_REVERSAL', 'REQUISITION', 1, 0],
+      ['DIRECT_ISSUE', 'DIRECT_ISSUE', 0, 4], ['DIRECT_ISSUE_REVERSAL', 'DIRECT_ISSUE', 2, 0],
+      ['STOCK_ADJUSTMENT', 'STOCK_ADJUSTMENT', 5, 0], ['STOCK_ADJUSTMENT_REVERSAL', 'STOCK_ADJUSTMENT', 0, 5],
+      ['INVENTORY_IN', 'INVENTORY', 7, 0], ['INVENTORY_OUT', 'INVENTORY', 0, 2], ['INVENTORY_ADJUST', 'INVENTORY', 0, 1],
+      ['INVENTORY_REVERSAL', 'INVENTORY', 2, 0], ['SHEET_SYNC', 'INVENTORY_SYNC', 6, 0],
+      ['STOCK_ALIGNMENT', 'OPENING_ALIGNMENT', 3, 0], ['STOCK_ALIGNMENT', 'OPENING_ALIGNMENT', 0, 1],
+    ];
+    let balance = 0;
+    for (const [type, refType, inward, outward] of rows) {
+      balance += inward - outward;
+      await query(
+        `INSERT INTO stock_ledger (item_id, txn_type, reference_type, reference_no, inward_qty, outward_qty, balance_qty, txn_date)
+         VALUES ($1, $2, $3, 'RECON-ALL', $4, $5, $6, '2026-10-17')`,
+        [id, type, refType, inward, outward, balance],
+      );
+    }
+    const res = await request(app).get(api('/items/analysis/stock-reconciliation')).query({ search: 'RECON-ALL-T' }).set(auth(adminToken));
+    expect(res.status).toBe(200);
+    const row = res.body.data[0];
+    expect(row).toMatchObject({
+      grn_inward: '9.0000', grn_reversal: '2.0000', requisition_issue: '3.0000', requisition_reversal: '1.0000',
+      direct_issue_net: '-2.0000', adjustment_net: '0.0000', inventory_net: '6.0000', sheet_sync_net: '6.0000',
+      alignment_net: '2.0000', computed_balance: '17.0000', current_stock: '17.0000', mismatch: false,
+    });
+    const signed = RECONCILIATION_COLUMNS.reduce((sum, c) => sum + (c.outward ? -1 : 1) * Number(row[c.key]), 0);
+    expect(signed).toBeCloseTo(Number(row.computed_balance), 4);
   });
 });
