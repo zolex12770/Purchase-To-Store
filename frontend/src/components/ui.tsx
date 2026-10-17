@@ -112,11 +112,27 @@ function initialFocusTarget(panel: HTMLElement): HTMLElement | null {
  * Live Data Verify modal opened with focus left on the page behind them.
  */
 function useDialogFocus(open: boolean, panelRef: RefObject<HTMLElement>): void {
+  // The trigger is read while rendering the pass that opens the dialog. By the
+  // time any effect runs, React has already applied a field's autoFocus (it
+  // does that during commit), so an effect recorded that field as the trigger;
+  // it is gone after close and focus fell to <body> — cancelling a reject
+  // reason left a keyboard user at the top of the page (review 2026-10-16;
+  // about 14 page modals autofocus a field).
+  const opener = useRef<HTMLElement | null>(null);
+  const wasOpen = useRef(false);
+  if (open !== wasOpen.current) {
+    wasOpen.current = open;
+    if (open && typeof document !== 'undefined') {
+      const active = document.activeElement;
+      opener.current = active instanceof HTMLElement && active !== document.body ? active : null;
+    }
+  }
+
   useEffect(() => {
     if (!open) return;
     const panel = panelRef.current;
     if (!panel) return;
-    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const trigger = opener.current;
     traps.push(panel);
     if (traps.length === 1) document.addEventListener('keydown', onTrapKeyDown);
     // After children have mounted, so their own autoFocus wins.
@@ -129,7 +145,7 @@ function useDialogFocus(open: boolean, panelRef: RefObject<HTMLElement>): void {
       const i = traps.indexOf(panel);
       if (i >= 0) traps.splice(i, 1);
       if (traps.length === 0) document.removeEventListener('keydown', onTrapKeyDown);
-      if (trigger && trigger.isConnected && trigger !== document.body) trigger.focus({ preventScroll: true });
+      if (trigger && trigger.isConnected && !panel.contains(trigger)) trigger.focus({ preventScroll: true });
     };
   }, [open, panelRef]);
 }
@@ -225,17 +241,27 @@ export const IconButton = forwardRef<HTMLButtonElement, Omit<ButtonProps, 'child
 
 /* ═══════════════════════════ TOOLTIP ══════════════════════════════════ */
 
+/** `matches(':focus-visible')` throws on Safari before 15.4; focus there counts as visible. */
+function isFocusVisible(el: HTMLElement): boolean {
+  try { return el.matches(':focus-visible'); } catch { return true; }
+}
+
 /**
  * Hover and keyboard-focus tooltip (spec §3.15): inverse surface, 400 ms
  * delay on hover, immediate on focus, dismissed by Escape. Replaces multi-line
  * native `title=` tooltips, which keyboard users never see.
  */
 export function Tooltip({
-  content, children, placement = 'top', delay = 400, block,
+  content, children, placement = 'top', delay = 400, block, disabled = false,
 }: {
   content: ReactNode; children: ReactElement; placement?: 'top' | 'bottom'; delay?: number;
   /** Anchor fills its container (a tooltip over a whole card in a grid cell). */
   block?: boolean;
+  /**
+   * Shows nothing for now (say, while the trigger's own menu is open) but keeps
+   * the same wrapper, so the trigger is not remounted and keeps its focus.
+   */
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
@@ -245,6 +271,7 @@ export function Tooltip({
   const id = useId();
 
   const show = (immediate: boolean) => {
+    if (disabled) return;
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => setOpen(true), immediate ? 0 : delay);
   };
@@ -253,6 +280,11 @@ export function Tooltip({
     setOpen(false);
   };
   useEffect(() => () => window.clearTimeout(timer.current), []);
+  useEffect(() => {
+    if (!disabled) return;
+    window.clearTimeout(timer.current);
+    setOpen(false);
+  }, [disabled]);
 
   useLayoutEffect(() => {
     if (!open) { setPos(null); return; }
@@ -280,7 +312,7 @@ export function Tooltip({
       className={`tooltip-anchor ${block ? 'tooltip-block' : ''}`}
       onMouseEnter={() => show(false)}
       onMouseLeave={hide}
-      onFocus={(e) => { if ((e.target as HTMLElement).matches(':focus-visible')) show(true); }}
+      onFocus={(e) => { if (isFocusVisible(e.target as HTMLElement)) show(true); }}
       onBlur={hide}
       onMouseDown={hide}
       onKeyDown={(e) => { if (e.key === 'Escape') hide(); }}
@@ -306,11 +338,12 @@ export function Tooltip({
 
 /**
  * A floating panel anchored to a trigger, portaled to <body> so no card,
- * table wrapper or modal can clip it, and repositioned on any scroll.
+ * table wrapper or modal can clip it, and repositioned on any scroll. It opens
+ * below the trigger, or beside it (`placement="right"`, the sidebar rail).
  */
 export function Popover({
   anchorRef, open, onClose, children, align = 'start', offset = 6, minWidth, matchAnchorWidth,
-  className = '', role, id, label, restoreFocus = true, style,
+  className = '', role, id, label, restoreFocus = true, style, placement = 'bottom',
 }: {
   anchorRef: RefObject<HTMLElement>;
   open: boolean;
@@ -327,6 +360,7 @@ export function Popover({
   /** Return focus to the trigger when Escape closes it. */
   restoreFocus?: boolean;
   style?: CSSProperties;
+  placement?: 'bottom' | 'right';
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ top?: number; bottom?: number; left: number; minWidth?: number; maxHeight: number } | null>(null);
@@ -338,6 +372,16 @@ export function Popover({
     const r = a.getBoundingClientRect();
     const pw = p.offsetWidth;
     const ph = p.offsetHeight;
+    if (placement === 'right') {
+      const maxHeight = window.innerHeight - 16;
+      setPos({
+        top: Math.max(8, Math.min(r.top - 4, window.innerHeight - Math.min(ph, maxHeight) - 8)),
+        left: Math.max(8, Math.min(r.right + offset, window.innerWidth - pw - 8)),
+        minWidth,
+        maxHeight,
+      });
+      return;
+    }
     const below = window.innerHeight - r.bottom - offset - 8;
     const aboveSpace = r.top - offset - 8;
     const up = ph > below && aboveSpace > below;
@@ -350,7 +394,7 @@ export function Popover({
       minWidth: matchAnchorWidth ? Math.max(r.width, minWidth ?? 0) : minWidth,
       maxHeight: Math.max(160, up ? aboveSpace : below),
     });
-  }, [anchorRef, align, offset, minWidth, matchAnchorWidth]);
+  }, [anchorRef, align, offset, minWidth, matchAnchorWidth, placement]);
 
   useLayoutEffect(() => {
     if (!open) { setPos(null); return; }
@@ -380,6 +424,11 @@ export function Popover({
   });
 
   if (!open) return null;
+  // The first pass is measured off-screen, but VISIBLE: React applies a
+  // field's autoFocus during that commit, and a visibility:hidden panel cannot
+  // take focus, so the filter pills' search boxes never got it (review
+  // 2026-10-16; v2 mounted the panel only once placed). place() moves it in
+  // before the first paint.
   return createPortal(
     <div
       ref={panelRef}
@@ -390,13 +439,12 @@ export function Popover({
       style={{
         position: 'fixed',
         zIndex: 'var(--z-popover)' as unknown as number,
-        top: pos?.top,
+        top: pos ? pos.top : -9999,
         bottom: pos?.bottom,
         left: pos?.left ?? -9999,
         minWidth: pos?.minWidth,
         maxHeight: pos?.maxHeight,
         overflowY: 'auto',
-        visibility: pos ? 'visible' : 'hidden',
         ...style,
       }}
     >
@@ -806,7 +854,6 @@ export function SearchSelect({
   onSearchRef.current = onSearch;
   useEffect(() => { onSearchRef.current?.(term); }, [term]);
 
-  useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);
   useEffect(() => { setHighlight(0); }, [term]);
 
   const close = useCallback(() => { setOpen(false); setTerm(''); }, []);
@@ -839,8 +886,11 @@ export function SearchSelect({
         <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 320 }}>
           <div style={{ padding: 8, borderBottom: '1px solid var(--border-subtle)', position: 'relative' }}>
             <Search size={14} style={{ position: 'absolute', left: 18, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-4)' }} aria-hidden />
+            {/* Popover's first pass is visible, so autoFocus lands here; the
+                old focus effect ran while the panel was still hidden. */}
             <input
               ref={inputRef}
+              autoFocus
               className="input input-sm"
               style={{ paddingLeft: 30 }}
               value={term}
@@ -1186,7 +1236,10 @@ export function Segmented({
     if (!next) return;
     e.preventDefault();
     onChange(next.value);
-    requestAnimationFrame(() => e.currentTarget?.querySelector<HTMLElement>('[aria-checked="true"]')?.focus());
+    // Read now: React clears currentTarget once the handler returns, so the
+    // frame callback found nothing and focus stayed on the unchecked radio.
+    const group = e.currentTarget;
+    requestAnimationFrame(() => group.querySelector<HTMLElement>('[aria-checked="true"]')?.focus());
   };
   const focusValue = options.some((o) => o.value === value) ? value : options[0]?.value;
   return (

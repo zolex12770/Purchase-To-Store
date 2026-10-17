@@ -5,8 +5,8 @@
  * Both are ergonomic guards — the server re-checks every request regardless
  * (SRS §25), so a hand-typed URL cannot reach data the user may not see.
  */
-import { Suspense, lazy, useRef, type ReactNode } from 'react';
-import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { Suspense, lazy, useState, type ReactNode } from 'react';
+import { Routes, Route, Navigate, useLocation, useNavigate, useNavigationType } from 'react-router-dom';
 import { useAuth } from './lib/auth';
 import { AppShell } from './layout/AppShell';
 import { LoadingBlock, EmptyState, Button, Spinner } from './components/ui';
@@ -236,18 +236,22 @@ export default function App() {
 }
 
 /**
- * Profile reads its ?tab only when it mounts. The user menu's "Change
- * password" sends a fresh `profileTab` nonce in the navigation state, and a
- * new nonce remounts the page, so the password tab opens even when /profile
- * is already on screen (audit UI-017). Profile's own tab clicks carry no
- * nonce and keep the page mounted.
+ * Profile reads its ?tab only when it mounts, and keeps the address in step
+ * with its own tab clicks by REPLACE navigations. Every other arrival — the
+ * user menu's "My profile" or "Change password", a link, Back or Forward —
+ * remounts it, so the tab shown is the one the address names (audit UI-017).
+ * The first fix remounted only on a nonce that "Change password" sent, so
+ * "My profile" and Back left the password tab on screen under /profile
+ * (review 2026-10-16). A tab click keeps the page mounted, and its focus.
  */
 function ProfileRoute() {
   const location = useLocation();
-  const nonce = (location.state as { profileTab?: number } | null)?.profileTab;
-  const lastNonce = useRef(nonce);
-  if (nonce !== undefined) lastNonce.current = nonce;
-  return <Profile key={lastNonce.current ?? 'profile'} />;
+  const navigationType = useNavigationType();
+  const [mount, setMount] = useState({ key: location.key, n: 0 });
+  if (mount.key !== location.key) {
+    setMount({ key: location.key, n: navigationType === 'REPLACE' ? mount.n : mount.n + 1 });
+  }
+  return <Profile key={mount.n} />;
 }
 
 function NotFound() {

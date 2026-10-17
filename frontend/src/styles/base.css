@@ -1265,6 +1265,19 @@ h1, h2, h3, h4, h5, h6 {
 
 .user-trigger { display: flex; align-items: center; gap: var(--space-2); height: 40px; padding: 0 var(--space-1-5) 0 var(--space-1); border-radius: var(--radius-sm); }
 .user-trigger:hover { background: var(--hover-wash); }
+
+/* Phone (≤ 640 px, TopBar): search is an icon until opened, the sync chip is
+   its dot, the account trigger its avatar. While searching, the field takes
+   the whole bar. */
+.topbar.is-compact .sync-chip { width: 30px; padding: 0; justify-content: center; }
+.topbar.is-compact .sync-chip > :not(.sync-dot),
+.topbar.is-compact .user-trigger-text,
+.topbar.is-compact .user-trigger-caret,
+.topbar.is-compact .topbar-divider { display: none; }
+.topbar.is-compact .user-trigger { padding: 0 var(--space-1); }
+.topbar.is-searching > :not(.search-box) { display: none; }
+.topbar.is-searching .search-box { flex: 1 1 auto; min-width: 0; }
+.topbar.is-searching .search-box .input { padding-right: 36px; }
 .avatar {
   width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0;
   display: grid; place-items: center;
@@ -1331,6 +1344,14 @@ h1, h2, h3, h4, h5, h6 {
 .nav-item.is-active .nav-icon-sm { opacity: 1; color: var(--nav-hue, #ffffff); }
 .sidebar.is-rail .nav-item, .sidebar.is-rail .nav-group-btn { justify-content: center; padding: 0; }
 .sidebar.is-rail .nav-item.is-active::before { left: -8px; }
+.sidebar.is-rail .nav-group-btn[aria-expanded='true'] { background: var(--sidebar-hover); color: var(--sidebar-text-strong); }
+
+/* The rail's flyout: a group's entries beside its icon (RailGroup). A glass
+   menu on the page's theme, not part of the ink sidebar. */
+.nav-flyout .menu-list { min-width: 232px; }
+.nav-flyout-section { padding: var(--space-2) var(--space-2-5) 2px; font-size: var(--fs-11); font-weight: var(--fw-semibold); color: var(--text-3); }
+.menu-item.is-current { background: var(--accent-subtle); color: var(--accent-text); font-weight: var(--fw-semibold); }
+.menu-item.is-current svg { color: var(--accent-text); }
 .sidebar-foot { padding: var(--space-2); border-top: 1px solid var(--sidebar-edge); }
 
 /* Old class kept for page code; a plain solid strip now, never glass. */

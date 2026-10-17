@@ -15,13 +15,8 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, useId, type CSSP
 import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
-  LayoutDashboard, Database, FileText, ShoppingCart, Truck, Shield,
   Search, Bell, ChevronDown, ChevronRight, LogOut, User as UserIcon, KeyRound,
-  PanelLeftClose, PanelLeft, RefreshCw, Package, Building2, Tags, Users as UsersIcon,
-  ScrollText, HardDriveDownload, ArrowLeftRight, Settings, CircleAlert, Zap, X,
-  Tag, ClipboardList, PackageSearch, PackageCheck, ListChecks, Home, ShieldCheck,
-  Boxes, PackageMinus, History, ClipboardCheck, Layers, BarChart3, Sun, Moon, Monitor,
-  Factory, Warehouse, Wrench,
+  PanelLeftClose, PanelLeft, RefreshCw, Zap, X, ShieldCheck, Sun, Moon, Monitor,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth';
 import { useTheme, type ThemePreference } from '../lib/theme';
@@ -33,175 +28,13 @@ import {
 } from '../components/ui';
 import { initials, relativeTime } from '../lib/format';
 import { LiveDataVerifyModal } from '../components/LiveDataVerifyModal';
+import { NAV, findActive, isGroup, navAllowed, type NavGroup, type NavItem } from './navModel';
 
 export { PageHeader } from './PageHeader';
 export type { PageAction, Crumb } from './PageHeader';
 
-/* ── Navigation model ────────────────────────────────────────────────────── */
-
-interface NavItem {
-  to: string;
-  label: string;
-  icon: ReactNode;
-  permission?: string;
-  /** Shown to a holder of ANY of these rights (takes the place of `permission`). */
-  anyOf?: string[];
-  /** Sub-heading inside a long group (inventory). */
-  section?: string;
-}
-interface NavLeaf extends NavItem {
-  /** Module identity hue for the icon tile. */
-  hue: string;
-}
-interface NavGroup {
-  label: string;
-  icon: ReactNode;
-  base: string;
-  hue: string;
-  items: NavItem[];
-}
-type NavEntry = NavLeaf | NavGroup;
-
-/** Whether a menu entry is shown to this user. Must agree with the route guards in App.tsx. */
-const navAllowed = (item: { permission?: string; anyOf?: string[] }, can: (p: string) => boolean): boolean =>
-  item.anyOf ? item.anyOf.some((p) => can(p)) : !item.permission || can(item.permission);
-
-/** Analysis screens open for the module's own "analyze" right or the dashboard-wide one — the analytics API's rule. */
-const analysisRights = (module: string) => ({ permission: `${module}.analyze`, anyOf: [`${module}.analyze`, 'dashboard.analyze'] });
-
-const INVENTORY_VIEW = ['inventory.view', 'auto_indent.view'];
-
-/*
- * Labels are sentence case and unique: the four children that were all called
- * "Analysis" now say whose analysis they are (audit UI-031). Every URL is the
- * one the sidebar always used.
- */
-const NAV: NavEntry[] = [
-  // Everyone's landing page: the work waiting for them. No permission — it
-  // shows only the cards the signed-in user may act on.
-  { to: '/home', label: 'My work', icon: <Home size={16} />, hue: 'var(--module-dashboard)' },
-  { to: '/dashboard', label: 'Management analysis', icon: <LayoutDashboard size={16} />, permission: 'dashboard.view', hue: 'var(--module-dashboard)' },
-  {
-    label: 'Masters', icon: <Database size={16} />, base: '/masters', hue: 'var(--module-master)',
-    items: [
-      { to: '/masters/suppliers', label: 'Suppliers', icon: <Building2 size={14} />, permission: 'supplier.view' },
-      { to: '/masters/items', label: 'Items', icon: <Package size={14} />, permission: 'item.view' },
-      { to: '/masters/lookups', label: 'Supporting masters', icon: <Tags size={14} />, permission: 'lookup.view' },
-      { to: '/masters/stock-reconciliation', label: 'Stock reconciliation', icon: <ListChecks size={14} />, permission: 'item.view' },
-    ],
-  },
-  {
-    label: 'Purchase indent', icon: <FileText size={16} />, base: '/indents', hue: 'var(--module-indent)',
-    items: [
-      { to: '/indents', label: 'All indents', icon: <FileText size={14} />, permission: 'indent.view' },
-      { to: '/indents/analysis', label: 'Indent analysis', icon: <BarChart3 size={14} />, ...analysisRights('indent') },
-    ],
-  },
-  {
-    label: 'Purchase order', icon: <ShoppingCart size={16} />, base: '/purchase-orders', hue: 'var(--module-po)',
-    items: [
-      { to: '/purchase-orders', label: 'All purchase orders', icon: <ShoppingCart size={14} />, permission: 'po.view' },
-      { to: '/purchase-orders/awaiting', label: 'Indents ready for PO', icon: <ClipboardList size={14} />, permission: 'po.create' },
-      { to: '/purchase-orders/pending', label: 'Open POs', icon: <CircleAlert size={14} />, permission: 'po.view' },
-      { to: '/purchase-orders/complete', label: 'Completed POs', icon: <PackageCheck size={14} />, permission: 'po.view' },
-      { to: '/purchase-orders/analysis', label: 'PO analysis', icon: <BarChart3 size={14} />, ...analysisRights('po') },
-    ],
-  },
-  {
-    label: 'Goods receipt', icon: <Truck size={16} />, base: '/grn', hue: 'var(--module-grn)',
-    items: [
-      { to: '/grn', label: 'All GRNs', icon: <Truck size={14} />, permission: 'grn.view' },
-      { to: '/grn/pending', label: 'Material to receive', icon: <PackageSearch size={14} />, permission: 'grn.create' },
-      { to: '/grn/labels', label: 'Labels', icon: <Tag size={14} />, permission: 'grn.view' },
-      { to: '/grn/analysis', label: 'GRN analysis', icon: <BarChart3 size={14} />, ...analysisRights('grn') },
-    ],
-  },
-  // A group with one child is just a link.
-  { to: '/qc', label: 'Quality control', icon: <ShieldCheck size={16} />, permission: 'qc.view', hue: 'var(--module-grn)' },
-  {
-    label: 'Requisition', icon: <PackageCheck size={16} />, base: '/requisitions', hue: 'var(--module-requisition)',
-    items: [
-      { to: '/requisitions', label: 'All requisitions', icon: <PackageCheck size={14} />, permission: 'requisition.view' },
-      { to: '/requisitions/mine', label: 'My requisitions', icon: <FileText size={14} />, permission: 'requisition.view' },
-      { to: '/requisitions/hod-queue', label: 'Waiting for my approval', icon: <ListChecks size={14} />, permission: 'requisition.approve' },
-      { to: '/requisitions/store-queue', label: 'Material to issue', icon: <PackageSearch size={14} />, permission: 'requisition.issue' },
-      { to: '/requisitions/analysis', label: 'Requisition analysis', icon: <BarChart3 size={14} />, ...analysisRights('requisition') },
-    ],
-  },
-  {
-    label: 'Inventory & stock', icon: <Boxes size={16} />, base: '/inventory', hue: 'var(--module-inventory)',
-    items: [
-      { to: '/inventory?tab=overview', label: 'Overview', icon: <LayoutDashboard size={14} />, anyOf: INVENTORY_VIEW },
-      { to: '/inventory?tab=rm', label: 'Raw material (RM)', icon: <Layers size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=fg', label: 'Finished goods (FG)', icon: <PackageCheck size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=wip', label: 'Work in progress (WIP)', icon: <Factory size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=trading', label: 'Trading materials', icon: <Tag size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=general', label: 'General stores & spares', icon: <Wrench size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=stock', label: 'Stock register', icon: <Warehouse size={14} />, anyOf: INVENTORY_VIEW, section: 'Registers' },
-      { to: '/inventory?tab=ledger', label: 'Movement ledger', icon: <History size={14} />, anyOf: INVENTORY_VIEW, section: 'Registers' },
-      { to: '/inventory?tab=adjustments', label: 'Count adjustments', icon: <ClipboardCheck size={14} />, anyOf: ['inventory.adjust', ...INVENTORY_VIEW], section: 'Registers' },
-      { to: '/inventory?tab=requisition-queue', label: 'Requisition queue', icon: <PackageSearch size={14} />, anyOf: ['inventory.view', 'requisition.issue', 'auto_indent.view'], section: 'Store' },
-      { to: '/inventory/direct-issue', label: 'Direct issue', icon: <PackageMinus size={14} />, permission: 'direct_issue.view', section: 'Store' },
-      { to: '/inventory?tab=auto-indent', label: 'Auto-indent', icon: <Zap size={14} />, anyOf: ['auto_indent.view', 'inventory.view'], section: 'Store' },
-    ],
-  },
-  {
-    label: 'Admin', icon: <Shield size={16} />, base: '/admin', hue: 'var(--module-admin)',
-    items: [
-      { to: '/admin/users', label: 'Users', icon: <UsersIcon size={14} />, permission: 'user.view' },
-      { to: '/admin/roles', label: 'Roles & permissions', icon: <Shield size={14} />, permission: 'role.view' },
-      { to: '/admin/data-management', label: 'Data management & audit', icon: <Database size={14} />, anyOf: ['system.admin', 'user.admin', 'role.view'] },
-      { to: '/admin/import-export', label: 'Import / export', icon: <ArrowLeftRight size={14} />, permission: 'item.view' },
-      { to: '/admin/sync', label: 'Google Sheets sync', icon: <RefreshCw size={14} />, permission: 'sync.view' },
-      { to: '/admin/backup', label: 'Backup & restore', icon: <HardDriveDownload size={14} />, permission: 'backup.view' },
-      { to: '/admin/audit', label: 'Audit log', icon: <ScrollText size={14} />, permission: 'audit.view' },
-      { to: '/admin/settings', label: 'Settings', icon: <Settings size={14} />, permission: 'system.admin' },
-    ],
-  },
-];
-
-const isGroup = (n: NavEntry): n is NavGroup => 'items' in n;
-
-/**
- * How well a sidebar entry matches the current URL; 0 = not at all.
- *   • an entry with a query (`/inventory?tab=rm`) matches only its own tab —
- *     v2 used NavLink, which ignores the query, so all 11 inventory links
- *     carried aria-current on every inventory page (audit UI-012);
- *   • an exact path beats a parent path;
- *   • a parent path highlights its detail, new and edit pages
- *     (/purchase-orders/1119 → All purchase orders).
- */
-function matchScore(to: string, pathname: string, search: string): number {
-  const [path = '', query] = to.split('?');
-  if (query) {
-    if (pathname !== path) return 0;
-    const have = new URLSearchParams(search);
-    for (const [k, v] of new URLSearchParams(query)) {
-      const actual = have.get(k) ?? (path === '/inventory' && k === 'tab' ? 'overview' : null);
-      if (actual !== v) return 0;
-    }
-    return 2000 + path.length;
-  }
-  if (pathname === path) return 1000 + path.length;
-  if (pathname.startsWith(`${path}/`)) return path.length;
-  return 0;
-}
-
-interface ActiveNav { to: string | null; groupBase: string | null; section: string | null }
-
-/** The ONE sidebar entry the current URL belongs to. */
-function findActive(nav: NavEntry[], pathname: string, search: string): ActiveNav {
-  let best = { score: 0, to: null as string | null, groupBase: null as string | null, section: null as string | null };
-  for (const n of nav) {
-    const candidates = isGroup(n) ? n.items : [n];
-    for (const i of candidates) {
-      const s = matchScore(i.to, pathname, search);
-      if (s > best.score) best = { score: s, to: i.to, groupBase: isGroup(n) ? n.base : null, section: n.label };
-    }
-  }
-  if (!best.to && pathname.startsWith('/profile')) best.section = 'My profile';
-  return { to: best.to, groupBase: best.groupBase, section: best.section };
-}
+/** Below this width the top bar folds search, the sync chip and the user name away. */
+const COMPACT_TOPBAR = '(max-width: 640px)';
 
 /** Subscribes to a CSS media query so layout can respond to the viewport. */
 function useMediaQuery(query: string): boolean {
@@ -230,7 +63,9 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   const [userCollapsed, setCollapsed] = useState(() => readPref('zx.sidebar') === 'collapsed');
   // Below 1280 px the full sidebar squeezes tables into sideways scrolling,
-  // so it becomes the icon rail (v2 waited until 1100 px).
+  // so it becomes the icon rail (v2 waited until 1100 px). Each rail group
+  // opens a flyout with all its entries (RailGroup), so the rail reaches every
+  // screen the full sidebar does.
   const narrow = useMediaQuery('(max-width: 1279px)');
   const rail = userCollapsed || narrow;
 
@@ -290,16 +125,18 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         <nav ref={navRef} className="sidebar-nav">
           {visibleNav.map((n) => (isGroup(n) ? (
-            <SidebarGroup
-              key={n.base}
-              group={n}
-              rail={rail}
-              open={openGroup === n.base}
-              activeTo={active.to}
-              current={active.groupBase === n.base}
-              onToggle={() => setOpenGroup((g) => (g === n.base ? null : n.base))}
-              onRailClick={() => navigate(n.items.find((i) => i.to === active.to)?.to ?? n.items[0]!.to)}
-            />
+            rail ? (
+              <RailGroup key={n.base} group={n} activeTo={active.to} current={active.groupBase === n.base} />
+            ) : (
+              <SidebarGroup
+                key={n.base}
+                group={n}
+                open={openGroup === n.base}
+                activeTo={active.to}
+                current={active.groupBase === n.base}
+                onToggle={() => setOpenGroup((g) => (g === n.base ? null : n.base))}
+              />
+            )
           ) : (
             <SidebarLink key={n.to} item={n} hue={n.hue} rail={rail} active={active.to === n.to} topLevel />
           )))}
@@ -360,32 +197,92 @@ function SidebarLink({
   return rail ? <Tooltip content={item.label} block>{link}</Tooltip> : link;
 }
 
-function SidebarGroup({
-  group, rail, open, activeTo, current, onToggle, onRailClick,
-}: {
-  group: NavGroup; rail: boolean; open: boolean; activeTo: string | null; current: boolean;
-  onToggle: () => void; onRailClick: () => void;
-}) {
-  const panelId = useId();
-  const hueStyle = { ['--nav-hue' as string]: group.hue } as CSSProperties;
+/**
+ * A group on the icon rail: its button opens a flyout listing every entry of
+ * the group, the current one marked. The first rail button only opened the
+ * group's current or first screen, so below 1280 px the sidebar lost Material
+ * to receive, Open POs, the analysis pages, 11 of 12 inventory entries and 7
+ * of 8 admin pages (review 2026-10-16, rail_1200_home.png).
+ */
+function RailGroup({ group, activeTo, current }: { group: NavGroup; activeTo: string | null; current: boolean }) {
+  const [open, setOpen] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
+  const location = useLocation();
 
-  if (rail) {
-    // The rail shows the group icon; it opens the group's current or first screen.
-    return (
-      <Tooltip content={group.label} block>
+  // A choice navigates; close on any navigation, including Back.
+  useEffect(() => { setOpen(false); }, [location.pathname, location.search]);
+
+  // Focus the current entry, else the first, once the flyout is placed.
+  useEffect(() => {
+    if (!open) return;
+    const raf = requestAnimationFrame(() => {
+      const menu = document.getElementById(menuId);
+      (menu?.querySelector<HTMLElement>('[aria-current="page"]') ?? menu?.querySelector<HTMLElement>('[role="menuitem"]'))?.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [open, menuId]);
+
+  let lastSection: string | undefined;
+  return (
+    <>
+      <Tooltip content={group.label} block disabled={open}>
         <button
+          ref={buttonRef}
           type="button"
           className={`nav-group-btn ${current ? 'is-current is-collapsed' : ''}`}
-          onClick={onRailClick}
+          onClick={() => setOpen((v) => !v)}
           aria-label={group.label}
-          aria-current={current ? 'true' : undefined}
-          style={hueStyle}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-controls={open ? menuId : undefined}
+          style={{ ['--nav-hue' as string]: group.hue } as CSSProperties}
         >
           <span className="nav-icon" aria-hidden>{group.icon}</span>
         </button>
       </Tooltip>
-    );
-  }
+      <Popover anchorRef={buttonRef} open={open} onClose={() => setOpen(false)} placement="right" offset={10} minWidth={232} className="nav-flyout">
+        <div
+          id={menuId}
+          role="menu"
+          aria-label={group.label}
+          className="menu-list"
+          onKeyDown={(e) => { menuKeyNav(e); if (e.key === 'Tab') setOpen(false); }}
+        >
+          <div className="menu-label">{group.label}</div>
+          {group.items.map((i) => {
+            const heading = i.section && i.section !== lastSection ? i.section : null;
+            lastSection = i.section;
+            const isActive = activeTo === i.to;
+            return (
+              <div key={i.to} role="none">
+                {heading && <div className="nav-flyout-section" role="presentation">{heading}</div>}
+                <Link
+                  to={i.to}
+                  role="menuitem"
+                  className={`menu-item ${isActive ? 'is-current' : ''}`}
+                  aria-current={isActive ? 'page' : undefined}
+                  onClick={() => setOpen(false)}
+                >
+                  {i.icon}
+                  <span className="grow truncate">{i.label}</span>
+                </Link>
+              </div>
+            );
+          })}
+        </div>
+      </Popover>
+    </>
+  );
+}
+
+function SidebarGroup({
+  group, open, activeTo, current, onToggle,
+}: {
+  group: NavGroup; open: boolean; activeTo: string | null; current: boolean; onToggle: () => void;
+}) {
+  const panelId = useId();
+  const hueStyle = { ['--nav-hue' as string]: group.hue } as CSSProperties;
 
   let lastSection: string | undefined;
   return (
@@ -422,16 +319,25 @@ function SidebarGroup({
 
 /* ── Top bar ─────────────────────────────────────────────────────────────── */
 
+/**
+ * On a phone (≤ 640 px) the bar folds: search becomes an icon that opens the
+ * field across the whole bar, the sync chip shows its dot, the account
+ * trigger its avatar. Unfolded, the bar was 345 px wider than a 390 px screen
+ * and body overflow-x: hidden left Sign out out of reach (review 2026-10-16).
+ */
 function TopBar({ section, onSignOut }: { section: string | null; onSignOut: () => void }) {
   const { can } = useAuth();
+  const compact = useMediaQuery(COMPACT_TOPBAR);
+  const [searching, setSearching] = useState(false);
+  useEffect(() => { if (!compact) setSearching(false); }, [compact]);
   return (
-    <header className="topbar no-print">
+    <header className={`topbar no-print ${compact ? 'is-compact' : ''} ${compact && searching ? 'is-searching' : ''}`}>
       {section && <span className="topbar-section">{section}</span>}
-      <GlobalSearch />
+      <GlobalSearch compact={compact} expanded={searching} onExpandedChange={setSearching} />
       <div className="spacer" />
       {can('sync.view') && <SyncStatusChip />}
       <NotificationBell />
-      <div className="divider-v" style={{ height: 24, alignSelf: 'center' }} />
+      <div className="divider-v topbar-divider" style={{ height: 24, alignSelf: 'center' }} />
       <UserMenu onSignOut={onSignOut} />
     </header>
   );
@@ -455,11 +361,11 @@ function UserMenu({ onSignOut }: { onSignOut: () => void }) {
   useMenuAutofocus(open, menuId);
 
   const items: MenuAction[] = [
+    // Both open the tab their address names even when /profile is already on
+    // screen: App.tsx remounts Profile on every navigation that is not its own
+    // tab sync (ProfileRoute, audit UI-017).
     { key: 'profile', label: 'My profile', icon: <UserIcon size={16} />, onClick: () => navigate('/profile') },
-    // The state nonce makes App.tsx remount Profile, so the password tab opens
-    // even when /profile is already on screen (Profile reads ?tab once, on
-    // mount — audit UI-017).
-    { key: 'password', label: 'Change password', icon: <KeyRound size={16} />, onClick: () => navigate('/profile?tab=password', { state: { profileTab: Date.now() } }) },
+    { key: 'password', label: 'Change password', icon: <KeyRound size={16} />, onClick: () => navigate('/profile?tab=password') },
     { key: 'signout', label: 'Sign out', icon: <LogOut size={16} />, onClick: onSignOut, separatorBefore: true },
   ];
 
@@ -478,11 +384,11 @@ function UserMenu({ onSignOut }: { onSignOut: () => void }) {
         aria-label={`Account menu for ${user?.employeeName ?? 'user'}`}
       >
         <span className="avatar" aria-hidden>{initials(user?.employeeName ?? '?')}</span>
-        <span style={{ textAlign: 'left', minWidth: 0 }}>
+        <span className="user-trigger-text" style={{ textAlign: 'left', minWidth: 0 }}>
           <span className="user-name truncate" style={{ display: 'block' }}>{user?.employeeName}</span>
           <span className="user-role truncate" style={{ display: 'block' }}>{role}</span>
         </span>
-        <ChevronDown size={14} style={{ color: 'var(--text-3)' }} aria-hidden />
+        <ChevronDown size={14} className="user-trigger-caret" style={{ color: 'var(--text-3)' }} aria-hidden />
       </button>
 
       <Popover anchorRef={triggerRef} open={open} onClose={() => setOpen(false)} align="end" minWidth={268}>
@@ -523,15 +429,38 @@ interface SearchGroup {
   results: { id: string; title: string; subtitle: string; meta?: string; route: string }[];
 }
 
-function GlobalSearch() {
+/**
+ * `compact` (a phone): folded to an icon until `expanded`, then the field
+ * fills the bar with a close button; a chosen result, Escape or any
+ * navigation folds it again.
+ */
+function GlobalSearch({
+  compact, expanded, onExpandedChange,
+}: { compact: boolean; expanded: boolean; onExpandedChange: (expanded: boolean) => void }) {
   const [term, setTerm] = useState('');
   const [debounced, setDebounced] = useState('');
   const [open, setOpen] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
   const navigate = useNavigate();
+  const location = useLocation();
   const boxRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
   const listId = useId();
+  const folded = compact && !expanded;
+
+  // Read by the Ctrl+K listener, which is registered once.
+  const unfoldRef = useRef(() => {});
+  unfoldRef.current = () => { if (compact) onExpandedChange(true); };
+
+  useEffect(() => { onExpandedChange(false); }, [location.pathname, location.search, onExpandedChange]);
+
+  const fold = () => {
+    setOpen(false);
+    setTerm('');
+    onExpandedChange(false);
+    requestAnimationFrame(() => toggleRef.current?.focus());
+  };
 
   useEffect(() => {
     // Debounce so typing does not fire a request per keystroke (SRS §30).
@@ -546,11 +475,13 @@ function GlobalSearch() {
     staleTime: 30_000,
   });
 
-  // Ctrl/Cmd+K focuses search from anywhere.
+  // Ctrl/Cmd+K focuses search from anywhere (unfolding it first on a phone;
+  // the field takes focus as it mounts).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
+        unfoldRef.current();
         inputRef.current?.focus();
         inputRef.current?.select();
         setOpen(true);
@@ -569,10 +500,24 @@ function GlobalSearch() {
     setOpen(false);
     setTerm('');
     inputRef.current?.blur();
+    if (compact) onExpandedChange(false);
   };
 
   const showPanel = open && debounced.length >= 2;
   let offset = 0;
+
+  if (folded) {
+    return (
+      <IconButton
+        ref={toggleRef}
+        label="Search"
+        icon={<Search size={18} />}
+        size="md"
+        tooltip={false}
+        onClick={() => { onExpandedChange(true); setOpen(true); }}
+      />
+    );
+  }
 
   return (
     <div ref={boxRef} className="search-box" role="search">
@@ -580,11 +525,14 @@ function GlobalSearch() {
       <input
         ref={inputRef}
         className="input"
+        autoFocus={compact}
         placeholder="Search items, suppliers, indents, POs, GRNs…"
         value={term}
         onChange={(e) => { setTerm(e.target.value); setOpen(true); }}
         onFocus={() => setOpen(true)}
         onKeyDown={(e) => {
+          // On a phone the first Escape closes the results (Popover), the next folds the field.
+          if (e.key === 'Escape' && compact && !showPanel) { e.preventDefault(); fold(); return; }
           if (!showPanel || flat.length === 0) return;
           if (e.key === 'ArrowDown') { e.preventDefault(); setActiveIdx((i) => Math.min(i + 1, flat.length - 1)); }
           else if (e.key === 'ArrowUp') { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
@@ -597,7 +545,16 @@ function GlobalSearch() {
         aria-activedescendant={showPanel && flat[activeIdx] ? `${listId}-${activeIdx}` : undefined}
         aria-label="Global search"
       />
-      {term ? (
+      {compact ? (
+        <button
+          type="button"
+          onClick={fold}
+          aria-label="Close search"
+          style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)', display: 'grid', placeItems: 'center', width: 22, height: 22, borderRadius: 4 }}
+        >
+          <X size={14} />
+        </button>
+      ) : term ? (
         <button
           type="button"
           onClick={() => { setTerm(''); inputRef.current?.focus(); }}
@@ -714,6 +671,8 @@ function SyncStatusChip() {
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="dialog"
         aria-expanded={open}
+        // Named in full: on a phone the chip folds to its dot (TopBar).
+        aria-label={`Google Sheets sync: ${state.label}`}
       >
         <span className={`sync-dot is-${state.tone}`} aria-hidden />
         <RefreshCw size={13} aria-hidden style={{ color: 'var(--text-3)', animation: data?.running ? 'zx-spin 1.2s linear infinite' : undefined }} />
