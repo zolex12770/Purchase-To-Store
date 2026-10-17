@@ -22,6 +22,9 @@ export const BACKUP_TABLES = [
   'purchase_indent_headers', 'purchase_indent_lines', 'indent_approvals', 'auto_indents',
   'purchase_order_headers', 'purchase_order_lines', 'po_indent_sources',
   'grn_headers', 'grn_lines', 'grn_line_mlns', 'qc_inspections', 'stock_ledger',
+  // The store receipts the GRN link repair held back (migration 030). Left out, a
+  // restore would show every PO with such a receipt as genuinely pending again.
+  'store_grn_link_holds',
   'requisition_headers', 'requisition_lines', 'requisition_approvals',
   'requisition_issues', 'requisition_issue_lines',
   'direct_issue_headers', 'direct_issue_lines',
@@ -120,7 +123,10 @@ export interface RestoreResult {
 /**
  * Replaces the contents of every backup table with the payload.
  * MUST be called inside a transaction: either the database ends up exactly as the
- * backup described, or it is left completely untouched.
+ * backup described, or it is left completely untouched. Once that transaction has
+ * committed, the caller analyses the database (statistics.ts analyseDatabase): the
+ * restored rows have no planner statistics, and without them the receipt evidence
+ * summary took 76.7 s on a copy restored from the 2026-10-17 backup.
  */
 export async function restoreFromPayload(
   tx: Queryable,

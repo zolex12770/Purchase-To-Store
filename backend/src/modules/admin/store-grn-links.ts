@@ -35,6 +35,16 @@
  * ledger are never touched and nothing is deleted. Each batch of links is recorded
  * in the audit log with the values it replaced, and undo takes back exactly the
  * links recorded there, a whole GRN at a time.
+ *
+ * The held lines are recorded too (store_grn_link_holds, migration 030): each apply
+ * replaces the record with its own held list, also when it links nothing, and an undo
+ * adds the lines it unlinks as UNDONE. Without it a PO whose store receipt was held
+ * looked exactly like a PO nothing was received against (2,642 held lines on the
+ * 2026-10-17 copy); purchase-order/receipt-evidence.ts reads it. It never links.
+ *
+ * The rules do not know about undo: while the tab still names the PO, a later run links
+ * a line taken back again. The dry run lists such lines (previouslyUndoneLines), and a
+ * run may keep them all out (keepOutUndone, the Data Management panel's default).
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { txQuery, type Queryable } from '../../db/index.js';
@@ -143,6 +153,11 @@ export interface HeldLine extends LineRef {
   dates?: { grnDate: string; poDate: string; days: number };
   /** GRN_PARTLY_HELD: the lines of the same GRN that hold it back. */
   blockedBy?: Array<{ grnLineId: number; itemCode: string; reason: HoldReason }>;
+  /** GRN_PARTLY_HELD: the link it would have made (the planned link's own fields). */
+  poId?: number;
+  poNo?: string;
+  poLineId?: number;
+  poLineNo?: number;
 }
 
 /**
@@ -402,20 +417,22 @@ export async function planStoreGrnLinks(
       grnLineId: Number(l.id), grnId: Number(l.grn_id), grnNo: l.grn_no, itemCode: l.item_code,
       grnQty: toQty(l.grn_qty), tabRows: rows.map((r) => r.row),
     };
-    if (excluded.has(ref.grnLineId)) {
-      hold(ref, 'EXCLUDED', 'Kept out of this run by the reviewer (excludeGrnLineIds).');
-      continue;
-    }
-    if (rows.length === 0) {
-      hold(ref, 'NOT_ON_TAB', `No row of the ${STORE_GRN_TAB} tab names GRN ${l.grn_no} with item ${l.item_code}.`);
-      continue;
-    }
     const spelled = new Map<string, string>();
     for (const r of rows) {
       const key = poNamedBy(r);
       if (key !== null && !spelled.has(key)) spelled.set(key, r.poNo);
     }
     const poNos = [...spelled.values()];
+    if (excluded.has(ref.grnLineId)) {
+      // The POs its rows name are kept, so a receipt kept out still counts as awaiting
+      // link on them (store_grn_link_holds) rather than leaving them looking unreceived.
+      hold(ref, 'EXCLUDED', 'Kept out of this run by the reviewer (excludeGrnLineIds).', poNos.length > 0 ? { poNos } : {});
+      continue;
+    }
+    if (rows.length === 0) {
+      hold(ref, 'NOT_ON_TAB', `No row of the ${STORE_GRN_TAB} tab names GRN ${l.grn_no} with item ${l.item_code}.`);
+      continue;
+    }
     if (spelled.size > 1) {
       hold(ref, 'SEVERAL_POS', `Tab row(s) ${ref.tabRows.join(', ')} name ${poNos.join(', ')}.`, { poNos });
       continue;
@@ -771,6 +788,76 @@ function batchesOf(plan: LinkPlan): Array<{ links: PlannedLink[]; headers: Heade
   return batches;
 }
 
+/** A row of store_grn_link_holds (migration 030). */
+interface HoldRow {
+  runId: string;
+  grnLineId: number;
+  grnId: number;
+  grnNo: string;
+  itemCode: string;
+  grnQty: string;
+  poId: number | null;
+  poLineId: number | null;
+  poNo: string | null;
+  reason: HoldReason | 'UNDONE';
+  detail: string;
+}
+
+/**
+ * The plan's held lines as hold rows: one per PO the tab names for the line, so a
+ * line whose rows name two POs gives two, each with its ERP PO when the number is in
+ * the ERP (matched as the plan matches it: trimmed, ignoring case) and the PO line
+ * when the plan settled on one (OVER_RECEIPT, GRN_PARTLY_HELD). A line naming no PO
+ * gives one row with neither.
+ */
+async function holdRowsOf(run: Run, runId: string, held: HeldLine[]): Promise<HoldRow[]> {
+  const keys = [...new Set(held.flatMap((h) => h.poNos ?? []).map((n) => U(n.trim())))];
+  const found = keys.length === 0 ? [] : await run<{ id: number; key: string }>(
+    'SELECT id, upper(trim(po_no)) AS key FROM purchase_order_headers WHERE upper(trim(po_no)) = ANY($1::text[]) ORDER BY id',
+    [keys],
+  );
+  const idsByKey = new Map<string, number[]>();
+  for (const f of found) addTo(idsByKey, f.key, Number(f.id));
+  const rows: HoldRow[] = [];
+  for (const h of held) {
+    const poLineId = h.reason === 'OVER_RECEIPT' ? h.poLine?.poLineId ?? null
+      : h.reason === 'GRN_PARTLY_HELD' ? h.poLineId ?? null : null;
+    const row = (poId: number | null, poNo: string | null, lineId: number | null): HoldRow => ({
+      runId, grnLineId: h.grnLineId, grnId: h.grnId, grnNo: h.grnNo, itemCode: h.itemCode, grnQty: h.grnQty,
+      poId, poLineId: lineId, poNo, reason: h.reason, detail: h.detail,
+    });
+    const names = h.poNos ?? [];
+    if (names.length === 0) rows.push(row(null, null, null));
+    for (const name of names) {
+      const ids = idsByKey.get(U(name.trim())) ?? [];
+      if (ids.length === 0) rows.push(row(null, name, null));
+      for (const id of ids) rows.push(row(id, name, ids.length === 1 ? poLineId : null));
+    }
+  }
+  return rows;
+}
+
+/** Writes hold rows; the rows of one transaction share its now() as recorded_at. */
+async function insertHolds(run: Run, rows: HoldRow[]): Promise<number> {
+  if (rows.length === 0) return 0;
+  const [inserted] = await run<{ n: number }>(
+    `WITH ins AS (
+       INSERT INTO store_grn_link_holds (run_id, grn_line_id, grn_id, grn_no, item_code, grn_qty, po_id, po_line_id, po_no, reason, detail)
+       SELECT v.run_id, v.grn_line_id, v.grn_id, v.grn_no, v.item_code, v.grn_qty, v.po_id, v.po_line_id, v.po_no, v.reason, v.detail
+         FROM jsonb_to_recordset($1::jsonb) AS v(run_id text, grn_line_id bigint, grn_id bigint, grn_no text, item_code text,
+                                                 grn_qty numeric, po_id bigint, po_line_id bigint, po_no text, reason text, detail text)
+       RETURNING 1)
+     SELECT COUNT(*)::int AS n FROM ins`,
+    [JSON.stringify(rows.map((r) => ({
+      run_id: r.runId, grn_line_id: r.grnLineId, grn_id: r.grnId, grn_no: r.grnNo, item_code: r.itemCode, grn_qty: r.grnQty,
+      po_id: r.poId, po_line_id: r.poLineId, po_no: r.poNo, reason: r.reason, detail: r.detail,
+    })))],
+  );
+  const n = Number(inserted?.n ?? 0);
+  if (n !== rows.length) throw ServerError(`Recorded ${n} of ${rows.length} held receipt row(s); nothing was written.`);
+  return n;
+}
+
 export interface ApplyResult {
   plan: LinkPlan;
   linesLinked: number;
@@ -779,13 +866,17 @@ export interface ApplyResult {
   poStatusesRederived: number;
   runId: string;
   auditIds: number[];
+  /** Rows written to store_grn_link_holds: one per PO the tab names for each held line. */
+  holdsRecorded: number;
 }
 
 /**
  * Writes the plan the dry run showed. MUST run inside a transaction: the plan is
  * rebuilt with the rows locked and must carry the dry run's hash (the same review
  * choices included), and every linked PO line, GRN and status is checked by the
- * database before anything commits.
+ * database before anything commits. The plan's held lines then replace the record of
+ * store receipts awaiting link, also when it links nothing: once the first run has
+ * linked what the tab supports, that is how a later run records what is still held.
  */
 export async function applyStoreGrnLinks(
   tx: Queryable,
@@ -803,8 +894,6 @@ export async function applyStoreGrnLinks(
       { linkable: plan.totals.linkable, held: plan.totals.held, selectionHash: plan.selectionHash },
     );
   }
-  if (plan.links.length === 0) throw BusinessRuleError('No GRN line can be linked; nothing was written.');
-
   const runId = randomUUID();
   const batches = batchesOf(plan);
   let linesLinked = 0;
@@ -858,7 +947,7 @@ export async function applyStoreGrnLinks(
     });
   }
 
-  const poStatusesRederived = await recomputePoStatuses(tx, plan.affectedPos.map((p) => p.poId));
+  const poStatusesRederived = plan.affectedPos.length === 0 ? 0 : await recomputePoStatuses(tx, plan.affectedPos.map((p) => p.poId));
 
   // Checked by the database before anything commits: no linked PO line has received
   // more than it ordered, no linked GRN is left with a line on no PO line or with a
@@ -892,10 +981,18 @@ export async function applyStoreGrnLinks(
     );
   }
 
+  // The receipts this run holds back replace the record the last run left: a receipt
+  // linked since drops out of it, and one held for another reason now says so.
+  const holds = await holdRowsOf(run, runId, plan.held);
+  await run('DELETE FROM store_grn_link_holds', []);
+  const holdsRecorded = await insertHolds(run, holds);
+
   const auditIds = (await run<{ id: number }>(
     `SELECT id FROM audit_logs WHERE entity = $1 AND after_data->>'runId' = $2 AND after_data->>'kind' = 'links' ORDER BY id`,
     [LINK_AUDIT_ENTITY, runId],
   )).map((r) => Number(r.id));
+  const recorded = `${holdsRecorded} row(s) for the ${plan.held.length} held receipt line(s) recorded as store receipts awaiting link, `
+    + 'replacing the earlier record.';
   await auditIn(tx, {
     actor: ctx.actor,
     action: 'UPDATE',
@@ -907,14 +1004,19 @@ export async function applyStoreGrnLinks(
       review: plan.review, supplierPairs: plan.supplierPairs,
       statusTransitions: statusTransitions(plan), poStatusesRederived,
       poStatusCounts: plan.poStatusCounts.after, pendingValue: plan.pendingValue.after,
+      heldLines: plan.held.length, holdsRecorded,
     },
-    message: `${summariseLinkPlan(plan)} Linked in ${auditIds.length} audited batch(es); undo takes back exactly these links. `
-      + 'Quantities, stock and the ledger were not changed.',
+    message: plan.links.length === 0
+      ? `${summariseLinkPlan(plan)} Nothing was linked; ${recorded}`
+      : `${summariseLinkPlan(plan)} Linked in ${auditIds.length} audited batch(es); undo takes back exactly these links. ${recorded} `
+        + 'Quantities, stock and the ledger were not changed.',
   });
-  return { plan, linesLinked, headersSet, headersCleared, poStatusesRederived, runId, auditIds };
+  return { plan, linesLinked, headersSet, headersCleared, poStatusesRederived, runId, auditIds, holdsRecorded };
 }
 
-type LinkRecord = { grnLineId: number; grnId: number; grnNo: string; poLineId: number; poId: number; poNo: string };
+type LinkRecord = {
+  grnLineId: number; grnId: number; grnNo: string; poLineId: number; poId: number; poNo: string; poLineNo?: number;
+};
 type AuditRow = { id: number; after_data: Record<string, unknown> | null };
 
 export interface UndoResult {
@@ -925,6 +1027,8 @@ export interface UndoResult {
   headersLeft: Array<{ grnId: number; grnNo: string; reason: string }>;
   skipped: Array<{ grnLineId: number; reason: string }>;
   poStatusesRederived: number;
+  /** UNDONE rows written to store_grn_link_holds, one per line unlinked. */
+  holdsRecorded: number;
 }
 
 /**
@@ -934,8 +1038,10 @@ export interface UndoResult {
  * that linked it. A GRN is undone whole: one whose other repair-made links are not
  * in the undo is skipped, as a GRN left with some lines on a PO line and others on
  * none could no longer be saved from the GRN screen. A header the run changed is set
- * back to its previous value while it still holds what the run wrote. MUST run
- * inside a transaction.
+ * back to its previous value while it still holds what the run wrote. Each line
+ * unlinked is recorded as a store receipt awaiting link (UNDONE) on the PO it was
+ * linked to, so that PO does not look as if nothing had been received against it.
+ * MUST run inside a transaction.
  */
 export async function undoStoreGrnLinks(
   tx: Queryable,
@@ -1063,7 +1169,10 @@ export async function undoStoreGrnLinks(
       .map((h) => ({ grnId: Number(h.grnId), grnNo: h.grnNo, reason: `It no longer names ${h.poNoAfter ?? 'no PO'} as this repair set it; left as it is.` })),
     skipped,
     poStatusesRederived,
+    holdsRecorded: toUndo.length,
   };
+  // Marks this entry, so the UNDONE rows below can name it.
+  const undoId = randomUUID();
   await auditIn(tx, {
     actor: ctx.actor,
     action: 'CANCEL',
@@ -1074,13 +1183,144 @@ export async function undoStoreGrnLinks(
       headers: result.headersRestored.map((h) => ({ grnId: h.grnId, poId: h.repairSet })),
     },
     after: {
-      kind: 'undo', reason: ctx.reason, target,
+      kind: 'undo', undoId, reason: ctx.reason, target,
       links: toUndo.map((r) => ({ grnLineId: Number(r.link.grnLineId), poLineId: null })),
       headers: result.headersRestored.map((h) => ({ grnId: h.grnId, poId: h.restoredTo })),
-      headersLeft: result.headersLeft, skipped, poStatusesRederived,
+      headersLeft: result.headersLeft, skipped, poStatusesRederived, holdsRecorded: result.holdsRecorded,
     },
     message: `Store GRN links undone: ${toUndo.length} GRN line(s) no longer point to a PO line and ${result.headersRestored.length} GRN header(s) `
-      + `name what they named before; ${poStatusesRederived} PO status(es) re-derived. Quantities and stock were not changed. Reason: ${ctx.reason}`,
+      + `name what they named before; ${poStatusesRederived} PO status(es) re-derived. The ${toUndo.length} receipt line(s) are recorded as `
+      + `awaiting link (UNDONE) on the PO they were linked to. Quantities and stock were not changed. Reason: ${ctx.reason}`,
   });
+  const [entry] = await run<{ id: number }>(
+    `SELECT id FROM audit_logs WHERE entity = $1 AND after_data->>'undoId' = $2`, [LINK_AUDIT_ENTITY, undoId],
+  );
+  await recordUndone(run, toUndo, { undoAuditId: Number(entry!.id), reason: ctx.reason, runOf: runIdsOf(entries) });
   return result;
+}
+
+/** For each GRN line this repair ever linked or unlinked: its latest such audit entry. */
+async function latestLinkEntries(run: Run): Promise<Map<number, { kind: string; auditId: number; at: string; reason: string }>> {
+  const entries = await run<{ id: number; created_at: Date | string; after_data: Record<string, unknown> | null }>(
+    `SELECT id, created_at, after_data FROM audit_logs
+      WHERE entity = $1 AND after_data->>'kind' IN ('links', 'undo') ORDER BY id`,
+    [LINK_AUDIT_ENTITY],
+  );
+  const latest = new Map<number, { kind: string; auditId: number; at: string; reason: string }>();
+  for (const e of entries) {
+    const kind = String(e.after_data?.kind);
+    const links = Array.isArray(e.after_data?.links) ? e.after_data!.links as Array<{ grnLineId: number }> : [];
+    const at = e.created_at instanceof Date ? e.created_at.toISOString() : new Date(e.created_at).toISOString();
+    for (const l of links) {
+      latest.set(Number(l.grnLineId), { kind, auditId: Number(e.id), at, reason: String(e.after_data?.reason ?? '') });
+    }
+  }
+  return latest;
+}
+
+/**
+ * The GRN lines without a PO line whose latest entry of this repair is an undo: what
+ * a run asked to keep them out (keepOutUndone) adds to its excludeGrnLineIds, so they
+ * stay held (EXCLUDED) and the hash covers them like any other exclusion.
+ */
+export async function undoneLineIds(run: Run): Promise<number[]> {
+  const ids = [...await latestLinkEntries(run)].filter(([, e]) => e.kind === 'undo').map(([id]) => id);
+  if (ids.length === 0) return [];
+  const rows = await run<{ id: number }>(
+    'SELECT id FROM grn_lines WHERE id = ANY($1::bigint[]) AND po_line_id IS NULL ORDER BY id', [ids],
+  );
+  return rows.map((r) => Number(r.id));
+}
+
+/** A line a Super Admin unlinked that the plan would link again, or that it keeps out (EXCLUDED). */
+export interface UndoneLine {
+  grnLineId: number;
+  grnId: number;
+  grnNo: string;
+  itemCode: string;
+  grnQty: string;
+  /** The PO the plan would link it to, or the one its tab rows name when it is kept out. */
+  poNo: string | null;
+  /** True when the plan links it again; false when this run keeps it out. */
+  wouldLink: boolean;
+  undoAuditId: number;
+  undoneAt: string;
+  undoReason: string;
+}
+
+/**
+ * The plan's lines whose latest audit entry of this repair is an undo: a Super Admin
+ * took their link back, and nothing has linked them since. The link rules do not know
+ * about undo, so while the tab still names the same PO a plain re-run links them again
+ * on the same evidence, and the apply's record then replaces their UNDONE rows (seen on
+ * the 2026-10-17 review copy: ZG/TM/0159 undone, then linked again by the next run from
+ * the Data Management panel). The dry run lists them, and the panel keeps them out of
+ * its run (excludeGrnLineIds) unless the Super Admin chooses to link them again.
+ */
+export async function previouslyUndoneLines(run: Run, plan: LinkPlan): Promise<UndoneLine[]> {
+  const latest = await latestLinkEntries(run);
+  const undone = (id: number) => {
+    const last = latest.get(id);
+    return last?.kind === 'undo' ? last : null;
+  };
+  const out: UndoneLine[] = [];
+  for (const l of plan.links) {
+    const u = undone(l.grnLineId);
+    if (u) {
+      out.push({
+        grnLineId: l.grnLineId, grnId: l.grnId, grnNo: l.grnNo, itemCode: l.itemCode, grnQty: l.grnQty, poNo: l.poNo,
+        wouldLink: true, undoAuditId: u.auditId, undoneAt: u.at, undoReason: u.reason,
+      });
+    }
+  }
+  for (const h of plan.held) {
+    const u = h.reason === 'EXCLUDED' ? undone(h.grnLineId) : null;
+    if (u) {
+      out.push({
+        grnLineId: h.grnLineId, grnId: h.grnId, grnNo: h.grnNo, itemCode: h.itemCode, grnQty: h.grnQty, poNo: h.poNos?.[0] ?? null,
+        wouldLink: false, undoAuditId: u.auditId, undoneAt: u.at, undoReason: u.reason,
+      });
+    }
+  }
+  return out.sort((a, b) => a.grnLineId - b.grnLineId);
+}
+
+/** The link run each 'links' audit entry belongs to. */
+const runIdsOf = (entries: AuditRow[]) => new Map(entries.map((e) => [Number(e.id), String(e.after_data?.runId ?? `audit #${e.id}`)]));
+
+/**
+ * The lines an undo unlinked, as store receipts awaiting link on the PO each was
+ * linked to (reason UNDONE). Any row the record held for the line goes: it described
+ * the line before it was linked. A later apply replaces them with its own held list.
+ */
+async function recordUndone(
+  run: Run,
+  undone: Array<{ auditId: number; link: LinkRecord }>,
+  ctx: { undoAuditId: number; reason: string; runOf: Map<number, string> },
+): Promise<number> {
+  const lineIds = undone.map((r) => Number(r.link.grnLineId));
+  const receipts = await run<{ id: number; grn_id: number; grn_no: string; item_code: string; grn_qty: string }>(
+    `SELECT gl.id, gl.grn_id, gh.grn_no, gl.item_code, gl.grn_qty::text AS grn_qty
+       FROM grn_lines gl JOIN grn_headers gh ON gh.id = gl.grn_id
+      WHERE gl.id = ANY($1::bigint[])`,
+    [lineIds],
+  );
+  const poLines = await run<{ id: number; line_no: number }>(
+    'SELECT id, line_no FROM purchase_order_lines WHERE id = ANY($1::bigint[])', [[...new Set(undone.map((r) => Number(r.link.poLineId)))]],
+  );
+  const receiptOf = new Map(receipts.map((r) => [Number(r.id), r]));
+  const lineNoOf = new Map(poLines.map((p) => [Number(p.id), Number(p.line_no)]));
+  await run('DELETE FROM store_grn_link_holds WHERE grn_line_id = ANY($1::bigint[])', [lineIds]);
+  return insertHolds(run, undone.map((r) => {
+    const receipt = receiptOf.get(Number(r.link.grnLineId))!;
+    const lineNo = lineNoOf.get(Number(r.link.poLineId)) ?? r.link.poLineNo;
+    return {
+      runId: ctx.runOf.get(r.auditId) ?? `audit #${r.auditId}`,
+      grnLineId: Number(r.link.grnLineId), grnId: Number(receipt.grn_id), grnNo: receipt.grn_no,
+      itemCode: receipt.item_code, grnQty: toQty(receipt.grn_qty),
+      poId: Number(r.link.poId), poLineId: Number(r.link.poLineId), poNo: r.link.poNo, reason: 'UNDONE',
+      detail: `Linked to ${r.link.poNo}${lineNo != null ? ` line ${lineNo}` : ''} by audit #${r.auditId}; taken back by a Super Admin `
+        + `(audit #${ctx.undoAuditId}): ${ctx.reason}`,
+    };
+  }));
 }

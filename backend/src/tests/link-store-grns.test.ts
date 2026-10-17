@@ -22,7 +22,8 @@
  *      kept out by the reviewer.
  *   4. A tab, ERP or review-choice change between the dry run and the apply: 409,
  *      nothing written.
- *   5. A second run proposes nothing for the lines already linked.
+ *   5. A second run proposes nothing for the lines already linked; applying it only
+ *      records the held lines (receipt-evidence.test.ts covers that record).
  *   6. Undo by GRN line ids or by audit entry takes back exactly the links this repair
  *      made, a GRN whole, sets back the headers it changed and re-derives the statuses.
  *   7. Links are audited in batches of whole GRNs, at most 500 lines each.
@@ -455,12 +456,16 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     expect(await count(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE entity = 'store_grn_link' AND after_data->>'kind' = 'run'`)).toBe(1);
   });
 
-  it('proposes nothing on a second run for the lines it already linked', async () => {
+  it('proposes nothing on a second run for the lines it already linked, and its apply only records what is held', async () => {
     const d = await dryRun();
     expect(d.totals).toMatchObject({ unlinkedLines: 12, linkable: 0, held: 12 });
     expect(d.held.every((h: { reason: string }) => h.reason !== 'NOT_ON_TAB' || h.grnNo === 'ZG/LSG/0011')).toBe(true);
+    // Linking nothing is no longer refused: the apply records the held receipts
+    // (store_grn_link_holds) and says plainly that nothing was linked.
     const again = await apply(d.selectionHash);
-    expect(again.status).toBe(422);
+    expect(again.status).toBe(200);
+    expect(again.body.data).toMatchObject({ linesLinked: 0, heldLines: 12, auditIds: [] });
+    expect(again.body.data.message).toMatch(/^Nothing was linked/);
     expect(await linkedLines()).toBe(7);
   });
 });
@@ -489,7 +494,8 @@ describe('Link store GRNs — undo', () => {
   });
 
   it('takes back a whole run by its audit entry, skipping what is already undone, and only once', async () => {
-    const [run] = await query<{ id: number }>(`SELECT id FROM audit_logs WHERE entity = 'store_grn_link' AND after_data->>'kind' = 'run'`);
+    // The first run linked; the second only recorded what was held.
+    const [run] = await query<{ id: number }>(`SELECT id FROM audit_logs WHERE entity = 'store_grn_link' AND after_data->>'kind' = 'run' ORDER BY id LIMIT 1`);
     const res = await request(app).post(UNDO).set(auth(adminToken))
       .send({ auditId: run!.id, reason: 'Re-run after the tab is corrected', confirm: 'UNDO STORE GRN LINKS' });
     expect(res.status).toBe(200);

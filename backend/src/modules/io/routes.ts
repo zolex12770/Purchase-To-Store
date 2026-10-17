@@ -24,6 +24,7 @@ import { env } from '../../config/env.js';
 import { parseNumericInput, toRate } from '../../domain/money.js';
 import { logger } from '../../core/logger.js';
 import { assertMayChangeUsers, superAdminsAmong } from '../admin/super-admin-guard.js';
+import { RECEIPT_EVIDENCE_LABEL } from '../purchase-order/receipt-evidence.js';
 
 const router = Router();
 
@@ -65,6 +66,8 @@ const FILTER_LABELS: Record<string, string> = {
 const NOT_FILTERS = new Set(['format', 'page', 'pageSize', 'sortBy', 'sortDir', 'dateFrom', 'dateTo', 'search', 'ids']);
 /** Switches a list turns on with 'true'; 'false' is the same as leaving them off. */
 const SWITCHES = new Set(['overdue', 'pendingOnly', 'excludeCancelled', 'eligibleOnly']);
+/** Filters whose value is written in the words the list shows for it. */
+const VALUE_WORDS: Record<string, Record<string, string>> = { receiptEvidence: RECEIPT_EVIDENCE_LABEL };
 
 /** Human-readable description of the filters actually applied (SRS §35) — every one of the list's. */
 function describeFilters(f: Record<string, unknown>): string {
@@ -74,7 +77,10 @@ function describeFilters(f: Record<string, unknown>): string {
     if (NOT_FILTERS.has(key) || value === undefined || value === null || value === '') continue;
     if (key === 'view' && value === 'all') continue;
     const label = FILTER_LABELS[key] ?? key;
-    if (SWITCHES.has(key)) {
+    const words = VALUE_WORDS[key]?.[String(value)];
+    if (words) {
+      parts.push(words);
+    } else if (SWITCHES.has(key)) {
       if (value === 'true') parts.push(label);
     } else if (Array.isArray(value)) {
       if (value.length === 0) continue;

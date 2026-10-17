@@ -17,7 +17,9 @@ import {
   CheckCircle2, XCircle, ShieldAlert, ArrowLeftRight
 } from 'lucide-react';
 import { api } from '../../lib/api';
+import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
+import { LinkStoreGrnsPanel } from './LinkStoreGrnsPanel';
 import { PageHeader } from '../../layout/AppShell';
 import {
   Button, Card, CardBody, CardHeader, Input, Select, Badge, LoadingBlock,
@@ -97,6 +99,7 @@ const ENTITY_CONFIG: Record<EntityKey, { label: string; icon: typeof Database; i
 export default function DataManagement() {
   const toast = useToast();
   const qc = useQueryClient();
+  const { isSuperAdmin } = useAuth();
 
   const [activeEntity, setActiveEntity] = useState<EntityKey>('users');
   const [searchTerm, setSearchTerm] = useState('');
@@ -597,6 +600,9 @@ export default function DataManagement() {
           )}
         </CardBody>
       </Card>
+
+      {/* Repair: link the store's imported GRNs to their POs (the API is Super Admin only). */}
+      {isSuperAdmin && <LinkStoreGrnsPanel />}
 
       {/* Record Deep Inspection Drawer */}
       <Drawer

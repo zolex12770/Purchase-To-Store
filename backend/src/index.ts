@@ -10,6 +10,7 @@ import { logger } from './core/logger.js';
 import { createApp } from './app.js';
 import { getDatabase, closeDatabase, databaseLabel } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
+import { ensurePlannerStatistics } from './db/statistics.js';
 import { seedSystem, seedDemoData } from './db/seed.js';
 import { startSyncScheduler, stopSyncScheduler } from './modules/google-sync/scheduler.js';
 import { startReplicaScheduler, stopReplicaScheduler } from './modules/google-db/scheduler.js';
@@ -45,6 +46,13 @@ async function bootstrap(): Promise<void> {
   await seedSystem();
   if (env.SEED_DEMO_DATA && !env.isProd) {
     await seedDemoData();
+  }
+
+  // A database whose rows came in without an ANALYZE (a data folder restored by other
+  // means, a staging rebuild) is planned as if empty; see db/statistics.ts.
+  const stats = await ensurePlannerStatistics();
+  if (stats.tables.length > 0) {
+    logger.info(`Statistics   : ${stats.tables.join(', ')} had none; ${stats.analysed ? 'database analysed' : 'ANALYZE failed'}`);
   }
 
   const app = createApp();

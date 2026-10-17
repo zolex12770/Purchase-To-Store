@@ -17,6 +17,7 @@ import { auditIn, audit, actorFrom } from '../../core/audit.js';
 import { paths } from '../../config/env.js';
 import { logger } from '../../core/logger.js';
 import { restoreFromPayload, type BackupPayload } from '../../db/restore.js';
+import { analyseDatabase } from '../../db/statistics.js';
 import { createBackup, applyRetention, isBackupRunning, backupPath, sha256 } from './backup-service.js';
 import { backupScheduleStatus } from './backup-scheduler.js';
 import exportRoutes from './export.routes.js';
@@ -236,6 +237,9 @@ router.post(
     });
 
     logger.warn(`Database restored from backup ${meta.filename}`);
+    // The restored rows carry no planner statistics until they are analysed
+    // (db/statistics.ts); left so, one PO screen froze every user for over a minute.
+    await analyseDatabase(`restore of ${meta.filename}`);
 
     sendOk(res, {
       restored: result.restored,

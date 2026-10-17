@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 import express, { Router, type Request } from 'express';
 import { z } from 'zod';
-import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
+import { query, queryOne, withTransaction, withSnapshot, txQuery, txQueryOne, SqlBuilder, type Queryable } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
 import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { requirePermission, requireSuperAdmin, invalidateAuthState } from '../../auth/middleware.js';
@@ -31,8 +31,9 @@ import {
 } from './stock-alignment.js';
 import {
   STORE_GRN_TAB, planStoreGrnLinks, applyStoreGrnLinks, undoStoreGrnLinks, describeLinkPlan,
-  summariseLinkPlan, runIn, type SheetReader,
+  summariseLinkPlan, previouslyUndoneLines, undoneLineIds, runIn, type SheetReader,
 } from './store-grn-links.js';
+import { REASON_TEXT, standingHoldsNaming } from '../purchase-order/receipt-evidence.js';
 import { readSheet } from '../google-sync/engine.js';
 
 const router = Router();
@@ -776,6 +777,12 @@ async function inspectDependencies(entity: string, id: number): Promise<{
     if (Number(grnRefs?.n ?? 0) > 0) {
       blockingReasons.push(`Purchase Order is referenced by ${grnRefs?.n} GRN(s). Cannot hard-delete.`);
     }
+    // Store receipts the GRN link repair held back that name this PO (their GRN header
+    // names no PO, so the count above misses them). Not blocking: a deleted PO's rows keep
+    // its number and count as receipts naming a PO the ERP does not hold (migration 030).
+    dependencies.push({
+      table: 'store_grn_link_holds', label: 'Store receipts awaiting link that name it', count: await standingHoldsNaming(id),
+    });
   } else if (entity === 'grn') {
     // stock_ledger has no grn_id column — the old query failed with HTTP 500 for
     // every GRN (staging, GRN 12379). A GRN's entries carry reference_type 'GRN'
@@ -1601,7 +1608,12 @@ router.post(
    confirm two supplier records as one company (sameSupplierPairs); the apply repeats
    those choices with the typed confirmation and the hash, re-reads the tab and
    re-plans in the transaction that writes. Undo takes back exactly the links one
-   audit entry (or a run) recorded, or those of the GRN lines named, a GRN whole. */
+   audit entry (or a run) recorded, or those of the GRN lines named, a GRN whole.
+   Every apply, also one that links nothing, records the held lines as the store
+   receipts awaiting link (store_grn_link_holds, migration 030); undo adds the lines
+   it unlinks there. The PO list and PO screen read that record. The dry run lists the
+   lines a Super Admin took back (previouslyUndone), which the rules would link again
+   while the tab names the same PO; keepOutUndone keeps them all out of the run. */
 
 /** The GRN tab's reader: the sync engine's own, unless the app was handed another (tests). */
 const grnTabReaderOf = (req: Request): SheetReader =>
@@ -1616,6 +1628,12 @@ const linkStoreGrnsSchema = z.object({
     grnSupplierId: z.coerce.number().int().positive(),
     poSupplierId: z.coerce.number().int().positive(),
   })).max(1000).default([]),
+  /**
+   * Also keep out every line a Super Admin took back (undo) that nothing has linked
+   * since: the Data Management panel's default, as the tab still names the PO the link
+   * was taken back from and the rules would link it again.
+   */
+  keepOutUndone: z.boolean().default(false),
 });
 
 router.post(
@@ -1623,7 +1641,7 @@ router.post(
   requireSuperAdmin(),
   validateBody(linkStoreGrnsSchema),
   asyncHandler(async (req, res) => {
-    const { dryRun, confirm, expectedHash, excludeGrnLineIds, sameSupplierPairs } = req.body as z.infer<typeof linkStoreGrnsSchema>;
+    const { dryRun, confirm, expectedHash, excludeGrnLineIds, sameSupplierPairs, keepOutUndone } = req.body as z.infer<typeof linkStoreGrnsSchema>;
     if (!dryRun) {
       if (confirm !== 'LINK STORE GRNS') {
         throw ValidationError('Type "LINK STORE GRNS" to confirm. Take a verified backup first.');
@@ -1635,15 +1653,32 @@ router.post(
     // The tab is read before the transaction opens: a Google read can take seconds,
     // and the embedded database serves one transaction at a time.
     const grid = await grnTabReaderOf(req)(STORE_GRN_TAB);
+    // The exclusions the plan is made with, read in its own transaction.
+    const excluded = async (tx: Queryable) => (keepOutUndone
+      ? [...new Set([...excludeGrnLineIds, ...await undoneLineIds(runIn(tx))])] : excludeGrnLineIds);
     if (dryRun) {
-      // One read-only transaction, so every figure comes from the same moment.
-      const plan = await withTransaction((tx) => planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds, sameSupplierPairs }));
-      sendOk(res, { dryRun: true, ...describeLinkPlan(plan), message: `${summariseLinkPlan(plan)} Nothing was changed.` });
+      // One read-only snapshot, so every figure comes from the same moment.
+      const { plan, previouslyUndone } = await withSnapshot(async (tx) => {
+        const p = await planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds: await excluded(tx), sameSupplierPairs });
+        return { plan: p, previouslyUndone: await previouslyUndoneLines(runIn(tx), p) };
+      });
+      // reasonText: each reason in the words the PO screen uses, for the held list a
+      // purchase user works through (the screen's CSV download). previouslyUndone: the
+      // lines a Super Admin took back that this plan would link again, or keeps out.
+      const relinked = previouslyUndone.filter((u) => u.wouldLink).length;
+      sendOk(res, {
+        dryRun: true, ...describeLinkPlan(plan), reasonText: REASON_TEXT, previouslyUndone,
+        message: `${summariseLinkPlan(plan)}${relinked > 0
+          ? ` ${relinked} of these line(s) were linked before and taken back by a Super Admin; keep them out (excludeGrnLineIds) unless they are to be linked again.`
+          : ''} Nothing was changed.`,
+      });
       return;
     }
-    const result = await withTransaction((tx) => applyStoreGrnLinks(tx, grid, {
-      expectedHash: expectedHash!, actor: actorFrom(req), excludeGrnLineIds, sameSupplierPairs,
+    const result = await withTransaction(async (tx) => applyStoreGrnLinks(tx, grid, {
+      expectedHash: expectedHash!, actor: actorFrom(req), excludeGrnLineIds: await excluded(tx), sameSupplierPairs,
     }));
+    const recorded = `${result.plan.totals.held} held store receipt line(s) recorded as awaiting link `
+      + `(${result.holdsRecorded} row(s), one per PO the GRN tab names), replacing the earlier record.`;
     sendOk(res, {
       dryRun: false,
       linesLinked: result.linesLinked,
@@ -1652,9 +1687,14 @@ router.post(
       poStatusesRederived: result.poStatusesRederived,
       runId: result.runId,
       auditIds: result.auditIds,
+      heldLines: result.plan.totals.held,
+      holdsRecorded: result.holdsRecorded,
       ...describeLinkPlan(result.plan),
-      message: `${summariseLinkPlan(result.plan)} ${result.linesLinked} line(s) linked in ${result.auditIds.length} audited batch(es); `
-        + 'quantities, stock and the ledger were not changed.',
+      message: result.linesLinked === 0
+        ? `Nothing was linked: no GRN line can be linked from the tab's evidence. ${recorded} `
+          + 'Quantities, stock and the ledger were not changed.'
+        : `${summariseLinkPlan(result.plan)} ${result.linesLinked} line(s) linked in ${result.auditIds.length} audited batch(es); `
+          + `${recorded} Quantities, stock and the ledger were not changed.`,
     });
   }),
 );
@@ -1679,7 +1719,8 @@ router.post(
     sendOk(res, {
       ...result,
       message: `${result.undone.length} GRN line link(s) undone and ${result.headersRestored.length} GRN header(s) set back; `
-        + `${result.poStatusesRederived} PO status(es) re-derived.${result.skipped.length ? ` ${result.skipped.length} line(s) skipped.` : ''}`,
+        + `${result.poStatusesRederived} PO status(es) re-derived; ${result.holdsRecorded} receipt line(s) recorded as awaiting link (UNDONE).`
+        + `${result.skipped.length ? ` ${result.skipped.length} line(s) skipped.` : ''}`,
     });
   }),
 );

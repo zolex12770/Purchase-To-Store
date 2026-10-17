@@ -14,6 +14,7 @@ import { getDatabase, closeDatabase, databaseLabel } from './driver.js';
 import { withTransaction } from './index.js';
 import { probeDatabase, removeDataDirectory } from './probe.js';
 import { restoreFromPayload, type BackupPayload } from './restore.js';
+import { analyseDatabase } from './statistics.js';
 import { logger } from '../core/logger.js';
 
 function listBackups(): string[] {
@@ -102,6 +103,8 @@ async function main(): Promise<void> {
   logger.info(
     `Restore complete — ${result.totalRows} row(s) across ${Object.keys(result.restored).length} table(s).`,
   );
+  // The restored rows have no planner statistics until analysed (statistics.ts).
+  await analyseDatabase(`restore of ${filename}`);
   if (result.notInBackup.length > 0) {
     logger.warn(`This backup predates ${result.notInBackup.join(', ')} — those tables are now empty.`);
   }

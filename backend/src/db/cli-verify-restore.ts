@@ -39,6 +39,7 @@ async function main(): Promise<void> {
   const { runMigrations } = await import('./migrate.js');
   const { withTransaction, query } = await import('./index.js');
   const { restoreFromPayload, BACKUP_TABLES } = await import('./restore.js');
+  const { analyseDatabase } = await import('./statistics.js');
   type Payload = import('./restore.js').BackupPayload;
 
   const started = Date.now();
@@ -51,6 +52,8 @@ async function main(): Promise<void> {
     console.log(`Verifying ${path.basename(file)} (${(raw.length / 1048576).toFixed(1)} MB, taken ${payload.meta?.createdAt ?? '?'}, schema ${payload.meta?.schemaVersion ?? '?'}) in ${databaseLabel()}`);
     await runMigrations({ silent: true });
     const result = await withTransaction((tx) => restoreFromPayload(tx, payload));
+    // As a real restore does: a copy kept with --keep is then planned like the original.
+    await analyseDatabase('verify-restore');
     const problems: string[] = [];
     for (const table of BACKUP_TABLES) {
       const expected = Array.isArray(payload.data[table]) ? payload.data[table]!.length : 0;

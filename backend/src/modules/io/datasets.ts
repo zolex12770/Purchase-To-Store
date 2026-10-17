@@ -19,6 +19,7 @@ import { listSchema as itemListSchema, buildItemFilter } from '../masters/item.r
 import { listSchema as supplierListSchema, buildSupplierFilter } from '../masters/supplier.routes.js';
 import { listSchema as indentListSchema, buildIndentFilter, indentLineScope } from '../indent/routes.js';
 import { listSchema as poListSchema, buildPoFilter, poLineScope, PO_FROM } from '../purchase-order/routes.js';
+import { EVIDENCE_COUNTS_WITH, evidenceCountColumns } from '../purchase-order/receipt-evidence.js';
 import { listSchema as grnListSchema, buildGrnFilter, grnLineScope, GRN_FROM } from '../grn/routes.js';
 import {
   listSchema as requisitionListSchema, buildFilter as buildRequisitionFilter, LIST_FROM as REQUISITION_FROM,
@@ -265,20 +266,26 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'payment_terms', header: 'Payment Terms', width: 16 },
       { key: 'delivery_date', header: 'Delivery Date', type: 'date', width: 13 },
       { key: 'remarks', header: 'Remarks', width: 30 },
+      { key: 'store_receipts_awaiting_link', header: 'Store Receipts Awaiting Link', type: 'number', width: 16 },
+      { key: 'store_sheet_receipts', header: 'Receipts on Store Sheet Only', type: 'number', width: 16 },
     ],
-    // The Pending / Complete views and "overdue only" included: the file once held every PO.
+    // The Pending / Complete views, "overdue only" and the receipt evidence included: the
+    // file once held every PO.
     schema: poListSchema.extend({ ids: csvIdArray }),
     build: (q) => {
       const b = buildPoFilter(q);
       b.addIn('h.id', q.ids);
       return {
-        sql: `SELECT h.po_no, h.po_date, h.po_time, pt.name AS po_type_name, s.supplier_name,
+        // The receipt evidence counts are each built once and looked up, as on the list.
+        sql: `WITH ${EVIDENCE_COUNTS_WITH}
+              SELECT h.po_no, h.po_date, h.po_time, pt.name AS po_type_name, s.supplier_name,
                      h.status, h.source_mode,
                      (SELECT string_agg(DISTINCT src.indent_no, ', ')
                         FROM v_po_line_sources src WHERE src.po_id = h.id) AS source_indents,
                      b.line_count, b.total_po_qty, b.total_received_qty, b.total_pending_qty,
                      b.total_amount, b.received_amount, b.pending_amount,
-                     h.payment_terms, h.delivery_date, h.remarks
+                     h.payment_terms, h.delivery_date, h.remarks,
+                     ${evidenceCountColumns('h')}
                 FROM purchase_order_headers h
                 JOIN v_po_header_balance b ON b.po_id = h.id
                 JOIN suppliers s ON s.id = h.supplier_id
