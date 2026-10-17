@@ -22,11 +22,19 @@
  *      dashboard's Pending POs and Pending PO Value; PO view permission is needed.
  *   5. A receipt linked since, or a GRN cancelled since, no longer counts.
  *   6. Receipts on the store's GRN sheet only (the GRN tab lines the business-sheet sync
- *      keeps open as MISSING_IN_ERP, as of the latest finished sync): a third class
- *      after 'awaiting link' and before 'none recorded'; the three add up to pending;
- *      the filter, its export, the list's count and the PO screen; a line the latest
- *      run no longer reports, one an administrator resolved, and one of a run still in
- *      progress do not count; one first recorded by an older run and still reported does.
+ *      keeps open as MISSING_IN_ERP, as of the latest run that read the tab through): a
+ *      third class after 'awaiting link' and before 'none recorded'; the three add up to
+ *      pending; the filter, its export, the list's count and the PO screen; a line the
+ *      latest run no longer reports, one an administrator resolved, and one of a run
+ *      still in progress do not count; one first recorded by an older run and still
+ *      reported does; a later run that did not read the tab through changes nothing.
+ *   7. A sheet line posted through POST /grn after the sync reported it (the ERP gives it
+ *      its own number, so the sync keeps reporting it) stops counting once the posted
+ *      quantity covers it, and the PO screen lists it as posted under that number.
+ *   8. The link dry run lists lines a Super Admin took back, and keepOutUndone keeps them
+ *      out; a deleted PO's held receipts stay, naming a PO the ERP does not hold.
+ *   9. A restore, and start-up, analyse a database without planner statistics; the
+ *      summary reads one REPEATABLE READ, READ ONLY snapshot.
  *
  * Real PGlite database, migrated and seeded from scratch. The GRN tab is a grid handed
  * to the app in place of the Google read (app.locals.storeGrnTabReader), and to the

@@ -1142,6 +1142,8 @@ h1, h2, h3, h4, h5, h6 {
 .banner-next strong { color: var(--tone-info-fg); }
 .banner-attention .banner-table { border-color: var(--tone-attention-border); }
 .banner-attention .banner-next strong { color: var(--tone-attention-fg); }
+.banner-warning .banner-table { border-color: var(--tone-pending-border); }
+.banner-warning .banner-next strong { color: var(--tone-pending-fg); }
 
 /* An evidence badge in a list row: focusable (the global ring), so its explanation shows on focus too. */
 .badge-tip { display: inline-flex; border-radius: var(--radius-full); }
