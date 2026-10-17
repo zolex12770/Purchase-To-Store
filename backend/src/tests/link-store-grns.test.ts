@@ -64,19 +64,19 @@ async function mkItem(code: string, live = '0'): Promise<number> {
   return items[code]!;
 }
 
-/** A PO as the 2026-10-16 register import left it: OPEN, nothing received. */
-async function mkPo(no: string, lines: Array<[string, string]>, status = 'OPEN'): Promise<void> {
+/** A PO as the 2026-10-16 register import left it: OPEN, nothing received. A line may carry another description. */
+async function mkPo(no: string, lines: Array<[string, string, string?]>, status = 'OPEN'): Promise<void> {
   const id = Number((await query<{ id: number }>(
     `INSERT INTO purchase_order_headers (po_no, po_date, supplier_id, status, close_reason)
      VALUES ($1, '2026-09-01', $2, $3, $4) RETURNING id`,
     [no, supplierId, status, status === 'CANCELLED' ? 'Cancelled for the test' : null],
   ))[0]!.id);
   const ids: number[] = [];
-  for (const [i, [code, qty]] of lines.entries()) {
+  for (const [i, [code, qty, description]] of lines.entries()) {
     ids.push(Number((await query<{ id: number }>(
       `INSERT INTO purchase_order_lines (po_id, line_no, item_id, item_code, item_description, po_qty, uom_id, rate)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 100) RETURNING id`,
-      [id, i + 1, items[code], code, `Link store item ${code}`, qty, uomId],
+      [id, i + 1, items[code], code, description ?? `Link store item ${code}`, qty, uomId],
     ))[0]!.id));
   }
   pos[no] = { id, lines: ids };
@@ -162,7 +162,7 @@ beforeAll(async () => {
   supplierId = Number((await query<{ id: number }>(
     `INSERT INTO suppliers (supplier_code, supplier_name) VALUES ('LSG-SUP', 'Link Store Supplier') RETURNING id`,
   ))[0]!.id);
-  for (const code of ['LSG-A', 'LSG-B', 'LSG-C', 'LSG-D', 'LSG-E', 'LSG-F', 'LSG-G', 'LSG-H', 'LSG-I', 'LSG-J', 'LSG-K', 'LSG-L', 'LSG-N', 'LSG-O']) {
+  for (const code of ['LSG-A', 'LSG-B', 'LSG-C', 'LSG-D', 'LSG-E', 'LSG-F', 'LSG-G', 'LSG-H', 'LSG-I', 'LSG-J', 'LSG-K', 'LSG-L', 'LSG-N', 'LSG-O', 'LSG-P', 'LSG-Q']) {
     await mkItem(code, '50');
   }
   // The purchase code the tab and the GRN use (CCLSG625) is not the item master's code.
@@ -180,6 +180,8 @@ beforeAll(async () => {
   await mkPo('Z/LSG/00010', [['LSG-L', '10']]);
   await mkPo('Z/LSG/00011', [['FCLSG62.5', '7']]);
   await mkPo('Z/LSG/00013', [['LSG-O', '5']], 'PARTIALLY_RECEIVED');
+  // Held under a duplicate item master row (LSG-Q) that carries the receipt's description.
+  await mkPo('Z/LSG/00014', [['LSG-Q', '1', 'Item LSG-P']]);
 
   await mkGrn('ZG/LSG/0001', [{ code: 'LSG-A', qty: '10' }, { code: 'LSG-B', qty: '5' }]);
   await mkGrn('ZG/LSG/0002', [{ code: 'LSG-C', qty: '4' }]);
@@ -199,6 +201,7 @@ beforeAll(async () => {
   // Z/LSG/00013 has already received 4 of 5 through a GRN raised in the ERP.
   await mkGrn('GRN-LSG-0001', [{ code: 'LSG-O', qty: '4', poLineId: pos['Z/LSG/00013']!.lines[0] }]);
   await mkGrn('ZG/LSG/0017', [{ code: 'LSG-O', qty: '2' }]);
+  await mkGrn('ZG/LSG/0018', [{ code: 'LSG-P', qty: '1' }]);
   // Not posted: never considered, though the tab names a PO for it.
   await mkGrn('ZG/LSG/0099', [{ code: 'LSG-A', qty: '1' }], 'DRAFT');
 
@@ -223,6 +226,7 @@ beforeAll(async () => {
     row('ZG/LSG/0015', 'LSG-N', '1', 'Z/LSG/00012'),
     row('ZG/LSG/0015', 'LSG-N', '1', '-'),
     row('ZG/LSG/0017', 'LSG-O', '2', 'Z/LSG/00013'),
+    row('ZG/LSG/0018', 'LSG-P', '1', 'Z/LSG/00014'),
     row('ZG/LSG/0099', 'LSG-A', '1', 'Z/LSG/00001'),
     ['', '', '', '', '', '', '', ''],
   ];
@@ -262,7 +266,7 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     expect(d.selectionHash).toMatch(/^[0-9a-f]{64}$/);
     hash = d.selectionHash;
     expect(d.totals).toMatchObject({
-      unlinkedLines: 18, linkable: 6, linkableBeforeOverReceipt: 9, held: 12, grns: 4, grnHeadersSet: 3, affectedPos: 5,
+      unlinkedLines: 19, linkable: 7, linkableBeforeOverReceipt: 10, held: 12, grns: 5, grnHeadersSet: 4, affectedPos: 6,
       byReason: {
         NOT_ON_TAB: 1, NO_PO_NAMED: 3, SEVERAL_POS: 1, PO_NOT_IN_ERP: 1, PO_NOT_RECEIVABLE: 1,
         ITEM_NOT_ON_PO: 1, SEVERAL_PO_LINES: 1, OVER_RECEIPT: 3,
@@ -275,6 +279,7 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     expect(linkOf('ZG/LSG/0002')).toEqual(['LSG-C>Z/LSG/00002']); // the tab wrote the PO number in lower case
     expect(linkOf('ZG/LSG/0013')).toEqual(['LSG-K>Z/LSG/00009', 'LSG-L>Z/LSG/00010']);
     expect(linkOf('ZG/LSG/0014')).toEqual(['CCLSG625>Z/LSG/00011']); // matched by the resolved item, not the code
+    expect(linkOf('ZG/LSG/0018')).toEqual(['LSG-P>Z/LSG/00014']); // matched by the description
 
     const reasonOf = (grn: string) => d.held.filter((h: { grnNo: string }) => h.grnNo === grn).map((h: { reason: string }) => h.reason);
     expect(reasonOf('ZG/LSG/0003')).toEqual(['NO_PO_NAMED']);
@@ -302,13 +307,13 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     const status = Object.fromEntries(d.affectedPos.map((p: { poNo: string; statusBefore: string; statusAfter: string }) => [p.poNo, `${p.statusBefore}>${p.statusAfter}`]));
     expect(status).toEqual({
       'Z/LSG/00001': 'OPEN>COMPLETED', 'Z/LSG/00002': 'OPEN>PARTIALLY_RECEIVED', 'Z/LSG/00009': 'OPEN>COMPLETED',
-      'Z/LSG/00010': 'OPEN>PARTIALLY_RECEIVED', 'Z/LSG/00011': 'OPEN>COMPLETED',
+      'Z/LSG/00010': 'OPEN>PARTIALLY_RECEIVED', 'Z/LSG/00011': 'OPEN>COMPLETED', 'Z/LSG/00014': 'OPEN>COMPLETED',
     });
-    expect(d.statusTransitions).toEqual({ 'OPEN -> COMPLETED': 3, 'OPEN -> PARTIALLY_RECEIVED': 2 });
-    // Pending value at rate 100: A 10 + B 5 + C 4 + K 2 + L 3 + FCLSG 7 = 31 units received.
-    expect(Number(d.pendingValue.before) - Number(d.pendingValue.after)).toBe(3100);
+    expect(d.statusTransitions).toEqual({ 'OPEN -> COMPLETED': 4, 'OPEN -> PARTIALLY_RECEIVED': 2 });
+    // Pending value at rate 100: A 10 + B 5 + C 4 + K 2 + L 3 + FCLSG 7 + P 1 = 32 units received.
+    expect(Number(d.pendingValue.before) - Number(d.pendingValue.after)).toBe(3200);
     expect(d.headers.map((h: { grnNo: string; poNo: string }) => `${h.grnNo}>${h.poNo}`)).toEqual([
-      'ZG/LSG/0001>Z/LSG/00001', 'ZG/LSG/0002>Z/LSG/00002', 'ZG/LSG/0014>Z/LSG/00011',
+      'ZG/LSG/0001>Z/LSG/00001', 'ZG/LSG/0002>Z/LSG/00002', 'ZG/LSG/0014>Z/LSG/00011', 'ZG/LSG/0018>Z/LSG/00014',
     ]);
 
     expect(await linkedLines()).toBe(0);
@@ -344,7 +349,7 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     const res = await apply(hash);
     expect(res.status).toBe(200);
     const d = res.body.data;
-    expect(d).toMatchObject({ dryRun: false, linesLinked: 6, headersSet: 3, poStatusesRederived: 5 });
+    expect(d).toMatchObject({ dryRun: false, linesLinked: 7, headersSet: 4, poStatusesRederived: 6 });
     expect(d.auditIds).toHaveLength(1);
 
     const g = (no: string, i = 0) => grns[no]!.lines[i]!;
@@ -355,6 +360,7 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     expect(Number(await poLineOf(g('ZG/LSG/0013', 0)))).toBe(p('Z/LSG/00009'));
     expect(Number(await poLineOf(g('ZG/LSG/0013', 1)))).toBe(p('Z/LSG/00010'));
     expect(Number(await poLineOf(g('ZG/LSG/0014')))).toBe(p('Z/LSG/00011'));
+    expect(Number(await poLineOf(g('ZG/LSG/0018')))).toBe(p('Z/LSG/00014'));
     for (const held of ['ZG/LSG/0003', 'ZG/LSG/0005', 'ZG/LSG/0009', 'ZG/LSG/0010', 'ZG/LSG/0012', 'ZG/LSG/0017', 'ZG/LSG/0099']) {
       expect(await poLineOf(g(held))).toBeNull();
     }
@@ -368,6 +374,7 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     expect(await statusOf('Z/LSG/00009')).toBe('COMPLETED');
     expect(await statusOf('Z/LSG/00010')).toBe('PARTIALLY_RECEIVED');
     expect(await statusOf('Z/LSG/00011')).toBe('COMPLETED');
+    expect(await statusOf('Z/LSG/00014')).toBe('COMPLETED');
     expect(await statusOf('Z/LSG/00007')).toBe('OPEN');
     expect(await statusOf('Z/LSG/00013')).toBe('PARTIALLY_RECEIVED');
     expect(await count(`SELECT COUNT(*)::int AS n FROM v_po_line_balance WHERE received_qty > po_qty`)).toBe(0);
@@ -377,7 +384,7 @@ describe('Link store GRNs — dry run, apply, second run', () => {
       'SELECT before_data, after_data FROM audit_logs WHERE id = $1', [d.auditIds[0]],
     );
     expect(batch!.after_data.kind).toBe('links');
-    expect(batch!.before_data.links).toHaveLength(6);
+    expect(batch!.before_data.links).toHaveLength(7);
     expect(batch!.before_data.links.every((l) => l.poLineId === null)).toBe(true);
     expect(batch!.after_data.links.find((l) => l.grnLineId === g('ZG/LSG/0002'))!.poLineId).toBe(p('Z/LSG/00002'));
     expect(await count(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE entity = 'store_grn_link' AND after_data->>'kind' = 'run'`)).toBe(1);
@@ -389,7 +396,7 @@ describe('Link store GRNs — dry run, apply, second run', () => {
     expect(d.held.every((h: { reason: string }) => h.reason !== 'NOT_ON_TAB' || h.grnNo === 'ZG/LSG/0011')).toBe(true);
     const again = await apply(d.selectionHash);
     expect(again.status).toBe(422);
-    expect(await linkedLines()).toBe(6);
+    expect(await linkedLines()).toBe(7);
   });
 });
 
@@ -410,7 +417,7 @@ describe('Link store GRNs — undo', () => {
     expect(await poLineOf(line)).toBeNull();
     expect(await headerPoOf('ZG/LSG/0002')).toBeNull();
     expect(await statusOf('Z/LSG/00002')).toBe('OPEN');
-    expect(await linkedLines()).toBe(5);
+    expect(await linkedLines()).toBe(6);
   });
 
   it('takes back a whole run by its audit entry, skipping what is already undone, and only once', async () => {
@@ -419,11 +426,11 @@ describe('Link store GRNs — undo', () => {
       .send({ auditId: run!.id, reason: 'Re-run after the tab is corrected', confirm: 'UNDO STORE GRN LINKS' });
     expect(res.status).toBe(200);
     const d = res.body.data;
-    expect(d.undone).toHaveLength(5);
+    expect(d.undone).toHaveLength(6);
     expect(d.skipped).toEqual([{ grnLineId: grns['ZG/LSG/0002']!.lines[0], reason: 'It is not linked now (already undone).' }]);
-    expect(d.headersCleared.map((h: { grnNo: string }) => h.grnNo).sort()).toEqual(['ZG/LSG/0001', 'ZG/LSG/0014']);
+    expect(d.headersCleared.map((h: { grnNo: string }) => h.grnNo).sort()).toEqual(['ZG/LSG/0001', 'ZG/LSG/0014', 'ZG/LSG/0018']);
     expect(await linkedLines()).toBe(0);
-    for (const po of ['Z/LSG/00001', 'Z/LSG/00009', 'Z/LSG/00010', 'Z/LSG/00011']) expect(await statusOf(po)).toBe('OPEN');
+    for (const po of ['Z/LSG/00001', 'Z/LSG/00009', 'Z/LSG/00010', 'Z/LSG/00011', 'Z/LSG/00014']) expect(await statusOf(po)).toBe('OPEN');
     expect(await statusOf('Z/LSG/00013')).toBe('PARTIALLY_RECEIVED'); // its ERP-made GRN link was never this repair's
     expect(Number(await poLineOf(grns['GRN-LSG-0001']!.lines[0]!))).toBe(pos['Z/LSG/00013']!.lines[0]);
     expect(await count(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE entity = 'store_grn_link' AND action = 'CANCEL'`)).toBe(2);
@@ -439,7 +446,7 @@ describe('Link store GRNs — undo', () => {
 
   it('proposes the same links again from the same evidence once they are undone', async () => {
     const d = await dryRun();
-    expect(d.totals).toMatchObject({ unlinkedLines: 18, linkable: 6 });
+    expect(d.totals).toMatchObject({ unlinkedLines: 19, linkable: 7 });
   });
 });
 
