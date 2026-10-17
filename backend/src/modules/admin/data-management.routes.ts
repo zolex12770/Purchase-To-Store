@@ -1588,10 +1588,12 @@ router.post(
    about Rs 79.5 Cr pending receipt, though the tab's 'Po No' column records which PO
    each receipt was against. The evidence rules are in store-grn-links.ts. Super Admin
    only. dryRun (the default) lists what would be linked, why every other line is not,
-   the POs' statuses and the pending value before and after, and a selectionHash;
-   applying needs the typed confirmation and that hash, re-reads the tab and re-plans
-   in the transaction that writes. Undo takes back exactly the links one audit entry
-   (or a run) recorded, or those of the GRN lines named. */
+   the supplier pairs that differ, the POs' statuses and the pending value before and
+   after, and a selectionHash. The reviewer may keep lines out (excludeGrnLineIds) and
+   confirm two supplier records as one company (sameSupplierPairs); the apply repeats
+   those choices with the typed confirmation and the hash, re-reads the tab and
+   re-plans in the transaction that writes. Undo takes back exactly the links one
+   audit entry (or a run) recorded, or those of the GRN lines named, a GRN whole. */
 
 /** The GRN tab's reader: the sync engine's own, unless the app was handed another (tests). */
 const grnTabReaderOf = (req: Request): SheetReader =>
@@ -1601,6 +1603,11 @@ const linkStoreGrnsSchema = z.object({
   dryRun: z.boolean().default(true),
   confirm: z.string().optional(),
   expectedHash: z.string().trim().regex(/^[0-9a-f]{64}$/, 'expectedHash is the selectionHash a dry run returned.').optional(),
+  excludeGrnLineIds: z.array(z.coerce.number().int().positive()).max(20000).default([]),
+  sameSupplierPairs: z.array(z.object({
+    grnSupplierId: z.coerce.number().int().positive(),
+    poSupplierId: z.coerce.number().int().positive(),
+  })).max(1000).default([]),
 });
 
 router.post(
@@ -1608,7 +1615,7 @@ router.post(
   requireSuperAdmin(),
   validateBody(linkStoreGrnsSchema),
   asyncHandler(async (req, res) => {
-    const { dryRun, confirm, expectedHash } = req.body as z.infer<typeof linkStoreGrnsSchema>;
+    const { dryRun, confirm, expectedHash, excludeGrnLineIds, sameSupplierPairs } = req.body as z.infer<typeof linkStoreGrnsSchema>;
     if (!dryRun) {
       if (confirm !== 'LINK STORE GRNS') {
         throw ValidationError('Type "LINK STORE GRNS" to confirm. Take a verified backup first.');
@@ -1622,15 +1629,18 @@ router.post(
     const grid = await grnTabReaderOf(req)(STORE_GRN_TAB);
     if (dryRun) {
       // One read-only transaction, so every figure comes from the same moment.
-      const plan = await withTransaction((tx) => planStoreGrnLinks(runIn(tx), grid));
+      const plan = await withTransaction((tx) => planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds, sameSupplierPairs }));
       sendOk(res, { dryRun: true, ...describeLinkPlan(plan), message: `${summariseLinkPlan(plan)} Nothing was changed.` });
       return;
     }
-    const result = await withTransaction((tx) => applyStoreGrnLinks(tx, grid, { expectedHash: expectedHash!, actor: actorFrom(req) }));
+    const result = await withTransaction((tx) => applyStoreGrnLinks(tx, grid, {
+      expectedHash: expectedHash!, actor: actorFrom(req), excludeGrnLineIds, sameSupplierPairs,
+    }));
     sendOk(res, {
       dryRun: false,
       linesLinked: result.linesLinked,
       headersSet: result.headersSet,
+      headersCleared: result.headersCleared,
       poStatusesRederived: result.poStatusesRederived,
       runId: result.runId,
       auditIds: result.auditIds,
@@ -1660,7 +1670,7 @@ router.post(
     const result = await withTransaction((tx) => undoStoreGrnLinks(tx, { auditId, grnLineIds }, { reason, actor: actorFrom(req) }));
     sendOk(res, {
       ...result,
-      message: `${result.undone.length} GRN line link(s) undone and ${result.headersCleared.length} GRN header(s) cleared; `
+      message: `${result.undone.length} GRN line link(s) undone and ${result.headersRestored.length} GRN header(s) set back; `
         + `${result.poStatusesRederived} PO status(es) re-derived.${result.skipped.length ? ` ${result.skipped.length} line(s) skipped.` : ''}`,
     });
   }),

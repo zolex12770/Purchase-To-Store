@@ -10,19 +10,29 @@
  *
  * The evidence is that tab, read by the sync engine's reader with the engine's own
  * column mapping for it. A POSTED GRN line without a PO link is linked only when
+ *   · the reviewer did not keep it out of the run (excludeGrnLineIds);
  *   · its GRN number and item are on the tab, the item matched as the engine's GRN
  *     reconciliation matches it: the resolved item, the code or the description;
  *   · every tab row for it names the same one PO (a blank or '-' names none);
  *   · that PO is in the ERP, is neither DRAFT nor CANCELLED (neither can hold a
  *     receipt), and has exactly one line for the item, matched the same way;
- *   · the PO line has then received no more than it ordered (+0.0001). All the
- *     receipts the tab assigns to one PO line are linked together or not at all, so
- *     the result never depends on which receipt happens to be counted first.
+ *   · the PO is the GRN's supplier's: the ERP's own receipt takes a PO GRN's supplier
+ *     from its PO and never mixes two. A GRN the import gave its placeholder supplier
+ *     is exempt, and so are two supplier records the reviewer confirms are one
+ *     company (sameSupplierPairs);
+ *   · the PO is dated no more than 30 days after the receipt;
+ *   · the PO line has then received no more than it ordered (+0.0001), counting at
+ *     once every receipt the tab assigns to it, so the result never depends on which
+ *     receipt happens to be counted first;
+ *   · every other unlinked line of its GRN is linked too. GET /grn/:id calls a GRN
+ *     with any linked line a PO GRN, and PUT /grn/:id then wants a PO line on every
+ *     line, so a GRN linked in part could no longer be saved from the GRN screen.
  * Every other line is listed with its reason and figures. Only grn_lines.po_line_id
- * and, when all of a GRN's linked lines point to one PO, grn_headers.po_id are
+ * and grn_headers.po_id (the one PO all the GRN's lines point to, else none) are
  * written, and the affected POs' statuses are re-derived. Quantities, stock and the
  * ledger are never touched and nothing is deleted. Each batch of links is recorded
- * in the audit log, and undo takes back exactly the links recorded there.
+ * in the audit log with the values it replaced, and undo takes back exactly the
+ * links recorded there, a whole GRN at a time.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { txQuery, type Queryable } from '../../db/index.js';
@@ -35,17 +45,34 @@ import { recomputePoStatuses, resolveColumns, type ColumnMap } from '../google-s
 export const STORE_GRN_TAB = 'GRN';
 /** Every audit entry of this repair; after_data.kind tells a link batch, a run and an undo apart. */
 export const LINK_AUDIT_ENTITY = 'store_grn_link';
+/**
+ * The supplier the store import gave a GRN whose tab row named none
+ * (scripts/live_source_reimport.ts): 251 of the lines linked to another supplier's
+ * PO in the 2026-10-17 copy carry it, and its PO is the only supplier evidence.
+ */
+export const IMPORT_PLACEHOLDER_SUPPLIER_CODE = 'SUP-UNSPECIFIED';
+/**
+ * A PO dated more than this many days after the receipt is not taken as the order the
+ * goods came against. In the 2026-10-17 copy 197 links had their PO dated the day after
+ * the GRN, and one 165 days after it (ZG/RM/0029 to Z/RM/00222, another supplier's).
+ */
+export const PO_AFTER_RECEIPT_DAYS = 30;
 /** A PO line may end up with its ordered quantity plus this (NUMERIC(18,4)). */
 const OVER_RECEIPT_TOLERANCE = dec('0.0001');
 /** GRN lines per audit entry. A GRN is never split between two entries. */
 const AUDIT_BATCH_LINES = 500;
 /** Lines shown per reason in a response's samples; the full lists follow them. */
 const SAMPLES_PER_REASON = 10;
+/** Blocking lines named in a GRN_PARTLY_HELD detail; blockedBy lists them all. */
+const BLOCKERS_NAMED = 5;
+const DAY_MS = 86_400_000;
 
 /** Reads one tab of the business sheet: the sync engine's readSheet, or a test's grid. */
 export type SheetReader = (sheetName: string) => Promise<string[][]>;
 
+/** In the order the checks run; a line is held by the first one it fails. */
 export const HOLD_REASONS = {
+  EXCLUDED: 'The reviewer kept it out of this run (excludeGrnLineIds).',
   NOT_ON_TAB: 'Its GRN number and item are not on the GRN tab.',
   NO_PO_NAMED: 'A tab row for it names no PO (blank or -).',
   SEVERAL_POS: 'Its tab rows name more than one PO.',
@@ -53,10 +80,24 @@ export const HOLD_REASONS = {
   PO_NOT_RECEIVABLE: 'The PO the tab names is DRAFT or CANCELLED in the ERP and cannot hold a receipt.',
   ITEM_NOT_ON_PO: 'The PO the tab names has no line for this item.',
   SEVERAL_PO_LINES: 'The PO the tab names has more than one line for this item.',
+  SUPPLIER_MISMATCH: "The PO the tab names is another supplier's, and the two supplier records are not confirmed as one company (sameSupplierPairs).",
+  PO_AFTER_RECEIPT: `The PO the tab names is dated more than ${PO_AFTER_RECEIPT_DAYS} days after the GRN.`,
   OVER_RECEIPT: 'With every receipt the tab assigns to that PO line, it would receive more than it ordered.',
+  GRN_PARTLY_HELD: 'Another line of its GRN is held, and a GRN is linked whole or not at all.',
 } as const;
 export type HoldReason = keyof typeof HOLD_REASONS;
 const REASONS = Object.keys(HOLD_REASONS) as HoldReason[];
+
+/** Two supplier records; a GRN of one may be linked to a PO of the other once the reviewer confirms them. */
+export interface SupplierPairRef { grnSupplierId: number; poSupplierId: number }
+
+/** What the reviewer decides on the dry run and repeats on the apply; the selectionHash covers it. */
+export interface ReviewChoices {
+  /** GRN lines kept out of this run; each one holds its whole GRN back. */
+  excludeGrnLineIds?: number[];
+  /** Supplier records confirmed as one company, e.g. 'GLOBAL  STAR' and 'GLOBAL STAR'. */
+  sameSupplierPairs?: SupplierPairRef[];
+}
 
 export interface TabRow {
   /** Sheet row number; the header is row 1. */
@@ -94,9 +135,37 @@ export interface HeldLine extends LineRef {
   poLines?: Array<{ poLineId: number; lineNo: number; itemCode: string; poQty: string }>;
   /** OVER_RECEIPT: the PO line and what the tab's receipts would make it. */
   poLine?: { poNo: string; poLineId: number; lineNo: number; poQty: string; receivedQty: string; proposedQty: string; wouldReceive: string; receipts: number };
+  /** SUPPLIER_MISMATCH: the GRN's supplier and the PO's. */
+  suppliers?: { grnSupplierId: number; grnSupplier: string; poSupplierId: number; poSupplier: string };
+  /** PO_AFTER_RECEIPT: the two dates. */
+  dates?: { grnDate: string; poDate: string; days: number };
+  /** GRN_PARTLY_HELD: the lines of the same GRN that hold it back. */
+  blockedBy?: Array<{ grnLineId: number; itemCode: string; reason: HoldReason }>;
 }
 
-export interface HeaderLink { grnId: number; grnNo: string; poId: number; poNo: string }
+/**
+ * A GRN header's PO once the run's links are in: the one PO all the GRN's lines point
+ * to, else none. That is what the GRN edit derives (grn/routes.ts updatePostedGrn), so
+ * re-saving the GRN keeps it.
+ */
+export interface HeaderChange {
+  grnId: number;
+  grnNo: string;
+  poIdBefore: number | null;
+  poNoBefore: string | null;
+  poIdAfter: number | null;
+  poNoAfter: string | null;
+}
+
+/** A GRN supplier and a PO supplier that differ on lines that passed every earlier check. */
+export interface SupplierPair extends SupplierPairRef {
+  grnSupplier: string;
+  poSupplier: string;
+  /** Confirmed as one company in sameSupplierPairs: its lines go on to the remaining checks. */
+  confirmedSame: boolean;
+  lines: number;
+  grns: string[];
+}
 
 export interface AffectedPo {
   poId: number;
@@ -116,26 +185,34 @@ export interface LinkPlan {
   tab: { sheet: string; rowsRead: number; rowsWithGrnAndItem: number; columns: Record<string, string> };
   links: PlannedLink[];
   held: HeldLine[];
-  headers: HeaderLink[];
+  headers: HeaderChange[];
   affectedPos: AffectedPo[];
+  supplierPairs: SupplierPair[];
+  /** The reviewer's choices as applied; exclusions naming no unlinked POSTED line are listed apart. */
+  review: { excludeGrnLineIds: number[]; excludedNotUnlinked: number[]; sameSupplierPairs: SupplierPairRef[] };
   /** PO lines whose receipts were all held back as an over-receipt. */
   overReceivedPoLines: number;
   totals: {
     unlinkedLines: number;
     linkable: number;
     linkableBeforeOverReceipt: number;
+    /** After the over-receipt check, before whole GRNs are held back for a held line. */
+    linkableBeforeWholeGrn: number;
     held: number;
     byReason: Record<HoldReason, number>;
     qtyLinked: string;
+    /** Links of GRNs the import gave its placeholder supplier to another supplier's PO. */
+    placeholderSupplierLinks: number;
     grns: number;
     grnHeadersSet: number;
+    grnHeadersCleared: number;
     affectedPos: number;
   };
   /** Every PO, by stored status: now, and once the affected POs carry their derived status. */
   poStatusCounts: { before: Record<string, number>; after: Record<string, number> };
   /** The dashboard's Pending PO Value (Σ pending_amount over receivable lines), before and after. */
   pendingValue: { before: string; after: string };
-  /** sha256 over the links, the PO-line figures they were checked against and the header links. */
+  /** sha256 over the links, the PO-line figures they were checked against, the header changes and the review choices. */
   selectionHash: string;
 }
 
@@ -151,6 +228,23 @@ function addTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
   const list = map.get(key);
   if (list) list.push(value);
   else map.set(key, [value]);
+}
+
+/** A confirmed pair holds in either direction: the two records are one company. */
+const pairKey = (a: number, b: number) => (a < b ? `${a}:${b}` : `${b}:${a}`);
+
+/** Whole days from one 'YYYY-MM-DD' date to another. */
+const daysFrom = (from: string, to: string) => Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / DAY_MS);
+
+/** The review choices in one order, so the same choices always hash the same. */
+function normaliseReview(choices: ReviewChoices): { excluded: number[]; pairs: SupplierPairRef[] } {
+  const excluded = [...new Set((choices.excludeGrnLineIds ?? []).map(Number))].sort((a, b) => a - b);
+  const pairs = new Map<string, SupplierPairRef>();
+  for (const p of choices.sameSupplierPairs ?? []) {
+    const ref = { grnSupplierId: Number(p.grnSupplierId), poSupplierId: Number(p.poSupplierId) };
+    pairs.set(pairKey(ref.grnSupplierId, ref.poSupplierId), ref);
+  }
+  return { excluded, pairs: [...pairs.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, p]) => p) };
 }
 
 /**
@@ -193,8 +287,11 @@ function tabRowsOf(grid: string[][], columns: ColumnMap[]): { rows: TabRow[]; co
   return { rows, columns: Object.fromEntries([...index].map(([field, i]) => [field, header[i] ?? ''])) };
 }
 
-type GrnLineRow = { id: number; grn_id: number; grn_no: string; item_id: number; item_code: string; item_description: string; grn_qty: string };
-type PoHeaderRow = { id: number; po_no: string; key: string; status: string };
+type GrnLineRow = {
+  id: number; grn_id: number; grn_no: string; grn_date: string; supplier_id: number; supplier_code: string; supplier_name: string;
+  item_id: number; item_code: string; item_description: string; grn_qty: string;
+};
+type PoHeaderRow = { id: number; po_no: string; key: string; status: string; po_date: string; supplier_id: number; supplier_name: string };
 type PoLineRow = {
   po_line_id: number; po_id: number; line_no: number; item_id: number; item_code: string; item_description: string;
   po_qty: string; received_qty: string;
@@ -234,11 +331,15 @@ const PO_FIGURES_SQL = `
 
 /**
  * Works out every link from the tab's grid and the database as they are now.
- * `lock` (inside the apply transaction) takes the unlinked GRN lines and the named
- * POs' lines FOR UPDATE first, so a GRN posted meanwhile cannot slip past the
- * over-receipt check.
+ * `lock` (inside the apply transaction) takes the unlinked GRN lines, the named POs'
+ * lines and the linked GRNs' headers FOR UPDATE first, so a GRN posted meanwhile
+ * cannot slip past the over-receipt check.
  */
-export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock?: boolean } = {}): Promise<LinkPlan> {
+export async function planStoreGrnLinks(
+  run: Run,
+  grid: string[][],
+  opts: ReviewChoices & { lock?: boolean } = {},
+): Promise<LinkPlan> {
   const [mapping] = await run<{ column_map: ColumnMap[] }>(
     'SELECT column_map FROM google_sheet_mappings WHERE sheet_name = $1', [STORE_GRN_TAB],
   );
@@ -246,15 +347,20 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
     throw BusinessRuleError(`The Google sync has no column mapping for the ${STORE_GRN_TAB} tab, so the tab cannot be read. Nothing was linked.`);
   }
   const tab = tabRowsOf(grid, Array.isArray(mapping.column_map) ? mapping.column_map : []);
+  const review = normaliseReview(opts);
+  const excluded = new Set(review.excluded);
+  const confirmedSame = new Set(review.pairs.map((p) => pairKey(p.grnSupplierId, p.poSupplierId)));
 
-  // 1. The receipts without a PO.
+  // 1. The receipts without a PO, with their GRN's supplier and date.
   const lines = await run<GrnLineRow>(
-    `SELECT gl.id, gl.grn_id, gh.grn_no, gl.item_id, gl.item_code, gl.item_description, gl.grn_qty::text AS grn_qty
-       FROM grn_lines gl JOIN grn_headers gh ON gh.id = gl.grn_id
+    `SELECT gl.id, gl.grn_id, gh.grn_no, gh.grn_date::text AS grn_date, gh.supplier_id, s.supplier_code, s.supplier_name,
+            gl.item_id, gl.item_code, gl.item_description, gl.grn_qty::text AS grn_qty
+       FROM grn_lines gl JOIN grn_headers gh ON gh.id = gl.grn_id JOIN suppliers s ON s.id = gh.supplier_id
       WHERE gl.po_line_id IS NULL AND gh.status = 'POSTED'
       ORDER BY gl.id${opts.lock ? ' FOR UPDATE OF gl' : ''}`,
     [],
   );
+  const unlinkedIds = new Set(lines.map((l) => Number(l.id)));
 
   // 2. The item each tab row names, resolved as the engine's findItem resolves it: by
   //    code, else by description (the code cell when the row has none). One query for
@@ -294,6 +400,10 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
       grnLineId: Number(l.id), grnId: Number(l.grn_id), grnNo: l.grn_no, itemCode: l.item_code,
       grnQty: toQty(l.grn_qty), tabRows: rows.map((r) => r.row),
     };
+    if (excluded.has(ref.grnLineId)) {
+      hold(ref, 'EXCLUDED', 'Kept out of this run by the reviewer (excludeGrnLineIds).');
+      continue;
+    }
     if (rows.length === 0) {
       hold(ref, 'NOT_ON_TAB', `No row of the ${STORE_GRN_TAB} tab names GRN ${l.grn_no} with item ${l.item_code}.`);
       continue;
@@ -319,10 +429,11 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
     named.push({ ref, line: l, rows, poKey: [...spelled.keys()][0]!, poNo: poNos[0]! });
   }
 
-  // 4. The POs named, and their lines with what they have received so far.
+  // 4. The POs named, with their supplier and date, and their lines with what they have received so far.
   const poHeaders = named.length === 0 ? [] : await run<PoHeaderRow>(
-    `SELECT id, po_no, upper(trim(po_no)) AS key, status FROM purchase_order_headers
-      WHERE upper(trim(po_no)) = ANY($1::text[]) ORDER BY id`,
+    `SELECT h.id, h.po_no, upper(trim(h.po_no)) AS key, h.status, h.po_date::text AS po_date, h.supplier_id, s.supplier_name
+       FROM purchase_order_headers h JOIN suppliers s ON s.id = h.supplier_id
+      WHERE upper(trim(h.po_no)) = ANY($1::text[]) ORDER BY h.id`,
     [[...new Set(named.map((n) => n.poKey))]],
   );
   const posByKey = new Map<string, PoHeaderRow[]>();
@@ -342,7 +453,10 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
 
   // 5. The PO line for each item, matched as the engine matches a PO row to stored lines:
   //    the resolved item, the code, or the description (or the code cell read as one).
+  //    Then the PO must be the GRN supplier's and not dated well after the receipt.
   const candidates: Array<{ ref: LineRef; header: PoHeaderRow; poLine: PoLineRow }> = [];
+  const supplierPairs = new Map<string, SupplierPair>();
+  const placeholderLines = new Set<number>();
   for (const n of named) {
     const found = posByKey.get(n.poKey) ?? [];
     if (found.length === 0) {
@@ -377,13 +491,48 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
       });
       continue;
     }
+    // The ERP's own receipt takes a PO GRN's supplier from its PO and refuses to mix two
+    // (grn/routes.ts resolveGrnLines); the tab's PO number alone does not outweigh the
+    // GRN's supplier. The 2026-10-17 review found ZG/RM/0330 (COPTEC) naming Z/RM/00200,
+    // RATNACHINTAMANI's PO.
+    const grnSupplierId = Number(n.line.supplier_id);
+    const poSupplierId = Number(header.supplier_id);
+    if (grnSupplierId !== poSupplierId) {
+      if (n.line.supplier_code === IMPORT_PLACEHOLDER_SUPPLIER_CODE) {
+        placeholderLines.add(n.ref.grnLineId);
+      } else {
+        const confirmed = confirmedSame.has(pairKey(grnSupplierId, poSupplierId));
+        const pair = supplierPairs.get(`${grnSupplierId}>${poSupplierId}`) ?? {
+          grnSupplierId, grnSupplier: n.line.supplier_name, poSupplierId, poSupplier: header.supplier_name,
+          confirmedSame: confirmed, lines: 0, grns: [],
+        };
+        pair.lines += 1;
+        if (!pair.grns.includes(n.ref.grnNo)) pair.grns.push(n.ref.grnNo);
+        supplierPairs.set(`${grnSupplierId}>${poSupplierId}`, pair);
+        if (!confirmed) {
+          hold(n.ref, 'SUPPLIER_MISMATCH', `${n.ref.grnNo} is from ${n.line.supplier_name} (supplier ${grnSupplierId}); `
+            + `${header.po_no} is ${header.supplier_name}'s (supplier ${poSupplierId}).`, {
+            poNos: [n.poNo],
+            suppliers: { grnSupplierId, grnSupplier: n.line.supplier_name, poSupplierId, poSupplier: header.supplier_name },
+          });
+          continue;
+        }
+      }
+    }
+    const days = daysFrom(n.line.grn_date, header.po_date);
+    if (days > PO_AFTER_RECEIPT_DAYS) {
+      hold(n.ref, 'PO_AFTER_RECEIPT', `${header.po_no} is dated ${header.po_date}, ${days} days after ${n.ref.grnNo} (${n.line.grn_date}).`, {
+        poNos: [n.poNo], dates: { grnDate: n.line.grn_date, poDate: header.po_date, days },
+      });
+      continue;
+    }
     candidates.push({ ref: n.ref, header, poLine: matches[0]! });
   }
 
   // 6. Over-receipt, per PO line, over all the receipts the tab assigns to it at once.
   const byPoLine = new Map<number, typeof candidates>();
   for (const c of candidates) addTo(byPoLine, Number(c.poLine.po_line_id), c);
-  const links: PlannedLink[] = [];
+  const linkable: PlannedLink[] = [];
   const checked: Array<[number, string, string]> = [];
   let overReceivedPoLines = 0;
   for (const [poLineId, group] of byPoLine) {
@@ -405,45 +554,78 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
       continue;
     }
     for (const c of group) {
-      links.push({ ...c.ref, poId: Number(header.id), poNo: header.po_no, poLineId, poLineNo: Number(poLine.line_no) });
+      linkable.push({ ...c.ref, poId: Number(header.id), poNo: header.po_no, poLineId, poLineNo: Number(poLine.line_no) });
     }
+  }
+  checked.sort((a, b) => a[0] - b[0]);
+
+  // 7. A GRN is linked whole or not at all. GET /grn/:id calls a GRN with any linked line
+  //    a PO GRN; PUT /grn/:id then wants a PO line on every line (grnSchema) and will not
+  //    switch it back to DIRECT (updatePostedGrn), so a GRN linked in part could no longer
+  //    be saved. The 2026-10-17 review found 169 GRNs that would have been left so, e.g.
+  //    ZG/RM/0011 with CRC245120 linked and CRC195120 held as an over-receipt. Holding a
+  //    receipt back only lowers what its PO line receives, so no over-receipt follows.
+  const heldOfGrn = new Map<number, HeldLine[]>();
+  for (const h of held) addTo(heldOfGrn, h.grnId, h);
+  const links: PlannedLink[] = [];
+  for (const l of linkable) {
+    const blocking = heldOfGrn.get(l.grnId);
+    if (!blocking) {
+      links.push(l);
+      continue;
+    }
+    const blockers = blocking.slice(0, BLOCKERS_NAMED).map((b) => `${b.itemCode} (${b.reason})`).join(', ');
+    hold(l, 'GRN_PARTLY_HELD', `${l.grnNo} is linked whole or not at all, and ${blocking.length} of its line(s) are held: `
+      + `${blockers}${blocking.length > BLOCKERS_NAMED ? ', …' : ''}. It would link to ${l.poNo} line ${l.poLineNo}.`, {
+      poNos: [l.poNo],
+      blockedBy: blocking.map((b) => ({ grnLineId: b.grnLineId, itemCode: b.itemCode, reason: b.reason })),
+    });
   }
   links.sort((a, b) => a.grnLineId - b.grnLineId);
   held.sort((a, b) => a.grnLineId - b.grnLineId);
-  checked.sort((a, b) => a[0] - b[0]);
 
-  // 7. A GRN header names its PO once every linked line of the GRN points to that one PO.
+  // 8. Each linked GRN's header then names the one PO all its lines point to, else none:
+  //    what the GRN edit derives (grn/routes.ts updatePostedGrn), so re-saving the GRN
+  //    keeps it. A header naming one PO while the lines point to two is cleared, and the
+  //    value it held is recorded for undo.
   const grnIds = [...new Set(links.map((l) => l.grnId))];
-  const linkedBefore = grnIds.length === 0 ? [] : await run<{ grn_id: number; header_po_id: number | null; po_id: number | null }>(
-    `SELECT gh.id AS grn_id, gh.po_id AS header_po_id, pol.po_id
+  const linkedBefore = grnIds.length === 0 ? [] : await run<{ grn_id: number; header_po_id: number | null; header_po_no: string | null; po_id: number | null }>(
+    `SELECT gh.id AS grn_id, gh.po_id AS header_po_id, hp.po_no AS header_po_no, pol.po_id
        FROM grn_headers gh
+       LEFT JOIN purchase_order_headers hp ON hp.id = gh.po_id
        LEFT JOIN grn_lines gl ON gl.grn_id = gh.id AND gl.po_line_id IS NOT NULL
        LEFT JOIN purchase_order_lines pol ON pol.id = gl.po_line_id
-      WHERE gh.id = ANY($1::bigint[])`,
+      WHERE gh.id = ANY($1::bigint[])${opts.lock ? ' FOR UPDATE OF gh' : ''}`,
     [grnIds],
   );
-  const posOfGrn = new Map<number, { headerPoId: number | null; poIds: Set<number> }>();
+  const posOfGrn = new Map<number, { poIdBefore: number | null; poNoBefore: string | null; poIds: Set<number> }>();
   for (const r of linkedBefore) {
-    const g = posOfGrn.get(Number(r.grn_id)) ?? { headerPoId: r.header_po_id == null ? null : Number(r.header_po_id), poIds: new Set<number>() };
+    const g = posOfGrn.get(Number(r.grn_id))
+      ?? { poIdBefore: r.header_po_id == null ? null : Number(r.header_po_id), poNoBefore: r.header_po_no, poIds: new Set<number>() };
     if (r.po_id != null) g.poIds.add(Number(r.po_id));
     posOfGrn.set(Number(r.grn_id), g);
   }
   const firstLinkOf = new Map<number, PlannedLink>();
+  const poNoOf = new Map<number, string>();
   for (const l of links) {
     posOfGrn.get(l.grnId)?.poIds.add(l.poId);
+    poNoOf.set(l.poId, l.poNo);
     if (!firstLinkOf.has(l.grnId)) firstLinkOf.set(l.grnId, l);
   }
-  const headers: HeaderLink[] = [];
+  const headers: HeaderChange[] = [];
   for (const grnId of grnIds) {
-    const g = posOfGrn.get(grnId);
-    // One PO in the set means it is this GRN's linked PO.
-    if (!g || g.headerPoId !== null || g.poIds.size !== 1) continue;
-    const link = firstLinkOf.get(grnId)!;
-    headers.push({ grnId, grnNo: link.grnNo, poId: link.poId, poNo: link.poNo });
+    const g = posOfGrn.get(grnId)!;
+    // Every line of the GRN is linked now (step 7), so its lines' POs are these.
+    const poIdAfter = g.poIds.size === 1 ? [...g.poIds][0]! : null;
+    if (poIdAfter === g.poIdBefore) continue;
+    headers.push({
+      grnId, grnNo: firstLinkOf.get(grnId)!.grnNo, poIdBefore: g.poIdBefore, poNoBefore: g.poNoBefore,
+      poIdAfter, poNoAfter: poIdAfter === null ? null : poNoOf.get(poIdAfter) ?? null,
+    });
   }
   headers.sort((a, b) => a.grnId - b.grnId);
 
-  // 8. The POs before and after, and the totals over every PO.
+  // 9. The POs before and after, and the totals over every PO.
   const affectedIds = [...new Set(links.map((l) => l.poId))];
   const gained = new Map<number, { lines: number; qty: ReturnType<typeof dec> }>();
   const addedPerLine = new Map<number, ReturnType<typeof dec>>();
@@ -484,7 +666,8 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
   const selectionHash = createHash('sha256').update(JSON.stringify({
     links: links.map((l) => [l.grnLineId, l.poLineId, l.grnQty]),
     poLines: checked,
-    headers: headers.map((h) => [h.grnId, h.poId]),
+    headers: headers.map((h) => [h.grnId, h.poIdBefore, h.poIdAfter]),
+    review: { excluded: review.excluded, sameSuppliers: review.pairs.map((p) => pairKey(p.grnSupplierId, p.poSupplierId)) },
   })).digest('hex');
 
   return {
@@ -493,16 +676,25 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
     held,
     headers,
     affectedPos,
+    supplierPairs: [...supplierPairs.values()].sort((a, b) => b.lines - a.lines || a.grnSupplierId - b.grnSupplierId || a.poSupplierId - b.poSupplierId),
+    review: {
+      excludeGrnLineIds: review.excluded,
+      excludedNotUnlinked: review.excluded.filter((id) => !unlinkedIds.has(id)),
+      sameSupplierPairs: review.pairs,
+    },
     overReceivedPoLines,
     totals: {
       unlinkedLines: lines.length,
       linkable: links.length,
       linkableBeforeOverReceipt: candidates.length,
+      linkableBeforeWholeGrn: linkable.length,
       held: held.length,
       byReason,
       qtyLinked: toQty(links.reduce((s, l) => s.plus(dec(l.grnQty)), dec(0))),
+      placeholderSupplierLinks: links.filter((l) => placeholderLines.has(l.grnLineId)).length,
       grns: grnIds.length,
-      grnHeadersSet: headers.length,
+      grnHeadersSet: headers.filter((h) => h.poIdAfter !== null).length,
+      grnHeadersCleared: headers.filter((h) => h.poIdAfter === null).length,
       affectedPos: affectedPos.length,
     },
     poStatusCounts: { before, after: Object.fromEntries(Object.entries(after).filter(([, n]) => n !== 0)) },
@@ -531,12 +723,14 @@ export function describeLinkPlan(plan: LinkPlan) {
   return {
     selectionHash: plan.selectionHash,
     tab: plan.tab,
+    review: plan.review,
     totals: plan.totals,
     overReceivedPoLines: plan.overReceivedPoLines,
     reasons: HOLD_REASONS,
     poStatusCounts: plan.poStatusCounts,
     statusTransitions: statusTransitions(plan),
     pendingValue: plan.pendingValue,
+    supplierPairs: plan.supplierPairs,
     samples,
     affectedPos: plan.affectedPos,
     headers: plan.headers,
@@ -556,12 +750,12 @@ export function summariseLinkPlan(plan: LinkPlan): string {
 }
 
 /** Splits the links into audit batches of whole GRNs, at most AUDIT_BATCH_LINES lines each. */
-function batchesOf(plan: LinkPlan): Array<{ links: PlannedLink[]; headers: HeaderLink[] }> {
+function batchesOf(plan: LinkPlan): Array<{ links: PlannedLink[]; headers: HeaderChange[] }> {
   const byGrn = new Map<number, PlannedLink[]>();
   for (const l of plan.links) addTo(byGrn, l.grnId, l);
   const headerOf = new Map(plan.headers.map((h) => [h.grnId, h]));
-  const batches: Array<{ links: PlannedLink[]; headers: HeaderLink[] }> = [];
-  let current = { links: [] as PlannedLink[], headers: [] as HeaderLink[] };
+  const batches: Array<{ links: PlannedLink[]; headers: HeaderChange[] }> = [];
+  let current = { links: [] as PlannedLink[], headers: [] as HeaderChange[] };
   for (const [grnId, grnLinks] of byGrn) {
     if (current.links.length > 0 && current.links.length + grnLinks.length > AUDIT_BATCH_LINES) {
       batches.push(current);
@@ -579,6 +773,7 @@ export interface ApplyResult {
   plan: LinkPlan;
   linesLinked: number;
   headersSet: number;
+  headersCleared: number;
   poStatusesRederived: number;
   runId: string;
   auditIds: number[];
@@ -586,20 +781,23 @@ export interface ApplyResult {
 
 /**
  * Writes the plan the dry run showed. MUST run inside a transaction: the plan is
- * rebuilt with the rows locked and must carry the dry run's hash, and every linked
- * PO line and status is checked by the database before anything commits.
+ * rebuilt with the rows locked and must carry the dry run's hash (the same review
+ * choices included), and every linked PO line, GRN and status is checked by the
+ * database before anything commits.
  */
 export async function applyStoreGrnLinks(
   tx: Queryable,
   grid: string[][],
-  ctx: { expectedHash: string; actor: AuditActor },
+  ctx: ReviewChoices & { expectedHash: string; actor: AuditActor },
 ): Promise<ApplyResult> {
   const run = runIn(tx);
-  const plan = await planStoreGrnLinks(run, grid, { lock: true });
+  const plan = await planStoreGrnLinks(run, grid, {
+    lock: true, excludeGrnLineIds: ctx.excludeGrnLineIds, sameSupplierPairs: ctx.sameSupplierPairs,
+  });
   if (plan.selectionHash !== ctx.expectedHash) {
     throw ConflictError(
-      `The GRN tab or the ERP has changed since the dry run (now ${plan.totals.linkable} line(s) would be linked and ${plan.totals.held} listed). `
-        + 'Nothing was linked; run the dry run again and review it.',
+      `The GRN tab, the ERP or the review choices have changed since the dry run (now ${plan.totals.linkable} line(s) would be linked and `
+        + `${plan.totals.held} listed). Nothing was linked; run the dry run again with the same excludeGrnLineIds and sameSupplierPairs, and review it.`,
       { linkable: plan.totals.linkable, held: plan.totals.held, selectionHash: plan.selectionHash },
     );
   }
@@ -609,6 +807,7 @@ export async function applyStoreGrnLinks(
   const batches = batchesOf(plan);
   let linesLinked = 0;
   let headersSet = 0;
+  let headersCleared = 0;
   for (const [k, b] of batches.entries()) {
     const set = await run<{ id: number }>(
       `UPDATE grn_lines gl SET po_line_id = v.po_line_id, updated_at = now()
@@ -617,19 +816,22 @@ export async function applyStoreGrnLinks(
         RETURNING gl.id`,
       [JSON.stringify(b.links.map((l) => ({ grn_line_id: l.grnLineId, po_line_id: l.poLineId })))],
     );
-    const named = b.headers.length === 0 ? [] : await run<{ id: number }>(
-      `UPDATE grn_headers gh SET po_id = v.po_id, updated_at = now()
-         FROM jsonb_to_recordset($1::jsonb) AS v(grn_id bigint, po_id bigint)
-        WHERE gh.id = v.grn_id AND gh.po_id IS NULL
+    const changed = b.headers.length === 0 ? [] : await run<{ id: number }>(
+      `UPDATE grn_headers gh SET po_id = v.po_id_after, updated_at = now()
+         FROM jsonb_to_recordset($1::jsonb) AS v(grn_id bigint, po_id_before bigint, po_id_after bigint)
+        WHERE gh.id = v.grn_id AND gh.po_id IS NOT DISTINCT FROM v.po_id_before
         RETURNING gh.id`,
-      [JSON.stringify(b.headers.map((h) => ({ grn_id: h.grnId, po_id: h.poId })))],
+      [JSON.stringify(b.headers.map((h) => ({ grn_id: h.grnId, po_id_before: h.poIdBefore, po_id_after: h.poIdAfter })))],
     );
-    if (set.length !== b.links.length || named.length !== b.headers.length) {
+    if (set.length !== b.links.length || changed.length !== b.headers.length) {
       // The rows were locked and re-read in this transaction; a difference is a bug.
-      throw ServerError(`Linking batch ${k + 1} wrote ${set.length} of ${b.links.length} line(s) and ${named.length} of ${b.headers.length} header(s); nothing was written.`);
+      throw ServerError(`Linking batch ${k + 1} wrote ${set.length} of ${b.links.length} line(s) and ${changed.length} of ${b.headers.length} header(s); nothing was written.`);
     }
+    const set1 = b.headers.filter((h) => h.poIdAfter !== null).length;
+    const cleared1 = b.headers.length - set1;
     linesLinked += set.length;
-    headersSet += named.length;
+    headersSet += set1;
+    headersCleared += cleared1;
     const grns = new Set(b.links.map((l) => l.grnId)).size;
     await auditIn(tx, {
       actor: ctx.actor,
@@ -638,7 +840,7 @@ export async function applyStoreGrnLinks(
       entityLabel: `store GRN links ${k + 1}/${batches.length}: ${b.links[0]!.grnNo} … ${b.links[b.links.length - 1]!.grnNo}`,
       before: {
         links: b.links.map((l) => ({ grnLineId: l.grnLineId, poLineId: null })),
-        headers: b.headers.map((h) => ({ grnId: h.grnId, poId: null })),
+        headers: b.headers.map((h) => ({ grnId: h.grnId, poId: h.poIdBefore })),
       },
       after: {
         kind: 'links', runId, batch: k + 1, batches: batches.length, selectionHash: plan.selectionHash,
@@ -648,28 +850,43 @@ export async function applyStoreGrnLinks(
         })),
         headers: b.headers,
       },
-      message: `Linked ${b.links.length} store GRN line(s) on ${grns} GRN(s) to the PO lines the ${STORE_GRN_TAB} tab's 'Po No' column names `
-        + `(batch ${k + 1} of ${batches.length}); ${b.headers.length} GRN header(s) now name their one PO. Quantities, stock and the ledger were not changed.`,
+      message: `Linked ${b.links.length} store GRN line(s) on ${grns} whole GRN(s) to the PO lines the ${STORE_GRN_TAB} tab's 'Po No' column names `
+        + `(batch ${k + 1} of ${batches.length}); ${set1} GRN header(s) now name their one PO and ${cleared1} no longer name one, `
+        + 'their lines pointing to several. Quantities, stock and the ledger were not changed.',
     });
   }
 
   const poStatusesRederived = await recomputePoStatuses(tx, plan.affectedPos.map((p) => p.poId));
 
   // Checked by the database before anything commits: no linked PO line has received
-  // more than it ordered, and every affected PO carries the status the dry run showed.
+  // more than it ordered, no linked GRN is left with a line on no PO line or with a
+  // header other than its lines' one PO, and every affected PO carries the status the
+  // dry run showed.
   const over = await run<{ po_no: string; line_no: number; po_qty: string; received_qty: string }>(
     `SELECT po_no, line_no, po_qty::text AS po_qty, received_qty::text AS received_qty FROM v_po_line_balance
       WHERE po_line_id = ANY($1::bigint[]) AND received_qty > po_qty + $2::numeric`,
     [[...new Set(plan.links.map((l) => l.poLineId))], OVER_RECEIPT_TOLERANCE.toString()],
+  );
+  const partial = await run<{ grn_no: string }>(
+    `SELECT gh.grn_no
+       FROM grn_headers gh
+       JOIN grn_lines gl ON gl.grn_id = gh.id
+       LEFT JOIN purchase_order_lines pol ON pol.id = gl.po_line_id
+      WHERE gh.id = ANY($1::bigint[])
+      GROUP BY gh.id, gh.grn_no, gh.po_id
+     HAVING COUNT(*) FILTER (WHERE gl.po_line_id IS NULL) > 0
+         OR gh.po_id IS DISTINCT FROM (CASE WHEN COUNT(DISTINCT pol.po_id) = 1 THEN MIN(pol.po_id) END)`,
+    [[...new Set(plan.links.map((l) => l.grnId))]],
   );
   const statuses = await run<{ id: number; status: string }>(
     'SELECT id, status FROM purchase_order_headers WHERE id = ANY($1::bigint[])', [plan.affectedPos.map((p) => p.poId)],
   );
   const expected = new Map(plan.affectedPos.map((p) => [p.poId, p.statusAfter]));
   const drifted = statuses.filter((s) => expected.get(Number(s.id)) !== s.status);
-  if (over.length > 0 || drifted.length > 0) {
+  if (over.length > 0 || partial.length > 0 || drifted.length > 0) {
     throw ServerError(
-      `Linking check failed (${over.length} PO line(s) over-received, ${drifted.length} PO status(es) differ from the dry run); nothing was written.`,
+      `Linking check failed (${over.length} PO line(s) over-received, ${partial.length} GRN(s) not linked whole or with another header PO, `
+        + `${drifted.length} PO status(es) differ from the dry run); nothing was written.`,
     );
   }
 
@@ -685,21 +902,25 @@ export async function applyStoreGrnLinks(
     before: { poStatusCounts: plan.poStatusCounts.before, pendingValue: plan.pendingValue.before },
     after: {
       kind: 'run', runId, selectionHash: plan.selectionHash, batchAuditIds: auditIds, totals: plan.totals,
+      review: plan.review, supplierPairs: plan.supplierPairs,
       statusTransitions: statusTransitions(plan), poStatusesRederived,
       poStatusCounts: plan.poStatusCounts.after, pendingValue: plan.pendingValue.after,
     },
     message: `${summariseLinkPlan(plan)} Linked in ${auditIds.length} audited batch(es); undo takes back exactly these links. `
       + 'Quantities, stock and the ledger were not changed.',
   });
-  return { plan, linesLinked, headersSet, poStatusesRederived, runId, auditIds };
+  return { plan, linesLinked, headersSet, headersCleared, poStatusesRederived, runId, auditIds };
 }
 
 type LinkRecord = { grnLineId: number; grnId: number; grnNo: string; poLineId: number; poId: number; poNo: string };
-type AuditRow = { id: number; action: string; after_data: Record<string, unknown> | null };
+type AuditRow = { id: number; after_data: Record<string, unknown> | null };
 
 export interface UndoResult {
   undone: Array<{ grnLineId: number; grnNo: string; poLineId: number; poNo: string }>;
-  headersCleared: Array<{ grnId: number; grnNo: string; poId: number }>;
+  /** Headers set back to what they named before the run; `repairSet` is what the run had written. */
+  headersRestored: Array<{ grnId: number; grnNo: string; repairSet: number | null; restoredTo: number | null }>;
+  /** Headers the run changed that no longer hold what it wrote: left as they are. */
+  headersLeft: Array<{ grnId: number; grnNo: string; reason: string }>;
   skipped: Array<{ grnLineId: number; reason: string }>;
   poStatusesRederived: number;
 }
@@ -708,8 +929,11 @@ export interface UndoResult {
  * Takes back links this repair made: by one audit entry (a batch, or a whole run's
  * summary entry) or by GRN line ids. A link is set back to NULL only while the line
  * still points to the PO line this repair set, and only by the latest audit entry
- * that linked it. A header's po_id is cleared when the repair set it and no line of
- * the GRN points to that PO any more. MUST run inside a transaction.
+ * that linked it. A GRN is undone whole: one whose other repair-made links are not
+ * in the undo is skipped, as a GRN left with some lines on a PO line and others on
+ * none could no longer be saved from the GRN screen. A header the run changed is set
+ * back to its previous value while it still holds what the run wrote. MUST run
+ * inside a transaction.
  */
 export async function undoStoreGrnLinks(
   tx: Queryable,
@@ -718,24 +942,24 @@ export async function undoStoreGrnLinks(
 ): Promise<UndoResult> {
   const run = runIn(tx);
   const entries = await run<AuditRow>(
-    `SELECT id, action, after_data FROM audit_logs WHERE entity = $1 AND after_data->>'kind' = 'links' ORDER BY id`,
+    `SELECT id, after_data FROM audit_logs WHERE entity = $1 AND after_data->>'kind' = 'links' ORDER BY id`,
     [LINK_AUDIT_ENTITY],
   );
   const linksOf = (e: AuditRow) => (Array.isArray(e.after_data?.links) ? e.after_data!.links as LinkRecord[] : []);
-  const headersOf = (e: AuditRow) => (Array.isArray(e.after_data?.headers) ? e.after_data!.headers as HeaderLink[] : []);
-  // The latest entry that linked each line, and that named each header.
+  const headersOf = (e: AuditRow) => (Array.isArray(e.after_data?.headers) ? e.after_data!.headers as HeaderChange[] : []);
+  // The latest entry that linked each line, and that changed each header.
   const latest = new Map<number, { auditId: number; link: LinkRecord }>();
-  const headerSetBy = new Map<number, HeaderLink>();
+  const headerChangedBy = new Map<number, { auditId: number; header: HeaderChange }>();
   for (const e of entries) {
     for (const l of linksOf(e)) latest.set(Number(l.grnLineId), { auditId: Number(e.id), link: l });
-    for (const h of headersOf(e)) headerSetBy.set(Number(h.grnId), h);
+    for (const h of headersOf(e)) headerChangedBy.set(Number(h.grnId), { auditId: Number(e.id), header: h });
   }
 
   const skipped: UndoResult['skipped'] = [];
   const requested: Array<{ auditId: number; link: LinkRecord }> = [];
   if (target.auditId !== undefined) {
     const [entry] = await run<AuditRow & { entity: string }>(
-      'SELECT id, action, entity, after_data FROM audit_logs WHERE id = $1', [target.auditId],
+      'SELECT id, entity, after_data FROM audit_logs WHERE id = $1', [target.auditId],
     );
     if (!entry || entry.entity !== LINK_AUDIT_ENTITY) throw NotFoundError(`Store GRN link audit entry #${target.auditId}`);
     const kind = entry.after_data?.kind;
@@ -761,22 +985,45 @@ export async function undoStoreGrnLinks(
     }
   }
 
-  const current = requested.length === 0 ? [] : await run<{ id: number; po_line_id: number | null }>(
-    'SELECT id, po_line_id FROM grn_lines WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE',
-    [requested.map((r) => Number(r.link.grnLineId))],
+  // Every line of the GRNs concerned, to check each link and that its GRN is undone whole.
+  const grnIdsAsked = [...new Set(requested.map((r) => Number(r.link.grnId)))];
+  const current = grnIdsAsked.length === 0 ? [] : await run<{ id: number; grn_id: number; po_line_id: number | null }>(
+    'SELECT id, grn_id, po_line_id FROM grn_lines WHERE grn_id = ANY($1::bigint[]) ORDER BY id FOR UPDATE',
+    [grnIdsAsked],
   );
   const nowOf = new Map<number, number | null>(current.map((c) => [Number(c.id), c.po_line_id == null ? null : Number(c.po_line_id)]));
-  const toUndo: LinkRecord[] = [];
+  const inPlace: Array<{ auditId: number; link: LinkRecord }> = [];
   for (const r of requested) {
     const id = Number(r.link.grnLineId);
     const now = nowOf.get(id);
     if (!nowOf.has(id)) skipped.push({ grnLineId: id, reason: 'The GRN line no longer exists.' });
     else if (now === null) skipped.push({ grnLineId: id, reason: 'It is not linked now (already undone).' });
     else if (now !== Number(r.link.poLineId)) skipped.push({ grnLineId: id, reason: `It now points to another PO line (${now}), not the one this repair set.` });
-    else toUndo.push(r.link);
+    else inPlace.push(r);
+  }
+
+  const chosen = new Set(inPlace.map((r) => Number(r.link.grnLineId)));
+  const byGrn = new Map<number, typeof inPlace>();
+  for (const r of inPlace) addTo(byGrn, Number(r.link.grnId), r);
+  const toUndo: typeof inPlace = [];
+  for (const [grnId, group] of byGrn) {
+    // The GRN's other lines that still carry a link this repair made.
+    const left = current.filter((c) => Number(c.grn_id) === grnId && !chosen.has(Number(c.id)) && c.po_line_id != null
+      && Number(latest.get(Number(c.id))?.link.poLineId) === Number(c.po_line_id));
+    if (left.length === 0) {
+      toUndo.push(...group);
+      continue;
+    }
+    const names = left.map((c) => `${c.id} (audit #${latest.get(Number(c.id))!.auditId})`).join(', ');
+    for (const r of group) {
+      skipped.push({
+        grnLineId: Number(r.link.grnLineId),
+        reason: `${r.link.grnNo} is undone whole, and its line(s) ${names}, linked by this repair, are not in this undo; name them too.`,
+      });
+    }
   }
   if (toUndo.length === 0) {
-    throw BusinessRuleError('Nothing to undo: none of these links is in place as this repair made it.', { skipped });
+    throw BusinessRuleError('Nothing to undo: none of these links is in place as this repair made it, or their GRNs are not named whole.', { skipped });
   }
 
   const cleared = await run<{ id: number }>(
@@ -784,28 +1031,34 @@ export async function undoStoreGrnLinks(
        FROM jsonb_to_recordset($1::jsonb) AS v(grn_line_id bigint, po_line_id bigint)
       WHERE gl.id = v.grn_line_id AND gl.po_line_id = v.po_line_id
       RETURNING gl.id`,
-    [JSON.stringify(toUndo.map((l) => ({ grn_line_id: Number(l.grnLineId), po_line_id: Number(l.poLineId) })))],
+    [JSON.stringify(toUndo.map((r) => ({ grn_line_id: Number(r.link.grnLineId), po_line_id: Number(r.link.poLineId) })))],
   );
   if (cleared.length !== toUndo.length) {
     throw ServerError(`Undo cleared ${cleared.length} of ${toUndo.length} link(s); nothing was changed.`);
   }
-  const headerCandidates = [...new Set(toUndo.map((l) => Number(l.grnId)))]
-    .map((grnId) => headerSetBy.get(grnId))
-    .filter((h): h is HeaderLink => h !== undefined);
-  const headersCleared = headerCandidates.length === 0 ? [] : await run<{ id: number; grn_no: string; po_id: number }>(
-    `UPDATE grn_headers gh SET po_id = NULL, updated_at = now()
-       FROM jsonb_to_recordset($1::jsonb) AS v(grn_id bigint, po_id bigint)
-      WHERE gh.id = v.grn_id AND gh.po_id = v.po_id
-        AND NOT EXISTS (SELECT 1 FROM grn_lines gl JOIN purchase_order_lines pol ON pol.id = gl.po_line_id
-                         WHERE gl.grn_id = gh.id AND pol.po_id = v.po_id)
-      RETURNING gh.id, gh.grn_no, v.po_id`,
-    [JSON.stringify(headerCandidates.map((h) => ({ grn_id: Number(h.grnId), po_id: Number(h.poId) })))],
+
+  // A header goes back to what it named before the entry being undone changed it.
+  const restore: HeaderChange[] = [];
+  for (const grnId of new Set(toUndo.map((r) => Number(r.link.grnId)))) {
+    const change = headerChangedBy.get(grnId);
+    if (change && toUndo.some((r) => Number(r.link.grnId) === grnId && r.auditId === change.auditId)) restore.push(change.header);
+  }
+  const restoredRows = restore.length === 0 ? [] : await run<{ id: number }>(
+    `UPDATE grn_headers gh SET po_id = v.po_id_before, updated_at = now()
+       FROM jsonb_to_recordset($1::jsonb) AS v(grn_id bigint, po_id_before bigint, po_id_after bigint)
+      WHERE gh.id = v.grn_id AND gh.po_id IS NOT DISTINCT FROM v.po_id_after
+      RETURNING gh.id`,
+    [JSON.stringify(restore.map((h) => ({ grn_id: Number(h.grnId), po_id_before: h.poIdBefore, po_id_after: h.poIdAfter })))],
   );
-  const poStatusesRederived = await recomputePoStatuses(tx, [...new Set(toUndo.map((l) => Number(l.poId)))]);
+  const restoredIds = new Set(restoredRows.map((r) => Number(r.id)));
+  const poStatusesRederived = await recomputePoStatuses(tx, [...new Set(toUndo.map((r) => Number(r.link.poId)))]);
 
   const result: UndoResult = {
-    undone: toUndo.map((l) => ({ grnLineId: Number(l.grnLineId), grnNo: l.grnNo, poLineId: Number(l.poLineId), poNo: l.poNo })),
-    headersCleared: headersCleared.map((h) => ({ grnId: Number(h.id), grnNo: h.grn_no, poId: Number(h.po_id) })),
+    undone: toUndo.map((r) => ({ grnLineId: Number(r.link.grnLineId), grnNo: r.link.grnNo, poLineId: Number(r.link.poLineId), poNo: r.link.poNo })),
+    headersRestored: restore.filter((h) => restoredIds.has(Number(h.grnId)))
+      .map((h) => ({ grnId: Number(h.grnId), grnNo: h.grnNo, repairSet: h.poIdAfter, restoredTo: h.poIdBefore })),
+    headersLeft: restore.filter((h) => !restoredIds.has(Number(h.grnId)))
+      .map((h) => ({ grnId: Number(h.grnId), grnNo: h.grnNo, reason: `It no longer names ${h.poNoAfter ?? 'no PO'} as this repair set it; left as it is.` })),
     skipped,
     poStatusesRederived,
   };
@@ -815,17 +1068,17 @@ export async function undoStoreGrnLinks(
     entity: LINK_AUDIT_ENTITY,
     entityLabel: target.auditId !== undefined ? `undo of audit #${target.auditId}` : `undo of ${toUndo.length} GRN line link(s)`,
     before: {
-      links: toUndo.map((l) => ({ grnLineId: Number(l.grnLineId), poLineId: Number(l.poLineId) })),
-      headers: result.headersCleared.map((h) => ({ grnId: h.grnId, poId: h.poId })),
+      links: toUndo.map((r) => ({ grnLineId: Number(r.link.grnLineId), poLineId: Number(r.link.poLineId) })),
+      headers: result.headersRestored.map((h) => ({ grnId: h.grnId, poId: h.repairSet })),
     },
     after: {
       kind: 'undo', reason: ctx.reason, target,
-      links: toUndo.map((l) => ({ grnLineId: Number(l.grnLineId), poLineId: null })),
-      headers: result.headersCleared.map((h) => ({ grnId: h.grnId, poId: null })),
-      skipped, poStatusesRederived,
+      links: toUndo.map((r) => ({ grnLineId: Number(r.link.grnLineId), poLineId: null })),
+      headers: result.headersRestored.map((h) => ({ grnId: h.grnId, poId: h.restoredTo })),
+      headersLeft: result.headersLeft, skipped, poStatusesRederived,
     },
-    message: `Store GRN links undone: ${toUndo.length} GRN line(s) no longer point to a PO line and ${result.headersCleared.length} GRN header(s) `
-      + `no longer name a PO; ${poStatusesRederived} PO status(es) re-derived. Quantities and stock were not changed. Reason: ${ctx.reason}`,
+    message: `Store GRN links undone: ${toUndo.length} GRN line(s) no longer point to a PO line and ${result.headersRestored.length} GRN header(s) `
+      + `name what they named before; ${poStatusesRederived} PO status(es) re-derived. Quantities and stock were not changed. Reason: ${ctx.reason}`,
   });
   return result;
 }
