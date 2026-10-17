@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 import express, { Router, type Request } from 'express';
 import { z } from 'zod';
-import { query, queryOne, withTransaction, withSnapshot, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
+import { query, queryOne, withTransaction, withSnapshot, txQuery, txQueryOne, SqlBuilder, type Queryable } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
 import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { requirePermission, requireSuperAdmin, invalidateAuthState } from '../../auth/middleware.js';
@@ -31,7 +31,7 @@ import {
 } from './stock-alignment.js';
 import {
   STORE_GRN_TAB, planStoreGrnLinks, applyStoreGrnLinks, undoStoreGrnLinks, describeLinkPlan,
-  summariseLinkPlan, previouslyUndoneLines, runIn, type SheetReader,
+  summariseLinkPlan, previouslyUndoneLines, undoneLineIds, runIn, type SheetReader,
 } from './store-grn-links.js';
 import { REASON_TEXT, standingHoldsNaming } from '../purchase-order/receipt-evidence.js';
 import { readSheet } from '../google-sync/engine.js';
@@ -1626,6 +1626,12 @@ const linkStoreGrnsSchema = z.object({
     grnSupplierId: z.coerce.number().int().positive(),
     poSupplierId: z.coerce.number().int().positive(),
   })).max(1000).default([]),
+  /**
+   * Also keep out every line a Super Admin took back (undo) that nothing has linked
+   * since: the Data Management panel's default, as the tab still names the PO the link
+   * was taken back from and the rules would link it again.
+   */
+  keepOutUndone: z.boolean().default(false),
 });
 
 router.post(
@@ -1633,7 +1639,7 @@ router.post(
   requireSuperAdmin(),
   validateBody(linkStoreGrnsSchema),
   asyncHandler(async (req, res) => {
-    const { dryRun, confirm, expectedHash, excludeGrnLineIds, sameSupplierPairs } = req.body as z.infer<typeof linkStoreGrnsSchema>;
+    const { dryRun, confirm, expectedHash, excludeGrnLineIds, sameSupplierPairs, keepOutUndone } = req.body as z.infer<typeof linkStoreGrnsSchema>;
     if (!dryRun) {
       if (confirm !== 'LINK STORE GRNS') {
         throw ValidationError('Type "LINK STORE GRNS" to confirm. Take a verified backup first.');
@@ -1645,10 +1651,13 @@ router.post(
     // The tab is read before the transaction opens: a Google read can take seconds,
     // and the embedded database serves one transaction at a time.
     const grid = await grnTabReaderOf(req)(STORE_GRN_TAB);
+    // The exclusions the plan is made with, read in its own transaction.
+    const excluded = async (tx: Queryable) => (keepOutUndone
+      ? [...new Set([...excludeGrnLineIds, ...await undoneLineIds(runIn(tx))])] : excludeGrnLineIds);
     if (dryRun) {
       // One read-only snapshot, so every figure comes from the same moment.
       const { plan, previouslyUndone } = await withSnapshot(async (tx) => {
-        const p = await planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds, sameSupplierPairs });
+        const p = await planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds: await excluded(tx), sameSupplierPairs });
         return { plan: p, previouslyUndone: await previouslyUndoneLines(runIn(tx), p) };
       });
       // reasonText: each reason in the words the PO screen uses, for the held list a
@@ -1663,8 +1672,8 @@ router.post(
       });
       return;
     }
-    const result = await withTransaction((tx) => applyStoreGrnLinks(tx, grid, {
-      expectedHash: expectedHash!, actor: actorFrom(req), excludeGrnLineIds, sameSupplierPairs,
+    const result = await withTransaction(async (tx) => applyStoreGrnLinks(tx, grid, {
+      expectedHash: expectedHash!, actor: actorFrom(req), excludeGrnLineIds: await excluded(tx), sameSupplierPairs,
     }));
     const recorded = `${result.plan.totals.held} held store receipt line(s) recorded as awaiting link `
       + `(${result.holdsRecorded} row(s), one per PO the GRN tab names), replacing the earlier record.`;

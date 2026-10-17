@@ -194,7 +194,9 @@ export default function PoList() {
       render: (r) => (
         <div>
           <StatusBadge status={r.status} />
-          <ReceiptEvidenceBadges awaiting={Number(r.store_receipts_awaiting_link ?? 0)} sheet={Number(r.store_sheet_receipts ?? 0)} />
+          <ReceiptEvidenceBadges
+            awaiting={Number(r.store_receipts_awaiting_link ?? 0)} sheet={Number(r.store_sheet_receipts ?? 0)} status={r.status}
+          />
         </div>
       ),
     },

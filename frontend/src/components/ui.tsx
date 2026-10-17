@@ -1459,14 +1459,16 @@ export function ErrorState({
 /**
  * Inline notice; danger when a background refetch failed but cached data stays on screen.
  * `attention` asks the reader to act on what it lists (a receipt awaiting its PO link),
- * and lays its content out from the top, as it usually holds more than one line.
+ * and lays its content out from the top, as it usually holds more than one line; `block`
+ * does the same for another tone (a list the reader only needs to know about).
  */
 export function Banner({
-  tone = 'info', children, action,
-}: { tone?: 'info' | 'warning' | 'attention' | 'danger'; children: ReactNode; action?: ReactNode }) {
+  tone = 'info', children, action, block,
+}: { tone?: 'info' | 'warning' | 'attention' | 'danger'; children: ReactNode; action?: ReactNode; block?: boolean }) {
   const Icon = tone === 'info' ? AlertCircle : AlertTriangle;
+  const cls = ['banner', tone === 'info' ? '' : `banner-${tone}`, block ? 'banner-block' : ''].filter(Boolean).join(' ');
   return (
-    <div className={`banner ${tone === 'info' ? '' : `banner-${tone}`}`} role={tone === 'danger' ? 'alert' : 'status'}>
+    <div className={cls} role={tone === 'danger' ? 'alert' : 'status'}>
       <Icon size={16} aria-hidden />
       <div className="grow">{children}</div>
       {action}

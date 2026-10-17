@@ -15,7 +15,8 @@ import { Badge, Banner, Tooltip } from './ui';
 import { FilterTiles } from './KpiCard';
 import { count, formatDate, formatDateTime, money, qty } from '../lib/format';
 import {
-  RECEIPT_EVIDENCE_OPTIONS,
+  RECEIPT_EVIDENCE_OPTIONS, NEXT_ACTION_POSTED_IN_ERP, NEXT_ACTION_SHEET_ONLY,
+  awaitingBadgeTip, awaitingBannerCopy, closedOrderWords, evidenceAsOf, isPendingOrder, sheetReceiptNeedsPosting,
   type ReceiptEvidence, type ReceiptEvidenceSummary, type StoreReceiptAwaitingLink, type StoreSheetReceipt,
 } from '../lib/receiptEvidence';
 
@@ -33,7 +34,7 @@ function EvidenceBadge({ label, tip, icon }: { label: string; tip: string; icon:
 }
 
 /** The evidence badges of one PO: receipt lines awaiting link, and lines on the store sheet only. */
-export function ReceiptEvidenceBadges({ awaiting, sheet }: { awaiting: number; sheet: number }) {
+export function ReceiptEvidenceBadges({ awaiting, sheet, status }: { awaiting: number; sheet: number; status: string }) {
   if (!(awaiting > 0) && !(sheet > 0)) return null;
   return (
     <span className="evidence-badges">
@@ -41,8 +42,7 @@ export function ReceiptEvidenceBadges({ awaiting, sheet }: { awaiting: number; s
         <EvidenceBadge
           label="Receipt awaiting link"
           icon={<Link2Off size={12} strokeWidth={2.25} />}
-          tip={`${plural(awaiting, 'store receipt line names', 'store receipt lines name')} this PO but `
-            + `${awaiting === 1 ? 'is' : 'are'} not linked to it yet, so its goods may have come. Open the PO to see why.`}
+          tip={awaitingBadgeTip(status, awaiting)}
         />
       )}
       {sheet > 0 && (
@@ -73,10 +73,7 @@ export function ReceiptEvidenceTiles({
 }) {
   const part = (v: ReceiptEvidence) => (!summary ? null
     : v === 'awaiting_link' ? summary.awaitingLink : v === 'sheet_only' ? summary.sheetOnly : summary.noneRecorded);
-  const asOf = [
-    summary?.asOf ? `receipts awaiting link as the last Link store GRNs run recorded them (${formatDateTime(summary.asOf)})` : null,
-    summary?.sheetOnly.jobId ? `the store sheet as of sheet sync #${summary.sheetOnly.jobId} (${formatDateTime(summary.sheetOnly.asOf)})` : null,
-  ].filter(Boolean);
+  const asOf = evidenceAsOf(summary);
   return (
     <div className="evidence-tiles">
       <FilterTiles
@@ -98,39 +95,34 @@ export function ReceiptEvidenceTiles({
       />
       <p className="evidence-note">
         {RECEIPT_EVIDENCE_OPTIONS.map((o) => <span key={o.value}><strong>{o.label}:</strong> {o.hint} </span>)}
-        {asOf.length > 0 && <span>Counted from {asOf.join(' and ')}.</span>}
+        {asOf.length > 0 && <span>Counted from {asOf.join(', and ')}.</span>}
       </p>
     </div>
   );
 }
 
-/** The next actions, word for word as the owner's brief gives them. */
-export const NEXT_ACTION_AWAITING_LINK = 'Purchase confirms which PO line each receipt belongs to (or corrects the GRN tab or the PO register); '
-  + 'a Super Admin then re-runs Link store GRNs in Admin > Data Management.';
-export const NEXT_ACTION_SHEET_ONLY = 'The store has recorded this receipt on the GRN sheet but not in the ERP. '
-  + 'Post it through Goods Receipt (GRN) in the ERP; the sheet sync never creates receipts.';
-
-/** The PO screen's banners: the receipts awaiting link, and the receipts on the store sheet only. */
+/** The PO screen's banners: the receipts awaiting link, the receipts on the store sheet only, and those posted in the ERP under another number. */
 export function StoreReceiptBanners({
-  awaiting, sheet, receiveAction,
+  awaiting, sheet, postedInErp, poStatus, receiveAction,
 }: {
   awaiting: StoreReceiptAwaitingLink[];
   sheet: StoreSheetReceipt[];
+  postedInErp: StoreSheetReceipt[];
+  /** The order's status: only an open or partly received order still counts a receipt as to come. */
+  poStatus: string;
   /** "Receive material" for a user who may post a GRN against this PO. */
   receiveAction?: ReactNode;
 }) {
+  const pending = isPendingOrder(poStatus);
+  const awaitingCopy = awaitingBannerCopy(poStatus, awaiting.length);
+  // Posting again what the ERP has already received would receive it twice.
+  const offerReceive = pending && sheetReceiptNeedsPosting(sheet) ? receiveAction : undefined;
   return (
     <>
       {awaiting.length > 0 && (
         <Banner tone="attention">
-          <div className="banner-title">
-            {awaiting.length === 1
-              ? 'A store receipt names this purchase order but is not linked to it yet'
-              : `${count(awaiting.length)} store receipts name this purchase order but are not linked to it yet`}
-          </div>
-          <div className="banner-text">
-            The goods may already have come: until a receipt is linked, this order counts its quantity as still to be received.
-          </div>
+          <div className="banner-title">{awaitingCopy.title}</div>
+          <div className="banner-text">{awaitingCopy.text}</div>
           <div className="banner-table">
             <table className="table table-compact">
               <thead>
@@ -138,7 +130,7 @@ export function StoreReceiptBanners({
               </thead>
               <tbody>
                 {awaiting.map((r) => (
-                  <tr key={`${r.grnId}-${r.itemCode}-${r.reason}-${r.detail}`}>
+                  <tr key={r.holdId}>
                     <td className="cell-code"><Link to={`/grn/${r.grnId}`}>{r.grnNo}</Link></td>
                     <td>{formatDate(r.grnDate)}</td>
                     <td className="cell-code">{r.itemCode}{r.poLineNo != null && <span className="cell-muted"> · PO line {r.poLineNo}</span>}</td>
@@ -152,27 +144,44 @@ export function StoreReceiptBanners({
               </tbody>
             </table>
           </div>
-          <div className="banner-next"><strong>Next:</strong> {NEXT_ACTION_AWAITING_LINK}</div>
+          <div className="banner-next"><strong>Next:</strong> {awaitingCopy.next}</div>
         </Banner>
       )}
       {sheet.length > 0 && (
-        <Banner tone="attention" action={receiveAction}>
+        <Banner tone="attention" action={offerReceive}>
           <div className="banner-title">
             {sheet.length === 1
               ? "A receipt on the store's GRN sheet names this purchase order, but no GRN in the ERP holds it"
               : `${count(sheet.length)} receipts on the store's GRN sheet name this purchase order, but no GRN in the ERP holds them`}
           </div>
+          {!pending && (
+            <div className="banner-text">
+              This order is {closedOrderWords(poStatus)} and expects no more goods: check which order {sheet.length === 1 ? 'the receipt belongs' : 'the receipts belong'} to
+              before posting anything.
+            </div>
+          )}
           <div className="banner-table">
             <table className="table table-compact">
               <thead>
-                <tr><th>GRN No (sheet)</th><th>Item</th><th className="right">Qty</th><th className="right">Sheet row</th><th>First reported by the sheet sync</th></tr>
+                <tr>
+                  <th>GRN No (sheet)</th><th>Item</th><th className="right">Qty</th><th className="right">Received in ERP (PO line)</th>
+                  <th className="right">Sheet row</th><th>First reported by the sheet sync</th>
+                </tr>
               </thead>
               <tbody>
                 {sheet.map((r) => (
-                  <tr key={`${r.sheetRow}-${r.grnNo}-${r.itemCode}`}>
+                  <tr key={r.issueId}>
                     <td className="cell-code">{r.grnNo ?? <span className="cell-muted">No GRN number</span>}</td>
                     <td className="cell-code">{r.itemCode}</td>
                     <td className="right num">{qty(r.grnQty)}</td>
+                    <td className="right num">
+                      {qty(r.erpReceivedOnPoLine)}
+                      {r.erpReceiptCoversIt && (
+                        <div className="cell-muted cell-wrap" style={{ textAlign: 'left', minWidth: 180 }}>
+                          Already covers this line: check it is not this receipt, posted under another number.
+                        </div>
+                      )}
+                    </td>
                     <td className="right num">{r.sheetRow ?? '—'}</td>
                     <td>{formatDateTime(r.reportedAt)}</td>
                   </tr>
@@ -181,6 +190,39 @@ export function StoreReceiptBanners({
             </table>
           </div>
           <div className="banner-next"><strong>Next:</strong> {NEXT_ACTION_SHEET_ONLY}</div>
+        </Banner>
+      )}
+      {postedInErp.length > 0 && (
+        <Banner tone="info" block>
+          <div className="banner-title">
+            {postedInErp.length === 1
+              ? "A receipt on the store's GRN sheet was posted in the ERP under another number"
+              : `${count(postedInErp.length)} receipts on the store's GRN sheet were posted in the ERP under another number`}
+          </div>
+          <div className="banner-text">
+            An ERP receipt posted after the sheet sync reported {postedInErp.length === 1 ? 'it covers it' : 'them covers them'}, so this order counts
+            {postedInErp.length === 1 ? ' it' : ' them'} as received; the sync still reports {postedInErp.length === 1 ? 'it' : 'them'} because it looks
+            for the sheet's GRN number.
+          </div>
+          <div className="banner-table">
+            <table className="table table-compact">
+              <thead>
+                <tr><th>GRN No (sheet)</th><th>Item</th><th className="right">Qty</th><th>Posted in the ERP as</th><th className="right">Sheet row</th></tr>
+              </thead>
+              <tbody>
+                {postedInErp.map((r) => (
+                  <tr key={r.issueId}>
+                    <td className="cell-code">{r.grnNo ?? <span className="cell-muted">No GRN number</span>}</td>
+                    <td className="cell-code">{r.itemCode}</td>
+                    <td className="right num">{qty(r.grnQty)}</td>
+                    <td className="cell-code">{r.postedAs}</td>
+                    <td className="right num">{r.sheetRow ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="banner-next"><strong>Next:</strong> {NEXT_ACTION_POSTED_IN_ERP}</div>
         </Banner>
       )}
     </>

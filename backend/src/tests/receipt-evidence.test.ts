@@ -526,6 +526,21 @@ describe('Store receipts awaiting link — undo, a later apply, and receipts tha
     expect(await holdCount()).toBe(15);
   });
 
+  it('keeps every line taken back out of a run that asks to (keepOutUndone), as the panel does by default', async () => {
+    const line = grns['ZG/RE/0011']!.lines[0]!;
+    const d = await dryRun({ keepOutUndone: true });
+    expect(d.review.excludeGrnLineIds).toEqual([line]);
+    expect(d.totals.linkable).toBe(0);
+    expect(d.previouslyUndone).toMatchObject([{ grnLineId: line, wouldLink: false }]);
+    // The panel applies with the plan's own exclusions, which the hash covers.
+    const res = await apply(d.selectionHash, { excludeGrnLineIds: d.review.excludeGrnLineIds });
+    expect(res.status).toBe(200);
+    expect(res.body.data.linesLinked).toBe(0);
+    expect((await holds()).filter((r) => r.grn_line_id === line)).toMatchObject([{ reason: 'EXCLUDED', po_id: pos['Z/RE/00010']!.id }]);
+    // Still taken back: a plain run would link it again, and says so.
+    expect((await dryRun()).previouslyUndone).toMatchObject([{ grnLineId: line, wouldLink: true }]);
+  });
+
   it('a later apply replaces the record as usual', async () => {
     const d = await dryRun();
     expect(d.totals.linkable).toBe(1);

@@ -1119,26 +1119,29 @@ h1, h2, h3, h4, h5, h6 {
 }
 .banner-danger { border-color: var(--tone-danger-border); background: var(--tone-danger-bg); color: var(--tone-danger-fg); }
 .banner-warning { border-color: var(--tone-pending-border); background: var(--tone-pending-bg); color: var(--tone-pending-fg); }
-.banner-attention {
+.banner-attention { border-color: var(--tone-attention-border); background: var(--tone-attention-bg); color: var(--tone-attention-fg); }
+/* A banner that lists something (an attention banner always does): laid out from the top. */
+.banner-attention, .banner-block {
   align-items: flex-start;
   padding: var(--space-3);
   margin-bottom: var(--space-4);
-  border-color: var(--tone-attention-border); background: var(--tone-attention-bg); color: var(--tone-attention-fg);
 }
-.banner-attention > svg { margin-top: 2px; flex-shrink: 0; }
+.banner-attention > svg, .banner-block > svg { margin-top: 2px; flex-shrink: 0; }
 /* What an attention banner lists, in ink on the page's surface, so the tone frames it without tinting the figures. */
 .banner-title { font-weight: var(--fw-semibold); }
 .banner-text { color: var(--text-2); margin-top: 2px; line-height: var(--lh-normal); }
 .banner-table {
   margin-top: var(--space-2);
   background: var(--surface-1);
-  border: 1px solid var(--tone-attention-border);
+  border: 1px solid var(--tone-info-border);
   border-radius: var(--radius-sm);
   color: var(--text-1);
   overflow-x: auto;
 }
 .banner-next { margin-top: var(--space-2); color: var(--text-2); line-height: var(--lh-normal); }
-.banner-next strong { color: var(--tone-attention-fg); }
+.banner-next strong { color: var(--tone-info-fg); }
+.banner-attention .banner-table { border-color: var(--tone-attention-border); }
+.banner-attention .banner-next strong { color: var(--tone-attention-fg); }
 
 /* An evidence badge in a list row: focusable (the global ring), so its explanation shows on focus too. */
 .badge-tip { display: inline-flex; border-radius: var(--radius-full); }

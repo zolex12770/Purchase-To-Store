@@ -109,6 +109,8 @@ interface PoDoc {
   storeReceiptsAwaitingLink?: StoreReceiptAwaitingLink[];
   /** Receipts on the store's GRN sheet that no ERP GRN holds, naming this PO. */
   storeSheetReceipts?: StoreSheetReceipt[];
+  /** Sheet lines an ERP receipt posted since covers: posted under another GRN number. */
+  storeSheetReceiptsPostedInErp?: StoreSheetReceipt[];
 }
 
 type ActionKind = 'issue' | 'cancel' | 'short-close' | 'delete';
@@ -305,6 +307,8 @@ export default function PoDetail() {
       <StoreReceiptBanners
         awaiting={data.storeReceiptsAwaitingLink ?? []}
         sheet={data.storeSheetReceipts ?? []}
+        postedInErp={data.storeSheetReceiptsPostedInErp ?? []}
+        poStatus={data.status}
         receiveAction={isReceivable && can('grn.create') ? (
           <Button variant="secondary" size="sm" icon={<Truck size={13} />} onClick={() => navigate(`/grn/new?poId=${data.id}`)}>
             Receive material

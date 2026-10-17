@@ -1195,6 +1195,39 @@ export async function undoStoreGrnLinks(
   return result;
 }
 
+/** For each GRN line this repair ever linked or unlinked: its latest such audit entry. */
+async function latestLinkEntries(run: Run): Promise<Map<number, { kind: string; auditId: number; at: string; reason: string }>> {
+  const entries = await run<{ id: number; created_at: Date | string; after_data: Record<string, unknown> | null }>(
+    `SELECT id, created_at, after_data FROM audit_logs
+      WHERE entity = $1 AND after_data->>'kind' IN ('links', 'undo') ORDER BY id`,
+    [LINK_AUDIT_ENTITY],
+  );
+  const latest = new Map<number, { kind: string; auditId: number; at: string; reason: string }>();
+  for (const e of entries) {
+    const kind = String(e.after_data?.kind);
+    const links = Array.isArray(e.after_data?.links) ? e.after_data!.links as Array<{ grnLineId: number }> : [];
+    const at = e.created_at instanceof Date ? e.created_at.toISOString() : new Date(e.created_at).toISOString();
+    for (const l of links) {
+      latest.set(Number(l.grnLineId), { kind, auditId: Number(e.id), at, reason: String(e.after_data?.reason ?? '') });
+    }
+  }
+  return latest;
+}
+
+/**
+ * The GRN lines without a PO line whose latest entry of this repair is an undo: what
+ * a run asked to keep them out (keepOutUndone) adds to its excludeGrnLineIds, so they
+ * stay held (EXCLUDED) and the hash covers them like any other exclusion.
+ */
+export async function undoneLineIds(run: Run): Promise<number[]> {
+  const ids = [...await latestLinkEntries(run)].filter(([, e]) => e.kind === 'undo').map(([id]) => id);
+  if (ids.length === 0) return [];
+  const rows = await run<{ id: number }>(
+    'SELECT id FROM grn_lines WHERE id = ANY($1::bigint[]) AND po_line_id IS NULL ORDER BY id', [ids],
+  );
+  return rows.map((r) => Number(r.id));
+}
+
 /** A line a Super Admin unlinked that the plan would link again, or that it keeps out (EXCLUDED). */
 export interface UndoneLine {
   grnLineId: number;
@@ -1221,20 +1254,7 @@ export interface UndoneLine {
  * its run (excludeGrnLineIds) unless the Super Admin chooses to link them again.
  */
 export async function previouslyUndoneLines(run: Run, plan: LinkPlan): Promise<UndoneLine[]> {
-  const entries = await run<{ id: number; created_at: Date | string; after_data: Record<string, unknown> | null }>(
-    `SELECT id, created_at, after_data FROM audit_logs
-      WHERE entity = $1 AND after_data->>'kind' IN ('links', 'undo') ORDER BY id`,
-    [LINK_AUDIT_ENTITY],
-  );
-  const latest = new Map<number, { kind: string; auditId: number; at: string; reason: string }>();
-  for (const e of entries) {
-    const kind = String(e.after_data?.kind);
-    const links = Array.isArray(e.after_data?.links) ? e.after_data!.links as Array<{ grnLineId: number }> : [];
-    const at = e.created_at instanceof Date ? e.created_at.toISOString() : new Date(e.created_at).toISOString();
-    for (const l of links) {
-      latest.set(Number(l.grnLineId), { kind, auditId: Number(e.id), at, reason: String(e.after_data?.reason ?? '') });
-    }
-  }
+  const latest = await latestLinkEntries(run);
   const undone = (id: number) => {
     const last = latest.get(id);
     return last?.kind === 'undo' ? last : null;
