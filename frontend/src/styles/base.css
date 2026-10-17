@@ -845,6 +845,9 @@ h1, h2, h3, h4, h5, h6 {
 /* ══════════════════════ MENUS · POPOVERS · TOOLTIPS (spec §3.15) ══════════════════════ */
 
 .popover, .menu {
+  /* Never wider than a phone screen less an 8 px margin each side (the
+     account menu, at 390 px, spanned the screen edge to edge). */
+  max-width: calc(100vw - 16px);
   background: var(--glass-bg-strong);
   -webkit-backdrop-filter: var(--glass-blur);
   backdrop-filter: var(--glass-blur);
@@ -1245,6 +1248,8 @@ h1, h2, h3, h4, h5, h6 {
 .sync-facts dt { color: var(--text-3); }
 .sync-facts dd { margin: 0; color: var(--text-1); min-width: 0; overflow-wrap: anywhere; }
 
+/* A class, not an inline style, so the phone top bar can fold it away while searching. */
+.notif-anchor { position: relative; display: inline-flex; }
 .notif-item { display: block; width: 100%; text-align: left; padding: var(--space-2-5) var(--space-4); border-bottom: 1px solid var(--border-subtle); }
 .notif-item:last-child { border-bottom: none; }
 .notif-item:hover, .notif-item:focus-visible { background: var(--hover-wash); }

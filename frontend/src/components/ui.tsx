@@ -831,7 +831,6 @@ export function SearchSelect({
   const [term, setTerm] = useState('');
   const [highlight, setHighlight] = useState(0);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
   const listId = useId();
 
   const selected = options.find((o) => String(o.value) === String(value))
@@ -889,7 +888,6 @@ export function SearchSelect({
             {/* Popover's first pass is visible, so autoFocus lands here; the
                 old focus effect ran while the panel was still hidden. */}
             <input
-              ref={inputRef}
               autoFocus
               className="input input-sm"
               style={{ paddingLeft: 30 }}

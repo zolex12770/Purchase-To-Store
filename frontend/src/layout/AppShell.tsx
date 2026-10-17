@@ -759,7 +759,7 @@ function NotificationBell() {
   if (!allowed) return null;
 
   return (
-    <span style={{ position: 'relative', display: 'inline-flex' }}>
+    <span className="notif-anchor">
       <IconButton
         ref={triggerRef}
         label={alerts.length > 0 ? `Notifications: ${alerts.length} need attention` : 'Notifications'}

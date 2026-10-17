@@ -63,6 +63,10 @@ describe('autoFrozenRight', () => {
     expect(autoFrozenRight([...data, col('actions', 'actions', 263)], 1080)).toEqual([]);
   });
 
+  it('never pins actions alone over a status column too wide to pin with them', () => {
+    expect(autoFrozenRight([...data, col('status', 'status', 240), col('actions', 'actions', 96)], 1080)).toEqual([]);
+  });
+
   it('does not freeze a trailing data column, or a status column that is not near the end', () => {
     expect(autoFrozenRight([col('status', 'status', 120), ...data], 1080)).toEqual([]);
     expect(autoFrozenRight([...data, col('status', 'status', 120), col('grns', 'data', 80)], 1080)).toEqual([]);

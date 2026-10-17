@@ -47,7 +47,8 @@ export const FREEZE_RIGHT_SHARE = 0.35;
  * column at 1366 and 1440 (review 2026-10-16). So:
  *   • a trailing status column freezes;
  *   • a narrow trailing actions column freezes, and takes a status column
- *     just before it along, so actions never cover status;
+ *     just before it along, so actions never cover status — if that status
+ *     column is too wide to freeze, neither freezes;
  *   • a wide actions column stays in the scroll; a status column just before
  *     it freezes alone and the actions come into view at the end of the row;
  *   • a group wider than FREEZE_RIGHT_SHARE of the table shrinks to its status
@@ -64,8 +65,10 @@ export function autoFrozenRight(visible: MeasuredColumn[], tableWidth: number): 
   if (narrowStatus(last)) group = [last];
   else if (last.kind === 'actions') {
     const narrowActions = last.width > 0 && last.width <= FREEZE_ACTIONS_MAX;
-    if (narrowActions) group = prev && narrowStatus(prev) ? [prev, last] : [last];
-    else if (prev && narrowStatus(prev)) group = [prev];
+    if (prev?.kind === 'status') {
+      // Pinned alone, the actions would slide over this status column.
+      if (narrowStatus(prev)) group = narrowActions ? [prev, last] : [prev];
+    } else if (narrowActions) group = [last];
   }
 
   const fits = (g: MeasuredColumn[]) => tableWidth <= 0 || g.reduce((s, c) => s + c.width, 0) <= tableWidth * FREEZE_RIGHT_SHARE;
