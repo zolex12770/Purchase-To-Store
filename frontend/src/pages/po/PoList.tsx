@@ -77,8 +77,10 @@ export default function PoList() {
     status: filters.status, dateFrom: filters.dateFrom, dateTo: filters.dateTo,
     supplierId: filters.supplierId, poTypeId: filters.poTypeId, itemId: filters.itemId,
     userId: filters.userId, departmentId: filters.departmentId, costCentreId: filters.costCentreId,
-    mainGroupId: filters.mainGroupId, hodId: filters.hodId,
-    view, overdue: filters.overdue,
+    mainGroupId: filters.mainGroupId, subMainGroupId: filters.subMainGroupId, itemTypeId: filters.itemTypeId,
+    hodId: filters.hodId, view, overdue: filters.overdue,
+    // A KPI card's scope (Purchase Orders, Total PO Value …): every order but cancelled.
+    excludeCancelled: filters.excludeCancelled,
   });
 
   const list = useQuery({
@@ -224,7 +226,7 @@ export default function PoList() {
 
       <FilterBar
         filters={filters} setFilters={setFilters} clearFilters={clearFilters} activeCount={activeCount}
-        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'poType', 'mainGroup', 'item']}
+        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'poType', 'mainGroup', 'itemType', 'item']}
         extra={
           view === 'pending' ? (
             <Button

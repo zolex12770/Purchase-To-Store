@@ -64,6 +64,8 @@ export default function GrnList() {
     status: filters.status, qcStatus: filters.qcStatus, dateFrom: filters.dateFrom, dateTo: filters.dateTo,
     supplierId: filters.supplierId, itemId: filters.itemId, poId: filters.poId,
     userId: filters.userId, departmentId: filters.departmentId, costCentreId: filters.costCentreId, hodId: filters.hodId,
+    // The item dimensions the dashboard's received-quantity KPIs drill with.
+    mainGroupId: filters.mainGroupId, subMainGroupId: filters.subMainGroupId, itemTypeId: filters.itemTypeId,
   });
 
   const list = useQuery({
@@ -185,7 +187,7 @@ export default function GrnList() {
 
       <FilterBar
         filters={filters} setFilters={setFilters} clearFilters={clearFilters} activeCount={activeCount}
-        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'qcStatus', 'item']}
+        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'qcStatus', 'mainGroup', 'itemType', 'item']}
       />
 
       <DataTable

@@ -84,6 +84,11 @@ const QC_STATUS_OPTIONS = [
   { value: 'NOT_APPLICABLE', label: 'Not Applicable' },
 ];
 
+const SCOPE_LABELS: Record<string, string> = {
+  excludeCancelled: 'Cancelled excluded',
+  eligibleOnly: 'Awaiting purchase order only',
+};
+
 export function FilterBar({
   filters, setFilters, clearFilters, activeCount,
   show = ['dateRange', 'supplier', 'department', 'costCentre'],
@@ -179,6 +184,12 @@ export function FilterBar({
         onRemove: () => toggleValue(param, id),
       });
     }
+  }
+
+  // Scopes a KPI card drills in with (backend domain/metrics.ts), so the list says why it
+  // holds what the number counts, and the scope can be removed like any filter.
+  for (const [param, label] of Object.entries(SCOPE_LABELS)) {
+    if (filters[param] === 'true') chips.push({ label, onRemove: () => setFilters({ [param]: undefined }) });
   }
 
   return (

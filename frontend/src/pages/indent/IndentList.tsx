@@ -72,6 +72,8 @@ export default function IndentList() {
     indentTypeId: filters.indentTypeId, departmentId: filters.departmentId,
     costCentreId: filters.costCentreId, supplierId: filters.supplierId,
     itemId: filters.itemId, userId: filters.userId, hodId: filters.hodId,
+    // KPI card scopes: Total Indents (every one but cancelled), Approved Qty Awaiting PO.
+    excludeCancelled: filters.excludeCancelled, eligibleOnly: filters.eligibleOnly,
   });
 
   const list = useQuery({

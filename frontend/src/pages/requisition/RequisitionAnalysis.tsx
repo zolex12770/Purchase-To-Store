@@ -154,7 +154,7 @@ export default function RequisitionAnalysis() {
       ) : featured.length > 0 ? (
         <KpiGrid min={200}>
           {featured.map((m) => (
-            <KpiCard key={m.key} metric={m} onClick={() => navigate(drilldownLink(m.drilldown, {}, filters as FilterState))} />
+            <KpiCard key={m.key} metric={m} onClick={m.drilldown ? () => navigate(drilldownLink(m.drilldown, {}, filters as FilterState)) : undefined} />
           ))}
         </KpiGrid>
       ) : (
