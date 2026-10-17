@@ -14,6 +14,12 @@
  *      (merged as the screen merges them: the target's own parameters win).
  *   3. The GRN KPIs count posted receipts of every kind.
  *   4. KPIs no list can show are not clickable.
+ *   5. Item-level filters (item, department, main group, HOD) select lines: orders,
+ *      receipts and indents here mix items of two departments, and a card counts, and
+ *      the list it opens shows, only the filtered lines (2026-10-17 review: filtered to
+ *      a department, Pending POs showed 0 and opened a PO whose only pending line
+ *      belonged to another department; Approved Qty Awaiting PO showed 10 and opened an
+ *      empty list).
  *
  * Real PGlite database, migrated and seeded from scratch.
  */
@@ -114,16 +120,20 @@ beforeAll(async () => {
   ids.indentType = await mk('INDENT_TYPE', 'KPI-IT', 'KPI Regular');
   ids.poType = await mk('PO_TYPE', 'KPI-PT', 'KPI Standard');
   ids.dept = await mk('DEPARTMENT', 'KPI-D', 'KPI Department');
+  ids.dept2 = await mk('DEPARTMENT', 'KPI-D2', 'KPI Second Department');
   ids.cc = await mk('COST_CENTRE', 'KPI-CC', 'KPI Cost Centre');
+  ids.mg = await mk('MAIN_GROUP', 'KPI-MG', 'KPI Cables');
   for (const [key, supplierName] of [['s1', 'KPI Supplier One'], ['s2', 'KPI Supplier Two']] as const) {
     const res = await request(app).post('/api/v1/suppliers').set(auth(adminToken)).send({ supplierName, city: 'Pune', state: 'Maharashtra' });
     expect(res.status).toBe(201);
     ids[key] = res.body.data.id;
   }
-  for (const [key, itemCode, itemDescription, standardRate] of [
-    ['a', 'KPI-CABLE', 'Copper cable', '100'], ['b', 'KPI-BOLT', 'Hex bolt', '50'],
+  // Cable belongs to the first department and the cables group, bolt to the second.
+  for (const [key, itemCode, itemDescription, standardRate, master] of [
+    ['a', 'KPI-CABLE', 'Copper cable', '100', { departmentId: ids.dept, mainGroupId: ids.mg }],
+    ['b', 'KPI-BOLT', 'Hex bolt', '50', { departmentId: ids.dept2 }],
   ] as const) {
-    const res = await request(app).post('/api/v1/items').set(auth(adminToken)).send({ itemCode, itemDescription, uomId, standardRate });
+    const res = await request(app).post('/api/v1/items').set(auth(adminToken)).send({ itemCode, itemDescription, uomId, standardRate, ...master });
     expect(res.status).toBe(201);
     ids[key] = res.body.data.id;
   }
@@ -143,14 +153,15 @@ beforeAll(async () => {
   hodToken = await signIn('KPI-HOD', ['Kpi@Test2026x']);
 
   /* Indents: one approved and unordered, one approved and fully ordered, one pending, one cancelled. */
-  const indent = async (itemId: number, qty: string, submit: boolean) => {
+  const indentOf = async (departmentId: number, lines: Array<[number, string]>, submit: boolean) => {
     const res = await request(app).post('/api/v1/indents').set(auth(adminToken)).send({
-      indentTypeId: ids.indentType, requiredByDate: '2026-12-31', departmentId: ids.dept, costCentreId: ids.cc, submit,
-      lines: [{ itemId, indentQty: qty, estimatedRate: '10' }],
+      indentTypeId: ids.indentType, requiredByDate: '2026-12-31', departmentId, costCentreId: ids.cc, submit,
+      lines: lines.map(([itemId, indentQty]) => ({ itemId, indentQty, estimatedRate: '10' })),
     });
     expect(res.status).toBe(201);
     return res.body.data.id as number;
   };
+  const indent = (itemId: number, qty: string, submit: boolean) => indentOf(ids.dept, [[itemId, qty]], submit);
   const approve = async (id: number) => {
     const res = await request(app).post(`/api/v1/indents/${id}/approve`).set(auth(headToken)).send({});
     expect(res.status).toBe(200);
@@ -182,8 +193,10 @@ beforeAll(async () => {
   ids.poPartial = await po(ids.s1, { itemId: ids.a, poQty: '6', rate: '100', deliveryDate: '2099-01-01' });
 
   /* GRNs: two against orders, a posted direct receipt, an unposted direct one. */
-  const lineOf = async (poId: number) =>
-    (await request(app).get(`/api/v1/purchase-orders/${poId}`).set(auth(adminToken))).body.data.lines[0].po_line_id as number;
+  const lineOf = async (poId: number, itemId?: number) => {
+    const lines = (await request(app).get(`/api/v1/purchase-orders/${poId}`).set(auth(adminToken))).body.data.lines as Array<{ po_line_id: number; item_id: number }>;
+    return (itemId === undefined ? lines[0] : lines.find((l) => Number(l.item_id) === itemId))!.po_line_id;
+  };
   const grn = async (body: Record<string, unknown>) => {
     const res = await request(app).post('/api/v1/grn').set(auth(adminToken)).send(body);
     expect(res.status).toBe(201);
@@ -192,6 +205,28 @@ beforeAll(async () => {
   await grn({ mode: 'PO', post: true, lines: [{ poLineId: await lineOf(ids.poPartial), grnQty: '2' }] });
   await grn({ mode: 'DIRECT', supplierId: ids.s2, post: true, lines: [{ itemId: ids.b, grnQty: '5', rate: '40' }] });
   await grn({ mode: 'DIRECT', supplierId: ids.s1, post: false, lines: [{ itemId: ids.a, grnQty: '1', rate: '10' }] });
+
+  /* Documents mixing both departments' items (the 2026-10-17 review's cases). */
+  const poOf = async (supplierId: number, lines: Array<[number, string, string, string]>) => {
+    const res = await request(app).post('/api/v1/purchase-orders').set(auth(adminToken)).send({
+      supplierId, poTypeId: ids.poType, issue: true,
+      lines: lines.map(([itemId, poQty, rate, deliveryDate]) => ({ itemId, poQty, rate, deliveryDate, discountPct: '0', sources: [] })),
+    });
+    expect(res.status).toBe(201);
+    return res.body.data.id as number;
+  };
+  // Cable received in full; the bolt line is still pending and past its delivery date.
+  ids.poMixed = await poOf(ids.s1, [[ids.a, '5', '10', '2026-01-10'], [ids.b, '5', '10', '2026-01-10']]);
+  await grn({ mode: 'PO', post: true, lines: [{ poLineId: await lineOf(ids.poMixed, ids.a), grnQty: '5' }] });
+  // Both lines pending, neither overdue.
+  ids.poBoth = await poOf(ids.s2, [[ids.a, '3', '100', '2099-01-01'], [ids.b, '2', '50', '2099-01-01']]);
+  await grn({ mode: 'DIRECT', supplierId: ids.s2, post: true, lines: [{ itemId: ids.a, grnQty: '2', rate: '10' }, { itemId: ids.b, grnQty: '3', rate: '20' }] });
+  // An indent of the second department for a first-department item, and one of the first
+  // department for both items; both approved, nothing ordered.
+  ids.indentD2 = await indentOf(ids.dept2, [[ids.a, '6']], true);
+  await approve(ids.indentD2);
+  ids.indentMixed = await indentOf(ids.dept, [[ids.a, '3'], [ids.b, '5']], true);
+  await approve(ids.indentMixed);
 
   /* Requisitions: pending with the HOD, approved, approved then cancelled, a draft. */
   const requisition = async (submit: boolean, lines: Array<[number, string]>) => {
@@ -249,14 +284,21 @@ describe('Drill targets name only filters their list handles', () => {
 });
 
 describe('Each KPI equals the list it opens', () => {
+  // `__key__` stands for ids.key, known once the fixture exists.
   const contexts: Array<[string, Record<string, string>]> = [
     ['no filter', {}],
     ['a supplier and a period', { supplierId: '__s1__', dateFrom: day(-2), dateTo: day(2) }],
+    ['a department', { departmentId: '__dept__' }],
+    ['an item', { itemId: '__a__' }],
+    ['a main group', { mainGroupId: '__mg__' }],
+    ['an HOD', { hodId: '__hod__' }],
+    ['a department and a supplier', { departmentId: '__dept__', supplierId: '__s2__' }],
+    ['a department and a main group no single line has', { departmentId: '__dept2__', mainGroupId: '__mg__' }],
   ];
 
   for (const [name, raw] of contexts) {
     describe(name, () => {
-      const ctx = () => Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v === '__s1__' ? String(ids.s1) : v]));
+      const ctx = () => Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, /^__\w+__$/.test(v) ? String(ids[v.slice(2, -2)]) : v]));
 
       it('purchase orders: counts, value, quantity, pending, overdue, completed', async () => {
         const k = await kpis(ctx());
@@ -282,12 +324,14 @@ describe('Each KPI equals the list it opens', () => {
         expect(Number(k.get('grn_value_total')!.value)).toBe(Number(posted.meta.totals.totalAmount));
       });
 
-      it('indents: total, pending approval, and the quantity awaiting a purchase order', async () => {
+      it('indents: total, pending approval and its value, and the quantity awaiting a purchase order', async () => {
         const k = await kpis(ctx());
         const all = await drill(k.get('indent_count')!.drilldown, ctx());
         expect(Number(k.get('indent_count')!.value)).toBe(all.meta.total);
         const pending = await drill(k.get('indent_pending_approval')!.drilldown, ctx());
         expect(Number(k.get('indent_pending_approval')!.value)).toBe(pending.meta.total);
+        expect(k.get('indent_pending_value')!.drilldown).toBe(k.get('indent_pending_approval')!.drilldown);
+        expect(Number(k.get('indent_pending_value')!.value)).toBe(Number(pending.meta.totals.totalEstimatedValue));
         const awaiting = await drill(k.get('indent_approved_open_qty')!.drilldown, ctx());
         expect(Number(k.get('indent_approved_open_qty')!.value)).toBe(Number(awaiting.meta.totals.totalPendingQty));
       });
@@ -316,29 +360,94 @@ describe('The figures themselves (no filter)', () => {
   it('match the documents created above', async () => {
     const k = await kpis();
     const v = (key: string) => Number(k.get(key)!.value);
-    // Five orders, one cancelled; the draft was never issued, so it is not pending.
-    expect(v('po_count')).toBe(4);
-    expect(v('po_pending_count')).toBe(2);
-    expect(v('po_pending_value')).toBe(1400);
-    expect(v('grn_pending_qty')).toBe(14);
-    expect(v('po_overdue_count')).toBe(1);
+    // Seven orders, one cancelled; the draft was never issued, so it is not pending.
+    expect(v('po_count')).toBe(6);
+    // Overdue 1,000, part-received 400, the mixed order's bolt line 50, both lines of the last 400.
+    expect(v('po_pending_count')).toBe(4);
+    expect(v('po_pending_value')).toBe(1850);
+    expect(v('grn_pending_qty')).toBe(24);
+    expect(v('po_overdue_count')).toBe(2);
     expect(v('po_completed_count')).toBe(1);
-    // 4 + 2 received against orders, 5 received directly; the unposted GRN does not count.
-    expect(v('grn_count')).toBe(3);
-    expect(v('grn_qty_total')).toBe(11);
-    expect(v('grn_value_total')).toBe(600);
-    expect(v('indent_count')).toBe(3);
-    expect(v('indent_approved_open_qty')).toBe(10);
+    // 4 + 2 + 5 received against orders, 5 + 5 received directly; the unposted GRN does not count.
+    expect(v('grn_count')).toBe(5);
+    expect(v('grn_qty_total')).toBe(21);
+    expect(v('grn_value_total')).toBe(730);
+    expect(v('indent_count')).toBe(5);
+    expect(v('indent_approved_open_qty')).toBe(24);
     expect(v('requisition_count')).toBe(3);
     // Approved then cancelled keeps HOD status Approved; the KPI and its list leave it out.
     expect(v('requisition_hod_approved')).toBe(1);
   });
 
-  it('the awaiting-PO list holds the approved indent with open quantity and nothing else', async () => {
+  it('the awaiting-PO list holds the approved indents with open quantity and nothing else', async () => {
     const k = await kpis();
     const list = await drill(k.get('indent_approved_open_qty')!.drilldown);
-    expect(list.data.map((r) => Number(r.id))).toEqual([ids.indentOpen]);
+    expect(list.data.map((r) => Number(r.id)).sort((x, y) => x - y)).toEqual([ids.indentOpen, ids.indentD2, ids.indentMixed]);
     const unfiltered = await drill('/indents');
-    expect(unfiltered.meta.total).toBe(4);
+    expect(unfiltered.meta.total).toBe(6);
+  });
+});
+
+describe('Item-level filters count lines (2026-10-17 review)', () => {
+  const rowIds = (list: { data: Record<string, unknown>[] }) => list.data.map((r) => Number(r.id)).sort((x, y) => x - y);
+  const sorted = (...xs: number[]) => xs.sort((x, y) => x - y);
+
+  it("filtered to a department, an order whose only pending line is another department's is not pending for it", async () => {
+    const ctx = { departmentId: String(ids.dept) };
+    const k = await kpis(ctx);
+    // The mixed order holds a line of the department, so the order list shows it…
+    expect(rowIds(await drill('/purchase-orders?excludeCancelled=true', ctx))).toContain(ids.poMixed);
+    // …but that line was received in full: its pending, overdue bolt line is the other department's.
+    const pending = await drill('/purchase-orders/pending', ctx);
+    expect(rowIds(pending)).toEqual(sorted(ids.poOverdue, ids.poPartial, ids.poBoth));
+    expect(Number(k.get('po_pending_count')!.value)).toBe(3);
+    // Cable lines only: 1,000 + 400 + 300, not the bolt line's 100 on the order pending both.
+    expect(Number(pending.meta.totals.pending)).toBe(1700);
+    expect(Number(k.get('po_pending_value')!.value)).toBe(1700);
+    expect(rowIds(await drill('/purchase-orders/pending?overdue=true', ctx))).toEqual([ids.poOverdue]);
+    expect(Number(k.get('po_overdue_count')!.value)).toBe(1);
+
+    // The other department sees the mixed order's overdue bolt line, and only its own value.
+    const other = { departmentId: String(ids.dept2) };
+    expect(rowIds(await drill('/purchase-orders/pending?overdue=true', other))).toEqual([ids.poMixed]);
+    expect(Number((await kpis(other)).get('po_pending_value')!.value)).toBe(150);
+  });
+
+  it('the list tiles and the received figures add up the filtered lines of mixed receipts', async () => {
+    const ctx = { departmentId: String(ids.dept) };
+    const k = await kpis(ctx);
+    const posted = await drill('/grn?status=POSTED', ctx);
+    // The part receipt (2 cable), the mixed order's receipt (5 cable) and the mixed direct one (2 of 5).
+    expect(posted.meta.total).toBe(3);
+    expect(Number(posted.meta.totals.totalQty)).toBe(9);
+    expect(Number(posted.meta.totals.totalAmount)).toBe(270);
+    expect(Number(posted.meta.totals.lineCount)).toBe(3);
+    expect(posted.meta.totals.lineScoped).toBe(true);
+    expect(Number(k.get('grn_qty_total')!.value)).toBe(9);
+    // Unfiltered, a receipt's tiles are all its lines.
+    expect((await drill('/grn?status=POSTED')).meta.totals.lineScoped).toBe(false);
+  });
+
+  it("an indent's department is its own, and the item filter counts that item's lines", async () => {
+    // The second department's indent is for a first-department item: not the first department's.
+    const dept = { departmentId: String(ids.dept) };
+    const awaiting = await drill('/indents?eligibleOnly=true', dept);
+    expect(rowIds(awaiting)).toEqual(sorted(ids.indentOpen, ids.indentMixed));
+    expect(Number(awaiting.meta.totals.totalPendingQty)).toBe(18);
+    expect(Number((await kpis(dept)).get('indent_approved_open_qty')!.value)).toBe(18);
+
+    // For the cable: its lines on three indents, 10 + 6 + 3, not the mixed indent's bolt.
+    const item = { itemId: String(ids.a) };
+    const forItem = await drill('/indents?eligibleOnly=true', item);
+    expect(rowIds(forItem)).toEqual(sorted(ids.indentOpen, ids.indentD2, ids.indentMixed));
+    expect(Number(forItem.meta.totals.totalPendingQty)).toBe(19);
+    expect(Number((await kpis(item)).get('indent_approved_open_qty')!.value)).toBe(19);
+  });
+
+  it('one line must satisfy every item-level filter', async () => {
+    // Department 2 and the cables group are on different lines of the mixed orders.
+    const ctx = { departmentId: String(ids.dept2), mainGroupId: String(ids.mg) };
+    expect((await drill('/purchase-orders?excludeCancelled=true', ctx)).meta.total).toBe(0);
+    expect(Number((await kpis(ctx)).get('po_count')!.value)).toBe(0);
   });
 });
