@@ -146,19 +146,20 @@ export function receiptEvidenceCondition(evidence: ReceiptEvidence, po: string):
 
 /**
  * The per-PO counts a PO list row and its export carry (store_receipts_awaiting_link,
- * store_sheet_receipts): a WITH clause, the joins that use it on the PO header aliased
- * `po`, and the two columns. Each set is counted once (MATERIALIZED) and joined.
+ * store_sheet_receipts): a WITH clause that counts each set once (MATERIALIZED), and
+ * the two columns, each a lookup of the PO header aliased `po` in its set. Lookups, not
+ * joins: joined, the two sets changed the plan of the list's own pending test on a
+ * database without statistics, and the 'No receipt recorded' page took 40.6 s against
+ * 1.3 s without them (2026-10-17 copy); looked up, it took 1.5 s.
  */
 export const EVIDENCE_COUNTS_WITH = `ev_awaiting AS MATERIALIZED (
     SELECT k.po_id, COUNT(*)::int AS n FROM ${AWAITING_LINK_FROM} WHERE k.po_id IS NOT NULL GROUP BY k.po_id
   ), ev_sheet AS MATERIALIZED (
     SELECT s.po_key, COUNT(*)::int AS n FROM (${SHEET_LINES}) s WHERE NOT s.posted_since GROUP BY s.po_key
   )`;
-export const evidenceCountJoins = (po: string): string =>
-  `LEFT JOIN ev_awaiting ON ev_awaiting.po_id = ${po}.id
-   LEFT JOIN ev_sheet ON ev_sheet.po_key = upper(trim(${po}.po_no))`;
-export const EVIDENCE_COUNT_COLUMNS =
-  'COALESCE(ev_awaiting.n, 0) AS store_receipts_awaiting_link, COALESCE(ev_sheet.n, 0) AS store_sheet_receipts';
+export const evidenceCountColumns = (po: string): string =>
+  `COALESCE((SELECT a.n FROM ev_awaiting a WHERE a.po_id = ${po}.id), 0) AS store_receipts_awaiting_link,
+   COALESCE((SELECT x.n FROM ev_sheet x WHERE x.po_key = upper(trim(${po}.po_no))), 0) AS store_sheet_receipts`;
 
 /** Each reason in plain words for a purchase user; the row's `detail` carries the figures. */
 export const REASON_TEXT: Record<HoldRowReason, string> = {

@@ -21,7 +21,7 @@ import {
 } from '../../db/index.js';
 import { renderPoDocumentHtml, type PoDocumentData } from './po-document.js';
 import {
-  RECEIPT_EVIDENCE, receiptEvidenceCondition, EVIDENCE_COUNTS_WITH, EVIDENCE_COUNT_COLUMNS, evidenceCountJoins,
+  RECEIPT_EVIDENCE, receiptEvidenceCondition, EVIDENCE_COUNTS_WITH, evidenceCountColumns,
   awaitingLinkLines, storeSheetLines, latestHoldRecord, latestSheetRead, receiptsNamingPosNotInErp,
   storeReceiptsAwaitingLink as storeReceiptsAwaitingLinkOf, storeSheetReceipts as storeSheetReceiptsOf,
   type ReceiptEvidence,
@@ -227,8 +227,9 @@ router.get(
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
 
-    // The receipt evidence counts are each built once and joined (EVIDENCE_COUNTS_WITH):
-    // its store receipts awaiting link, and its receipts on the store's GRN sheet only.
+    // The receipt evidence counts are each built once (EVIDENCE_COUNTS_WITH) and looked
+    // up per row: its store receipts awaiting link, and its receipts on the store's GRN
+    // sheet only.
     const rows = await query(
       `WITH ${EVIDENCE_COUNTS_WITH}
        SELECT h.id, h.po_no, h.po_date, h.po_time, h.status, h.source_mode, h.remarks,
@@ -253,11 +254,10 @@ router.get(
               -- Store receipts the link repair held back that name this PO, and receipts
               -- the store recorded on its GRN sheet only: its goods may have come although
               -- nothing is received against it in the ERP (receipt-evidence.ts).
-              ${EVIDENCE_COUNT_COLUMNS}
+              ${evidenceCountColumns('h')}
          ${PO_FROM}
          LEFT JOIN lookups pt ON pt.id = h.po_type_id
          LEFT JOIN users u ON u.id = h.created_by
-         ${evidenceCountJoins('h')}
          ${b.where()}
         ORDER BY ${order}, h.id DESC
         LIMIT ${limit} OFFSET ${offset}`,
