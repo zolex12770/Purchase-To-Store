@@ -116,7 +116,9 @@ router.post(
 
 router.post(
   '/reconcile',
-  requirePermission('sync.view'),
+  // Queues a background job that reads the whole replica, like the export and
+  // rebuild above — an administrator action, not something a viewer starts.
+  requirePermission('sync.admin'),
   validateBody(sheetsBody),
   asyncHandler(async (req, res) => {
     const { sheets } = req.body as z.infer<typeof sheetsBody>;

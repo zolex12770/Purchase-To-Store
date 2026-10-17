@@ -45,10 +45,11 @@ const OWN_BODY_PARSER = /^\/api\/v1\/(?:admin\/)?data-management\/repair\/stock-
 export function createApp(): Express {
   const app = express();
 
-  // Behind a reverse proxy in production, trust exactly one hop so `req.ip` is the
-  // real client (rate limiting and audit trails depend on it) without allowing
-  // arbitrary X-Forwarded-For spoofing.
-  app.set('trust proxy', env.isProd ? 1 : false);
+  // Who may name the client's address in X-Forwarded-For, which the sign-in rate
+  // limit and the audit trail key on: loopback (the vite proxy on this machine)
+  // in every environment, unless TRUST_PROXY names the deployment's proxies —
+  // config/env.ts says when it must.
+  app.set('trust proxy', env.TRUST_PROXY);
   app.disable('x-powered-by');
 
   /* ── Request identity & timing ───────────────────────────────────────────── */

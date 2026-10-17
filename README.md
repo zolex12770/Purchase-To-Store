@@ -23,17 +23,20 @@ npm run dev
 
 Open **http://localhost:5173** and sign in.
 
-| Employee ID | Password      | Role        |
-|-------------|---------------|-------------|
-| `10221`     | `Admin@12345` | Super Admin |
-| `10422`     | `Admin@12345` | Super Admin |
-
-> **These are bootstrap credentials.** The application forces a password change at
-> first sign-in and refuses every other screen until you rotate it. Never deploy
-> with them unchanged.
-
 The first run creates the database, applies migrations and seeds the permission
-catalogue, the six default roles and the two bootstrap administrators.
+catalogue, the six default roles and the two bootstrap administrators, `10221` and
+`10422` (Super Admin). There is no default password. Their first-sign-in password is:
+
+- the value of `BOOTSTRAP_ADMIN_PASSWORD` (at least 12 characters), if it is set for
+  that first start, or otherwise
+- a random one, written once to `bootstrap-admin-password.txt` in the data root
+  (`%ZOLEX_DATA_ROOT%`) and never to the log.
+
+> **It is for the first sign-in only.** Each account must set a password of its own
+> straight away: until it does, the application shows nothing but the
+> change-password screen and the API refuses every other request. Delete
+> `bootstrap-admin-password.txt` once both have signed in. A password that has been
+> published, or that contains the Employee ID, is refused.
 
 ### The database ships **clean**
 
@@ -143,6 +146,8 @@ The settings that matter most:
 | `DB_DRIVER` | `pglite` (embedded, default) or `pg` (a real PostgreSQL server) |
 | `DATABASE_URL` | Connection string when `DB_DRIVER=pg` |
 | `AUTH_SECRET`, `AUTH_REFRESH_SECRET` | Required in production; auto-generated in development |
+| `BOOTSTRAP_ADMIN_PASSWORD` | Optional first-sign-in password (12+ characters) for the bootstrap administrators a new database creates; without it a random one is written to `bootstrap-admin-password.txt` in the data root |
+| `TRUST_PROXY` | Which proxies may name the client's address, which sign-in rate limits and the audit trail key on. Unset means loopback, right for a proxy on the same machine; a proxy elsewhere must be named (the docker stack sets `1`) — see [docs/09_DEPLOYMENT.md](docs/09_DEPLOYMENT.md) §4 |
 | `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` | Path to a service-account key, stored outside the repository |
 
 **Production runs on a real PostgreSQL server.** See

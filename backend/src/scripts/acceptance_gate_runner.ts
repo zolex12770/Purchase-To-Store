@@ -5,6 +5,11 @@ import { execSync } from 'node:child_process';
 import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 import { env, paths } from '../config/env.js';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 interface ApiResponse<T = any> {
   status: number;
@@ -30,8 +35,8 @@ function apiRequest<T = any>(
     const dataStr = body ? JSON.stringify(body) : undefined;
     const req = http.request(
       {
-        hostname: '127.0.0.1',
-        port: 4001,
+        hostname: SCRIPT_API.hostname,
+        port: SCRIPT_API.port,
         path: `/api/v1${endpoint}`,
         method,
         headers: {
@@ -76,17 +81,14 @@ async function main() {
   console.log('========================================================================');
   console.log('FINAL PRODUCTION ACCEPTANCE GATE RUNNER — COMMIT d79c347');
   console.log('Timestamp:', new Date().toISOString());
-  console.log('Live Backend API: http://127.0.0.1:4001/api/v1');
+  console.log(`Backend API: ${SCRIPT_API.baseUrl}`);
   console.log('========================================================================\n');
 
   const report: Record<string, any> = {};
 
   // ── Authentication ──────────────────────────────────────────────────────────
-  console.log('Authenticating as Super Admin (10221)...');
-  const loginRes = await apiRequest('/auth/login', 'POST', {
-    employeeId: '10221',
-    password: 'Admin@123',
-  });
+  console.log(`Authenticating as ${SCRIPT_LOGIN.employeeId}...`);
+  const loginRes = await apiRequest('/auth/login', 'POST', SCRIPT_LOGIN);
   if (!loginRes.data.success || !loginRes.data.data?.accessToken) {
     throw new Error('Authentication failed: ' + JSON.stringify(loginRes.data));
   }

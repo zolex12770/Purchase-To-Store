@@ -8,6 +8,7 @@ import 'dotenv/config';
 import { z } from 'zod';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import net from 'node:net';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +25,67 @@ const int = (def: number) =>
     .optional()
     .transform((v) => (v === undefined || v === '' ? def : Number(v)))
     .pipe(z.number().int());
+
+const NAMED_RANGES = new Set(['loopback', 'linklocal', 'uniquelocal']);
+
+/** One entry of a TRUST_PROXY list: a named range, an address, or address/prefix-length. */
+function isProxyEntry(entry: string): boolean {
+  if (NAMED_RANGES.has(entry)) return true;
+  const [address = '', prefix, ...extra] = entry.split('/');
+  const family = net.isIP(address);
+  if (family === 0 || extra.length > 0) return false;
+  return prefix === undefined || (/^\d+$/.test(prefix) && Number(prefix) >= 1 && Number(prefix) <= (family === 4 ? 32 : 128));
+}
+
+/**
+ * TRUST_PROXY → Express `trust proxy`: who may name the client's address in
+ * X-Forwarded-For. `req.ip` keys the sign-in rate limit and is what audit and
+ * session rows record, so this must name exactly the proxies in front of the API.
+ *
+ *   (unset)  loopback. The pm2 host: its only proxy is the vite server on the same
+ *            machine (8080, xfwd on both /api entries), and a LAN client calling
+ *            the API port directly is keyed on its own address whatever it sends.
+ *   1, 2, …  that many hops, whoever they are: only where nothing else can reach
+ *            the API port. deploy/docker-compose.yml sets 1 — its nginx connects
+ *            from the compose network, so under loopback every user would share
+ *            nginx's address, and 20 mistyped passwords anywhere would close
+ *            sign-in for the whole site for 15 minutes.
+ *   a list   comma-separated addresses, CIDR subnets, loopback, linklocal,
+ *            uniquelocal. Not uniquelocal on the pm2 host: the office LAN
+ *            (172.16.18.x) is itself inside 172.16.0.0/12.
+ *   false    no proxy: every request is keyed on its own connection.
+ *
+ * `true` (every hop) is refused: the left-most X-Forwarded-For entry, which the
+ * client writes, would become its address. Production's old `1` gave a client
+ * calling 4001 directly the same power: a fresh rate-limit bucket per request,
+ * shown on staging.
+ */
+const trustProxy = z
+  .string()
+  .optional()
+  .transform((v, ctx): boolean | number | string => {
+    const value = (v ?? '').trim().toLowerCase();
+    if (value === '') return 'loopback';
+    if (value === 'false') return false;
+    if (/^\d+$/.test(value)) return Number(value);
+    if (value === 'true') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'true lets any client name its own address; give the number of proxies or their addresses.',
+      });
+      return z.NEVER;
+    }
+    const entries = value.split(',').map((e) => e.trim());
+    const bad = entries.find((e) => !isProxyEntry(e));
+    if (bad !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `"${bad}" is not an address, a CIDR subnet, loopback, linklocal or uniquelocal.`,
+      });
+      return z.NEVER;
+    }
+    return entries.join(',');
+  });
 
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -61,6 +123,7 @@ const schema = z.object({
   RATE_LIMIT_WINDOW_MINUTES: int(15),
   RATE_LIMIT_MAX: int(1000),
   AUTH_RATE_LIMIT_MAX: int(20),
+  TRUST_PROXY: trustProxy,
   MAX_UPLOAD_MB: int(15),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error', 'silent']).default('info'),
   SEED_DEMO_DATA: bool(true),

@@ -516,9 +516,11 @@ router.get(
   }),
 );
 
+// Recording a print moves the lot's print_count, which is what tells the store a
+// label is a reprint — so it needs the print right, not merely the view right.
 router.post(
   '/labels/print',
-  requirePermission('grn.view'),
+  requirePermission('grn.print'),
   validateBody(z.object({ ids: z.array(z.number().int().positive()).min(1) })),
   asyncHandler(async (req, res) => {
     const { ids } = req.body as { ids: number[] };
@@ -537,7 +539,8 @@ router.post(
 
 router.get(
   '/labels/pdf',
-  requirePermission('grn.view'),
+  // Counts as a print (it moves print_count below), like POST /labels/print.
+  requirePermission('grn.print'),
   validateQuery(labelIdsSchema),
   asyncHandler(async (req, res) => {
     const { ids } = parsedQuery<z.infer<typeof labelIdsSchema>>(res);
@@ -1655,11 +1658,17 @@ router.get(
  * cards and date/supplier/item trend breakdowns are already served generically
  * by the existing /analytics endpoints (GrnAnalysis.tsx) and are not
  * duplicated here.
+ *
+ * These need the GRN analysis right, not just the view right: they consolidate
+ * received value by supplier and item, which a view-only role had no business
+ * reading in bulk. Every role that holds grn.analyze (Purchase Head, Store User,
+ * Management) keeps them; the GRN Analysis screen itself draws from /analytics,
+ * whose rights are unchanged.
  * ──────────────────────────────────────────────────────────────────────── */
 
 router.get(
   '/analysis/po-wise',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   validateQuery(z.object({
     search: z.string().trim().max(200).optional(),
     supplierId: csvIdArray,
@@ -1711,7 +1720,7 @@ router.get(
 
 router.get(
   '/analysis/item-wise',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   validateQuery(z.object({
     search: z.string().trim().max(200).optional(),
     page: z.coerce.number().int().min(1).default(1),
@@ -1767,7 +1776,7 @@ router.get(
 
 router.get(
   '/analysis/supplier-wise',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   validateQuery(z.object({
     search: z.string().trim().max(200).optional(),
     page: z.coerce.number().int().min(1).default(1),
@@ -1825,7 +1834,7 @@ router.get(
 
 router.get(
   '/analysis/summary',
-  requirePermission('grn.view'),
+  requirePermission('grn.analyze'),
   asyncHandler(async (_req, res) => {
     const grnCounts = await query<{ status: string; n: string }>(
       "SELECT status, COUNT(*) AS n FROM grn_headers GROUP BY status",

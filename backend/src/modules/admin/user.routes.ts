@@ -15,6 +15,7 @@ import { NotFoundError, BusinessRuleError, ValidationError, ConflictError } from
 import { requirePermission, invalidateAuthState } from '../../auth/middleware.js';
 import { auditIn, actorFrom } from '../../core/audit.js';
 import { hashPassword, checkPasswordStrength } from '../../auth/tokens.js';
+import { assertMayChangeUsers, assertActiveSuperAdminRemains } from './super-admin-guard.js';
 
 const router = Router();
 
@@ -125,7 +126,9 @@ const createSchema = z.object({
   mobileNo: z.string().trim().max(30).default(''),
   departmentId: z.coerce.number().int().positive().nullable().optional(),
   password: z.string().min(1, 'A password is required.').max(128),
-  mustChangePassword: z.boolean().default(false),
+  // An administrator knows the password they typed, so by default the user must
+  // replace it at first sign-in; the administrator may opt out explicitly.
+  mustChangePassword: z.boolean().default(true),
   isActive: z.boolean().default(true),
   roleIds: z.array(z.coerce.number().int().positive()).min(1, 'Assign at least one role.'),
 });
@@ -137,7 +140,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const body = req.body as z.infer<typeof createSchema>;
 
-    const strength = checkPasswordStrength(body.password);
+    const strength = checkPasswordStrength(body.password, { employeeId: body.employeeId });
     if (!strength.ok) {
       throw ValidationError('Choose a stronger password.', [
         { field: 'password', message: `Password must ${strength.problems.join(', ')}.` },
@@ -208,6 +211,9 @@ router.put(
     if (!before) throw NotFoundError('User');
 
     await withTransaction(async (tx) => {
+      // A Super Admin's account — its roles above all — is changed only by a Super Admin.
+      await assertMayChangeUsers(tx, req, [id]);
+
       const roles = await txQuery<{ id: number; code: string }>(
         tx, 'SELECT id, code FROM roles WHERE id = ANY($1)', [body.roleIds],
       );
@@ -231,19 +237,7 @@ router.put(
         (before.roles as { code: string }[]).some((r) => r.code === 'SUPER_ADMIN');
       const staysSuper = roles.some((r) => r.code === 'SUPER_ADMIN');
       if (wasSuper && (!staysSuper || !body.isActive)) {
-        const remaining = await txQueryOne<{ n: string }>(
-          tx,
-          `SELECT COUNT(*) AS n FROM users u
-             JOIN user_roles ur ON ur.user_id = u.id
-             JOIN roles r ON r.id = ur.role_id
-            WHERE r.code = 'SUPER_ADMIN' AND u.is_active AND u.deleted_at IS NULL AND u.id <> $1`,
-          [id],
-        );
-        if (Number(remaining?.n ?? 0) === 0) {
-          throw BusinessRuleError(
-            'This is the last active Super Admin. Grant Super Admin to another user before changing this account.',
-          );
-        }
+        await assertActiveSuperAdminRemains(tx, [id]);
       }
 
       await tx.query(
@@ -292,7 +286,11 @@ router.post(
   requirePermission('user.edit'),
   validateBody(z.object({
     newPassword: z.string().min(1, 'A new password is required.').max(128),
-    mustChangePassword: z.boolean().default(false),
+    // The administrator now knows this password, so by default the user must
+    // replace it at their next sign-in. This defaulted to false, and the Users
+    // screen always sent false, so reset passwords (often the screen's own
+    // placeholder example) stayed in use indefinitely.
+    mustChangePassword: z.boolean().default(true),
   })),
   asyncHandler(async (req, res) => {
     const id = idParam(req);
@@ -302,8 +300,9 @@ router.post(
       'SELECT employee_id, employee_name FROM users WHERE id = $1 AND deleted_at IS NULL', [id],
     );
     if (!user) throw NotFoundError('User');
+    await assertMayChangeUsers(undefined, req, [id]);
 
-    const strength = checkPasswordStrength(newPassword);
+    const strength = checkPasswordStrength(newPassword, { employeeId: user.employee_id });
     if (!strength.ok) {
       throw ValidationError('Choose a stronger password.', [
         { field: 'newPassword', message: `Password must ${strength.problems.join(', ')}.` },
@@ -346,6 +345,8 @@ router.post(
       'SELECT employee_name, employee_id FROM users WHERE id = $1 AND deleted_at IS NULL', [id],
     );
     if (!user) throw NotFoundError('User');
+    // Lifting a lockout re-opens password guessing against the account.
+    await assertMayChangeUsers(undefined, req, [id]);
 
     await withTransaction(async (tx) => {
       await tx.query(
@@ -376,21 +377,8 @@ router.delete(
     );
     if (!user) throw NotFoundError('User');
 
-    const remaining = await queryOne<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM users u
-         JOIN user_roles ur ON ur.user_id = u.id
-         JOIN roles r ON r.id = ur.role_id
-        WHERE r.code = 'SUPER_ADMIN' AND u.is_active AND u.deleted_at IS NULL AND u.id <> $1`,
-      [id],
-    );
-    const isSuper = await queryOne<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM user_roles ur JOIN roles r ON r.id = ur.role_id
-        WHERE ur.user_id = $1 AND r.code = 'SUPER_ADMIN'`,
-      [id],
-    );
-    if (Number(isSuper?.n ?? 0) > 0 && Number(remaining?.n ?? 0) === 0) {
-      throw BusinessRuleError('This is the last active Super Admin and cannot be deactivated.');
-    }
+    await assertMayChangeUsers(undefined, req, [id]);
+    await assertActiveSuperAdminRemains(undefined, [id], 'This is the last active Super Admin and cannot be deactivated.');
 
     // Users are never hard-deleted: they author indents, approvals and audit records
     // that must keep pointing at a real identity (SRS §20, §24).

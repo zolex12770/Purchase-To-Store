@@ -198,7 +198,7 @@ anything.
 
 From `08_SECURITY.md §10`:
 
-- [ ] Rotate `10221` / `10422` away from `Admin@12345`
+- [ ] `10221` / `10422` have replaced their first-sign-in password; `bootstrap-admin-password.txt` deleted
 - [ ] Generate fresh `AUTH_SECRET` and `AUTH_REFRESH_SECRET`
 - [ ] `NODE_ENV=production`
 - [ ] `DB_DRIVER=pg` against a real PostgreSQL server

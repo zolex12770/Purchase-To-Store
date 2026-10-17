@@ -6,7 +6,9 @@
  * here only improves ergonomics; it never grants or withholds actual access.
  */
 import { createContext, useContext, useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
-import { api, setAccessToken, setUnauthenticatedHandler, resetRefreshState, refreshSession, ApiError } from './api';
+import {
+  api, setAccessToken, setUnauthenticatedHandler, setPasswordChangeRequiredHandler, resetRefreshState, refreshSession, ApiError,
+} from './api';
 
 export interface CurrentUser {
   id: number;
@@ -29,7 +31,11 @@ interface AuthState {
   signIn: (employeeId: string, password: string) => Promise<CurrentUser>;
   signOut: () => Promise<void>;
   refreshUser: () => Promise<void>;
-  changePassword: (currentPassword: string, newPassword: string) => Promise<string>;
+  /**
+   * Ends every session (the server revokes them all). With `continueAs` — the
+   * signed-in Employee ID — it then signs straight back in with the new password.
+   */
+  changePassword: (currentPassword: string, newPassword: string, options?: { continueAs?: string }) => Promise<string>;
   can: (...permissions: string[]) => boolean;
   canAny: (...permissions: string[]) => boolean;
   isSuperAdmin: boolean;
@@ -79,6 +85,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => setUnauthenticatedHandler(null);
   }, []);
 
+  // A 403 PASSWORD_CHANGE_REQUIRED anywhere means this account owes a password
+  // change the session did not know about; marking it so puts the change-password
+  // screen up (App.tsx RequireAuth) in place of the screen that was refused.
+  useEffect(() => {
+    setPasswordChangeRequiredHandler(() => setUser((u) => (u && !u.mustChangePassword ? { ...u, mustChangePassword: true } : u)));
+    return () => setPasswordChangeRequiredHandler(null);
+  }, []);
+
   const signIn = useCallback(async (employeeId: string, password: string) => {
     const res = await api.post<{ accessToken: string; user: CurrentUser }>('/auth/login', {
       employeeId,
@@ -101,16 +115,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }, []);
 
-  const changePassword = useCallback(async (currentPassword: string, newPassword: string) => {
+  const changePassword = useCallback(async (
+    currentPassword: string, newPassword: string, options: { continueAs?: string } = {},
+  ) => {
     const res = await api.post<{ message: string }>('/auth/change-password', {
       currentPassword,
       newPassword,
     });
     // The server revokes every session on a password change, so sign out locally.
     setAccessToken(null);
+    if (options.continueAs) {
+      // A user who had to change their password continues into the application
+      // on a new session rather than being sent back to the sign-in form. The
+      // signed-in user stays in place meanwhile, so that screen does not flash.
+      try {
+        await signIn(options.continueAs, newPassword);
+        return res.message;
+      } catch {
+        /* the password is changed regardless — they sign in with it themselves */
+      }
+    }
     setUser(null);
     return res.message;
-  }, []);
+  }, [signIn]);
 
   const permissionSet = useMemo(() => new Set(user?.permissions ?? []), [user]);
 

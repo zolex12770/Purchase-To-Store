@@ -2,6 +2,11 @@ import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 import http from 'node:http';
 import { env } from '../config/env.js';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 function apiRequest<T = any>(
   endpoint: string,
@@ -13,8 +18,8 @@ function apiRequest<T = any>(
     const dataStr = body ? JSON.stringify(body) : undefined;
     const req = http.request(
       {
-        hostname: '127.0.0.1',
-        port: 4001,
+        hostname: SCRIPT_API.hostname,
+        port: SCRIPT_API.port,
         path: `/api/v1${endpoint}`,
         method,
         headers: {
@@ -75,7 +80,7 @@ async function main() {
   }
 
   // 2. ERP Database
-  const loginRes = await apiRequest('/auth/login', 'POST', { employeeId: '10221', password: 'Admin@123' });
+  const loginRes = await apiRequest('/auth/login', 'POST', SCRIPT_LOGIN);
   const token = loginRes.data.data.accessToken;
 
   const erpRes = await apiRequest('/requisitions?dateFrom=2026-10-13&dateTo=2026-10-13&pageSize=100', 'GET', null, token);

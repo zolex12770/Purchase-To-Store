@@ -127,9 +127,12 @@ cat <<EOF
   3. Apply the schema (creates a CLEAN production database — no demo data):
        ./deploy/migrate.sh --clean
 
-  4. Sign in at \$FRONTEND_URL as 10221 / Admin@12345.
-     ${YELLOW}You will be forced to change the password immediately.${OFF}
-     Do the same for 10422.
+  4. Sign in at \$FRONTEND_URL as 10221. There is no default password: the API's
+     first start wrote a random first-sign-in password to its data volume —
+       cd ${HERE} && docker compose --env-file ./.env.deploy exec api cat /data/bootstrap-admin-password.txt
+     ${YELLOW}You will be forced to change the password immediately; nothing else opens until you do.${OFF}
+     Do the same for 10422, then delete the file:
+       cd ${HERE} && docker compose --env-file ./.env.deploy exec api rm /data/bootstrap-admin-password.txt
 
   5. Schedule backups and TEST A RESTORE:
        ./deploy/backup.sh          # add to cron, e.g. 0 2 * * *

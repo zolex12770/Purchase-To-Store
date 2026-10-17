@@ -289,9 +289,14 @@ export const ROLES: RoleDef[] = [
     code: 'VIEWER',
     name: 'Viewer',
     description: 'Read-only access to permitted screens.',
+    // Least privilege: the User Master sync gives this role to every employee it
+    // creates, so it must not open suppliers, indents, purchase orders or GRNs —
+    // with their rates and amounts — to all staff. A business role adds those.
+    // This default reaches new databases only: the seed never re-grants a right
+    // an administrator removed from an existing role (seed.ts seedRoles).
     permissions: [
       'dashboard.view',
-      ...viewAll(['item', 'supplier', 'lookup', 'indent', 'po', 'grn', 'requisition', 'qc', 'auto_indent', 'inventory']),
+      ...viewAll(['item', 'lookup', 'requisition']),
     ],
   },
   {

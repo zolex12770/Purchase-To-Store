@@ -1,4 +1,9 @@
 import http from 'node:http';
+import { scriptApiTarget, scriptCredentials } from './script-target.js';
+
+// Target and account come from the environment; production needs ZOLEX_ALLOW_PRODUCTION=yes.
+const SCRIPT_API = scriptApiTarget();
+const SCRIPT_LOGIN = scriptCredentials();
 
 function request(options: http.RequestOptions, body?: any): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -21,12 +26,12 @@ function request(options: http.RequestOptions, body?: any): Promise<any> {
 
 async function main() {
   const login = await request(
-    { hostname: '127.0.0.1', port: 4001, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
-    { employeeId: '10221', password: 'Admin@123' }
+    { hostname: SCRIPT_API.hostname, port: SCRIPT_API.port, path: '/api/v1/auth/login', method: 'POST', headers: { 'Content-Type': 'application/json' } },
+    SCRIPT_LOGIN
   );
   const token = login.data?.accessToken;
   const sync = await request(
-    { hostname: '127.0.0.1', port: 4001, path: '/api/v1/google-sync/status', method: 'GET', headers: { Authorization: `Bearer ${token}` } }
+    { hostname: SCRIPT_API.hostname, port: SCRIPT_API.port, path: '/api/v1/google-sync/status', method: 'GET', headers: { Authorization: `Bearer ${token}` } }
   );
   console.log('Login result:', login.success, login.data?.user?.employeeName);
   console.log('Sync result:', sync);
