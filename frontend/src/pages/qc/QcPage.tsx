@@ -43,7 +43,8 @@ interface InspectionRow {
   rejected_qty: string;
   uom_id: number | null;
   uom_code: string;
-  status: 'PENDING_QC' | 'QC_IN_PROGRESS' | 'QC_PASSED' | 'ACCEPTED_WITH_DEVIATION' | 'QC_FAILED' | 'ON_HOLD';
+  // CANCELLED: closed without a decision because its GRN was cancelled.
+  status: 'PENDING_QC' | 'QC_IN_PROGRESS' | 'QC_PASSED' | 'ACCEPTED_WITH_DEVIATION' | 'QC_FAILED' | 'ON_HOLD' | 'CANCELLED';
   inspector_id: number | null;
   inspector_name: string | null;
   inspection_date: string | null;
@@ -51,6 +52,7 @@ interface InspectionRow {
   rejection_reason: string | null;
   next_action: string | null;
   created_at: string;
+  grn_status: 'DRAFT' | 'POSTED' | 'CANCELLED';
 }
 
 interface QcStats {
@@ -60,7 +62,18 @@ interface QcStats {
   passed: number;
   failed: number;
   onHold: number;
+  closed: number;
 }
+
+/**
+ * The server records a decision only on a posted GRN, and never changes a pass:
+ * the button is not offered where it would be refused.
+ */
+const canDecide = (r: InspectionRow) =>
+  r.grn_status === 'POSTED' && !['QC_PASSED', 'ACCEPTED_WITH_DEVIATION', 'CANCELLED'].includes(r.status);
+
+/** A final decision accounts for everything received: what is not accepted is rejected. */
+const FINAL_DECISIONS: InspectionRow['status'][] = ['QC_PASSED', 'ACCEPTED_WITH_DEVIATION', 'QC_FAILED'];
 
 export default function QcPage() {
   const { can } = useAuth();
@@ -164,6 +177,11 @@ export default function QcPage() {
       return;
     }
 
+    if (FINAL_DECISIONS.includes(decisionStatus) && Math.abs(acc + rej - rec) > 0.00005) {
+      toast.error(`A final decision must account for all ${rec} received: accepted + rejected is ${acc + rej}.`);
+      return;
+    }
+
     if ((decisionStatus === 'QC_FAILED' || rej > 0) && !rejectionReason.trim()) {
       toast.error('Rejection reason is mandatory when items are rejected.');
       return;
@@ -225,6 +243,9 @@ export default function QcPage() {
         if (r.status === 'PENDING_QC') {
           return <span className="cell-muted" style={{ fontSize: 'var(--text-xs)' }}>Awaiting Test</span>;
         }
+        if (r.status === 'CANCELLED') {
+          return <span className="cell-muted" style={{ fontSize: 'var(--text-xs)' }}>Nothing released</span>;
+        }
         return (
           <div className="num" style={{ fontSize: 'var(--text-xs)' }}>
             <div style={{ color: 'var(--success-600)', fontWeight: 600 }}>{qty(r.accepted_qty)} pass</div>
@@ -251,6 +272,8 @@ export default function QcPage() {
             return <Badge tone="neutral"><Clock size={11} style={{ marginRight: 3 }} /> On Hold</Badge>;
           case 'QC_IN_PROGRESS':
             return <Badge tone="info"><Clock size={11} style={{ marginRight: 3 }} /> Testing</Badge>;
+          case 'CANCELLED':
+            return <Badge tone="neutral">Closed: GRN cancelled</Badge>;
           default:
             return <Badge tone="neutral">Pending QC</Badge>;
         }
@@ -281,7 +304,7 @@ export default function QcPage() {
       align: 'right',
       locked: true,
       render: (r) => {
-        const canInspect = can('qc.inspect') || can('qc.approve');
+        const canInspect = (can('qc.inspect') || can('qc.approve')) && canDecide(r);
         return (
           <div className="row" style={{ gap: 4, justifyContent: 'flex-end' }}>
             {canInspect && (
@@ -325,6 +348,9 @@ export default function QcPage() {
         <StatTile label="Passed & Released" value={count(stats?.passed ?? 0)} tone="success" />
         <StatTile label="Rejected / Failed" value={count(stats?.failed ?? 0)} tone="danger" />
         <StatTile label="On Hold" value={count(stats?.onHold ?? 0)} tone="default" />
+        {(stats?.closed ?? 0) > 0 && (
+          <StatTile label="Closed: GRN Cancelled" value={count(stats?.closed ?? 0)} tone="default" />
+        )}
       </div>
 
       <div style={{ marginBottom: 'var(--sp-4)' }}>

@@ -81,6 +81,7 @@ const QC_STATUS_OPTIONS = [
   { value: 'QC_FAILED', label: 'QC Failed' },
   { value: 'ACCEPTED_WITH_DEVIATION', label: 'Accepted with Deviation' },
   { value: 'ON_HOLD', label: 'On Hold' },
+  { value: 'CANCELLED', label: 'QC Closed (GRN cancelled)' },
   { value: 'NOT_APPLICABLE', label: 'Not Applicable' },
 ];
 

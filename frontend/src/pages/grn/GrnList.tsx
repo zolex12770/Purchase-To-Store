@@ -78,6 +78,7 @@ export default function GrnList() {
         pendingQcCount: number;
         qcPassedCount: number;
         qcFailedCount: number;
+        qcStatusCounts?: Record<string, number>;
       };
     }>(`/grn${query}`),
   });
@@ -85,6 +86,13 @@ export default function GrnList() {
   const counts = list.data?.meta.statusCounts ?? {};
   const totalAll = Object.values(counts).reduce((a, b) => a + b, 0);
   const totals = list.data?.meta.totals;
+  const qcCount = (code: string) => totals?.qcStatusCounts?.[code] ?? 0;
+  const pendingQcDetail = [
+    qcCount('QC_IN_PROGRESS') > 0 ? `${count(qcCount('QC_IN_PROGRESS'))} under testing` : '',
+    qcCount('ON_HOLD') > 0 ? `${count(qcCount('ON_HOLD'))} on hold` : '',
+  ].filter(Boolean).join(' · ') || undefined;
+  const passedQcDetail = qcCount('ACCEPTED_WITH_DEVIATION') > 0
+    ? `${count(qcCount('ACCEPTED_WITH_DEVIATION'))} with deviation` : undefined;
 
   const columns: Column<GrnRow>[] = [
     {
@@ -167,10 +175,15 @@ export default function GrnList() {
           <StatTile label="Total GRNs" value={count(totals.grnCount)} sub={`${count(totals.lineCount)} line item(s)`} />
           <StatTile label="Total Received Qty" value={qty(totals.totalQty)} />
           <StatTile label="Total Value" value={money(totals.totalAmount)} />
-          <StatTile label="Pending QC" value={count(totals.pendingQcCount)} tone={totals.pendingQcCount > 0 ? 'warning' : 'default'} />
-          <StatTile label="QC Passed" value={count(totals.qcPassedCount)} tone="success" />
+          {/* Each QC tile opens the list filtered by exactly the codes it counts. */}
+          <StatTile label="Pending QC" value={count(totals.pendingQcCount)} sub={pendingQcDetail}
+                    tone={totals.pendingQcCount > 0 ? 'warning' : 'default'}
+                    onClick={() => setFilters({ qcStatus: ['PENDING_QC', 'QC_IN_PROGRESS', 'ON_HOLD'] })} />
+          <StatTile label="QC Passed" value={count(totals.qcPassedCount)} sub={passedQcDetail} tone="success"
+                    onClick={() => setFilters({ qcStatus: ['QC_PASSED', 'ACCEPTED_WITH_DEVIATION'] })} />
           {totals.qcFailedCount > 0 && (
-            <StatTile label="QC Failed" value={count(totals.qcFailedCount)} tone="danger" />
+            <StatTile label="QC Failed" value={count(totals.qcFailedCount)} tone="danger"
+                      onClick={() => setFilters({ qcStatus: ['QC_FAILED'] })} />
           )}
         </div>
       )}
