@@ -286,11 +286,25 @@ router.post(
 
       const isPass = body.status === 'QC_PASSED' || body.status === 'ACCEPTED_WITH_DEVIATION';
       const isFail = body.status === 'QC_FAILED';
+      const isFinal = isPass || isFail;
 
       if (isFail && !body.rejectionReason) {
         throw ValidationError('Rejection reason is mandatory when failing inspection.', [
           { field: 'rejectionReason', message: 'Rejection reason is required.' },
         ]);
+      }
+
+      // A final decision accounts for the whole received quantity: what QC does
+      // not accept, it rejects. The GRN line keeps that split, and its CHECK
+      // (chk_grn_accepted_rejected, migration 007) wants the two to add up to
+      // the received quantity, so a short split used to fail as a bare
+      // "violate a data rule" error, and so did every interim decision.
+      if (isFinal && toQty(dec(body.acceptedQty).plus(dec(body.rejectedQty))) !== toQty(qi.received_qty)) {
+        throw ValidationError(
+          `A final QC decision must account for the whole received quantity: accepted (${body.acceptedQty}) ` +
+          `+ rejected (${body.rejectedQty}) must equal received (${receivedNum}).`,
+          [{ field: 'acceptedQty', message: 'Accepted + Rejected must equal the received quantity.' }],
+        );
       }
 
       // Update inspection record
@@ -314,12 +328,14 @@ router.post(
         ],
       );
 
-      // Also update accepted_qty and rejected_qty on grn_lines
+      // The GRN line carries the split of a final decision only; while QC is
+      // still testing or holding, its figures stay on the inspection and the
+      // line reads "not split yet".
       await tx.query(
         `UPDATE grn_lines
             SET accepted_qty = $2, rejected_qty = $3, updated_at = now()
           WHERE id = $1`,
-        [qi.grn_line_id, body.acceptedQty, body.rejectedQty],
+        [qi.grn_line_id, isFinal ? body.acceptedQty : null, isFinal ? body.rejectedQty : null],
       );
 
       // If passed / accepted with deviation and acceptedQty > 0, release into usable stock!

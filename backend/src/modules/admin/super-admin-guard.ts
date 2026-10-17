@@ -23,16 +23,22 @@ function rows<T>(tx: Queryable | undefined, sql: string, params: unknown[]): Pro
   return tx ? txQuery<T>(tx, sql, params) : query<T>(sql, params);
 }
 
+/** The accounts among `userIds` that hold the Super Admin role. */
+export async function superAdminsAmong(tx: Queryable | undefined, userIds: number[]): Promise<number[]> {
+  if (userIds.length === 0) return [];
+  const supers = await rows<{ user_id: number }>(
+    tx,
+    `SELECT DISTINCT ur.user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+      WHERE r.code = 'SUPER_ADMIN' AND ur.user_id = ANY($1::bigint[])`,
+    [userIds.map(Number)],
+  );
+  return supers.map((s) => Number(s.user_id));
+}
+
 /** Refuses unless the actor is a Super Admin, when any of `userIds` holds the Super Admin role. */
 export async function assertMayChangeUsers(tx: Queryable | undefined, req: Request, userIds: number[]): Promise<void> {
   if (req.user?.isSuperAdmin || userIds.length === 0) return;
-  const supers = await rows<{ user_id: number }>(
-    tx,
-    `SELECT ur.user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id
-      WHERE r.code = 'SUPER_ADMIN' AND ur.user_id = ANY($1::bigint[])
-      LIMIT 1`,
-    [userIds.map(Number)],
-  );
+  const supers = await superAdminsAmong(tx, userIds);
   if (supers.length > 0) {
     throw AuthorizationError(
       'Only a Super Admin can reset the password of, change, deactivate or delete a Super Admin account.',
