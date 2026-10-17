@@ -17,7 +17,7 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { Button, Tabs, StatusBadge, ConfirmDialog } from '../../components/ui';
 import { DocumentQuickViewModal } from '../../components/DocumentQuickViewModal';
-import { StatTile } from '../../components/KpiCard';
+import { StatTile, LineScopeNote } from '../../components/KpiCard';
 import { qty, formatDate, count, text, money } from '../../lib/format';
 
 interface IndentRow {
@@ -72,6 +72,8 @@ export default function IndentList() {
     indentTypeId: filters.indentTypeId, departmentId: filters.departmentId,
     costCentreId: filters.costCentreId, supplierId: filters.supplierId,
     itemId: filters.itemId, userId: filters.userId, hodId: filters.hodId,
+    // KPI card scopes: Total Indents (every one but cancelled), Approved Qty Awaiting PO.
+    excludeCancelled: filters.excludeCancelled, eligibleOnly: filters.eligibleOnly,
   });
 
   const list = useQuery({
@@ -85,6 +87,8 @@ export default function IndentList() {
         totalOrderedQty: number;
         totalPendingQty: number;
         totalEstimatedValue: number;
+        /** The item filter narrowed the tiles to that item's lines. */
+        lineScoped?: boolean;
       };
     }>(`/indents${query}`),
   });
@@ -209,7 +213,7 @@ export default function IndentList() {
       />
 
       {totals && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: totals.lineScoped ? 'var(--sp-2)' : 'var(--sp-4)' }}>
           <StatTile label="Total Indents" value={count(totals.indentCount)} sub={`${count(totals.lineCount)} line item(s)`} />
           <StatTile label="Total Indent Qty" value={qty(totals.totalIndentQty)} />
           <StatTile label="Ordered Qty" value={qty(totals.totalOrderedQty)} tone="success" />
@@ -217,6 +221,7 @@ export default function IndentList() {
           <StatTile label="Estimated Value" value={money(totals.totalEstimatedValue)} />
         </div>
       )}
+      {totals?.lineScoped && <LineScopeNote document="indent" />}
 
       <div style={{ marginBottom: 'var(--sp-4)' }}>
         <Tabs

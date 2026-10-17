@@ -53,7 +53,8 @@ const SORTABLE: Record<string, string> = {
   mainGroup: 'mg.name',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   isActive: z.enum(['true', 'false']).optional(),
   qcRequired: z.enum(['true', 'false']).optional(),
   itemTypeId: csvIdArray,
@@ -65,6 +66,33 @@ const listSchema = listQuerySchema.extend({
   hodId: csvIdArray,
 });
 
+/** The Item Master list's filter, shared with its export (the export searched fewer
+    columns and ignored every filter but department and cost centre). */
+export function buildItemFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+  const b = new SqlBuilder();
+  b.addRaw('i.deleted_at IS NULL');
+  if (q.isActive) b.addRaw(`i.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
+  if (q.qcRequired) b.addRaw(`i.qc_required = ${q.qcRequired === 'true' ? 'TRUE' : 'FALSE'}`);
+  b.addIn('i.item_type_id', q.itemTypeId);
+  b.addIn('i.department_id', q.departmentId);
+  b.addIn('i.cost_centre_id', q.costCentreId);
+  b.addIn('i.main_group_id', q.mainGroupId);
+  b.addIn('i.sub_main_group_id', q.subMainGroupId);
+  b.addIn('i.uom_id', q.uomId);
+  if (q.hodId && q.hodId.length > 0) {
+    const p = b.push(q.hodId);
+    b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+  }
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(
+      `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} ` +
+      `OR lower(i.hsn_code) LIKE ${p} OR lower(i.item_specification) LIKE ${p})`,
+    );
+  }
+  return b;
+}
+
 /* ── GET /items ─────────────────────────────────────────────────────────────── */
 
 router.get(
@@ -73,28 +101,7 @@ router.get(
   validateQuery(listSchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof listSchema>>(res);
-
-    const b = new SqlBuilder();
-    b.addRaw('i.deleted_at IS NULL');
-    if (q.isActive) b.addRaw(`i.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
-    if (q.qcRequired) b.addRaw(`i.qc_required = ${q.qcRequired === 'true' ? 'TRUE' : 'FALSE'}`);
-    b.addIn('i.item_type_id', q.itemTypeId);
-    b.addIn('i.department_id', q.departmentId);
-    b.addIn('i.cost_centre_id', q.costCentreId);
-    b.addIn('i.main_group_id', q.mainGroupId);
-    b.addIn('i.sub_main_group_id', q.subMainGroupId);
-    b.addIn('i.uom_id', q.uomId);
-    if (q.hodId && q.hodId.length > 0) {
-      const p = b.push(q.hodId);
-      b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-    }
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} ` +
-        `OR lower(i.hsn_code) LIKE ${p} OR lower(i.item_specification) LIKE ${p})`,
-      );
-    }
+    const b = buildItemFilter(q);
 
     // Counting needs no lookup joins: every filter above targets `items` itself,
     // and the joins only supply display labels for the page query.
@@ -173,6 +180,30 @@ const reconciliationSchema = listQuerySchema.extend({
   mismatchOnly: z.enum(['true', 'false']).default('false'),
 });
 
+/**
+ * The report's movement columns. Every stock_ledger txn_type (the CHECK of migration
+ * 028) lands in exactly one column, netted over BOTH quantity columns of its rows, so
+ * the columns always add up to the computed balance:
+ *   computed = grn_inward − grn_reversal − requisition_issue + requisition_reversal + every *_net.
+ * `outward` columns are shown as positive figures that reduce stock. The alignment column
+ * is keyed on its txn_type like the others, not on a reference type another entry could share.
+ */
+export const RECONCILIATION_COLUMNS = [
+  { key: 'grn_inward', outward: false, types: ['GRN_INWARD'] },
+  { key: 'grn_reversal', outward: true, types: ['GRN_REVERSAL'] },
+  { key: 'requisition_issue', outward: true, types: ['REQUISITION_ISSUE'] },
+  { key: 'requisition_reversal', outward: false, types: ['REQUISITION_REVERSAL'] },
+  { key: 'direct_issue_net', outward: false, types: ['DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL'] },
+  { key: 'adjustment_net', outward: false, types: ['STOCK_ADJUSTMENT', 'STOCK_ADJUSTMENT_REVERSAL'] },
+  { key: 'inventory_net', outward: false, types: ['INVENTORY_IN', 'INVENTORY_OUT', 'INVENTORY_ADJUST', 'INVENTORY_REVERSAL'] },
+  { key: 'sheet_sync_net', outward: false, types: ['SHEET_SYNC'] },
+  { key: 'alignment_net', outward: false, types: ['STOCK_ALIGNMENT'] },
+] as const;
+
+const RECONCILIATION_SUMS = RECONCILIATION_COLUMNS.map((c) =>
+  `SUM(${c.outward ? 'outward_qty - inward_qty' : 'inward_qty - outward_qty'}) ` +
+  `FILTER (WHERE txn_type IN (${c.types.map((t) => `'${t}'`).join(', ')})) AS ${c.key}`).join(',\n                  ');
+
 router.get(
   '/analysis/stock-reconciliation',
   requireAnyPermission('item.view', 'dashboard.analyze'),
@@ -199,29 +230,13 @@ router.get(
     const rows = await query<Record<string, string> & { is_active: boolean; mismatch: boolean }>(
       `SELECT i.id, i.item_code, i.item_description, u.code AS uom_code, i.live_stock_qty, i.is_active,
               abs(COALESCE(l.balance, 0) - i.live_stock_qty) > 0.0001 AS mismatch,
-              COALESCE(l.grn_inward, 0)              AS grn_inward,
-              COALESCE(l.grn_reversal, 0)             AS grn_reversal,
-              COALESCE(l.requisition_issue, 0)        AS requisition_issue,
-              COALESCE(l.requisition_reversal, 0)     AS requisition_reversal,
-              COALESCE(l.direct_issue_net, 0)         AS direct_issue_net,
-              COALESCE(l.adjustment_net, 0)           AS adjustment_net,
-              COALESCE(l.inventory_net, 0)            AS inventory_net,
-              COALESCE(l.sheet_sync_net, 0)           AS sheet_sync_net,
-              COALESCE(l.alignment_net, 0)            AS alignment_net,
+              ${RECONCILIATION_COLUMNS.map((c) => `COALESCE(l.${c.key}, 0) AS ${c.key}`).join(', ')},
               COALESCE(l.balance, 0)                  AS computed_balance
          FROM items i
          LEFT JOIN lookups u ON u.id = i.uom_id
          LEFT JOIN (
            SELECT item_id,
-                  SUM(inward_qty)  FILTER (WHERE txn_type = 'GRN_INWARD')          AS grn_inward,
-                  SUM(outward_qty) FILTER (WHERE txn_type = 'GRN_REVERSAL')        AS grn_reversal,
-                  SUM(outward_qty) FILTER (WHERE txn_type = 'REQUISITION_ISSUE')   AS requisition_issue,
-                  SUM(inward_qty)  FILTER (WHERE txn_type = 'REQUISITION_REVERSAL') AS requisition_reversal,
-                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL')) AS direct_issue_net,
-                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('STOCK_ADJUSTMENT', 'STOCK_ADJUSTMENT_REVERSAL')) AS adjustment_net,
-                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type IN ('INVENTORY_IN', 'INVENTORY_OUT', 'INVENTORY_ADJUST', 'INVENTORY_REVERSAL')) AS inventory_net,
-                  SUM(inward_qty - outward_qty) FILTER (WHERE txn_type = 'SHEET_SYNC') AS sheet_sync_net,
-                  SUM(inward_qty - outward_qty) FILTER (WHERE reference_type = 'OPENING_ALIGNMENT') AS alignment_net,
+                  ${RECONCILIATION_SUMS},
                   SUM(inward_qty - outward_qty) AS balance
              FROM stock_ledger
             GROUP BY item_id

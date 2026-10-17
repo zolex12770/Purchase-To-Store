@@ -1442,10 +1442,14 @@ describe('analytics reconciliation (SRS §38, ADR-009)', () => {
   });
 
   it('publishes a formula and drill-down for every KPI', async () => {
+    // A card drills into a list filtered to what it counts, or is not clickable when no list
+    // shows that (2026-10-16 audit, F09) — only these, each documented in domain/metrics.ts.
+    const notClickable = new Set(['supplier_count', 'item_count', 'purchase_cycle_days', 'requisition_issue_transaction_count']);
     const res = await request(app).get('/api/v1/analytics/kpis').set(auth(adminToken));
     for (const k of res.body.data.kpis) {
       expect(k.formula, `${k.key} has no formula`).toBeTruthy();
-      expect(k.drilldown, `${k.key} has no drill-down`).toBeTruthy();
+      if (notClickable.has(k.key)) expect(k.drilldown, `${k.key} opens a list that does not hold its figure`).toBe('');
+      else expect(k.drilldown, `${k.key} has no drill-down`).toBeTruthy();
       expect(k.source, `${k.key} has no source`).toBeTruthy();
     }
   });

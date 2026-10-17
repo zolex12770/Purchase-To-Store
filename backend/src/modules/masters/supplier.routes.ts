@@ -27,11 +27,30 @@ const SORTABLE: Record<string, string> = {
   updatedAt: 's.updated_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   isActive: z.enum(['true', 'false']).optional(),
   state: z.string().trim().max(100).optional(),
   city: z.string().trim().max(100).optional(),
 });
+
+/** The Supplier Master list's filter, shared with its export (which searched fewer columns). */
+export function buildSupplierFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+  const b = new SqlBuilder();
+  b.addRaw('s.deleted_at IS NULL');
+  if (q.isActive) b.addRaw(`s.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
+  b.add('lower(s.state) = lower(?)', q.state);
+  b.add('lower(s.city) = lower(?)', q.city);
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(
+      `(lower(s.supplier_name) LIKE ${p} OR lower(s.supplier_code) LIKE ${p} ` +
+      `OR lower(s.city) LIKE ${p} OR lower(s.state) LIKE ${p} ` +
+      `OR lower(s.gst_no) LIKE ${p} OR lower(s.email) LIKE ${p} OR s.mobile_no LIKE ${p})`,
+    );
+  }
+  return b;
+}
 
 /* ── GET /suppliers ─────────────────────────────────────────────────────────── */
 
@@ -41,20 +60,7 @@ router.get(
   validateQuery(listSchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof listSchema>>(res);
-
-    const b = new SqlBuilder();
-    b.addRaw('s.deleted_at IS NULL');
-    if (q.isActive) b.addRaw(`s.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
-    b.add('lower(s.state) = lower(?)', q.state);
-    b.add('lower(s.city) = lower(?)', q.city);
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(s.supplier_name) LIKE ${p} OR lower(s.supplier_code) LIKE ${p} ` +
-        `OR lower(s.city) LIKE ${p} OR lower(s.state) LIKE ${p} ` +
-        `OR lower(s.gst_no) LIKE ${p} OR lower(s.email) LIKE ${p} OR s.mobile_no LIKE ${p})`,
-      );
-    }
+    const b = buildSupplierFilter(q);
 
     const totalRow = await queryOne<{ n: string }>(
       `SELECT COUNT(*) AS n FROM suppliers s ${b.where()}`, b.params,

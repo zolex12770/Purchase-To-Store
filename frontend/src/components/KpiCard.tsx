@@ -338,3 +338,17 @@ export function FilterTiles({
     </div>
   );
 }
+
+/**
+ * Shown under a list's total tiles when an item-level filter (item, department, group…)
+ * narrowed them to the filtered items' lines — the lines the dashboard card that opened
+ * the list counts — while each row still shows its whole document (backend
+ * domain/item-scope.ts).
+ */
+export function LineScopeNote({ document }: { document: string }) {
+  return (
+    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)', marginBottom: 'var(--sp-4)' }}>
+      Quantities and values above add up only the lines of the filtered items; each row shows its whole {document}.
+    </div>
+  );
+}

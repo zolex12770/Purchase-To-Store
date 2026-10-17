@@ -32,6 +32,7 @@ import {
 } from '../../domain/quantities.js';
 import { toQty, toRate, toNumeric, dec, lineAmount } from '../../domain/money.js';
 import { loadCompanySettings } from '../../domain/company.js';
+import { itemLineScope } from '../../domain/item-scope.js';
 
 const router = Router();
 
@@ -47,7 +48,8 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'h.created_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   supplierId: csvIdArray,
   poTypeId: csvIdArray,
@@ -56,6 +58,8 @@ const listSchema = listQuerySchema.extend({
   departmentId: csvIdArray,
   costCentreId: csvIdArray,
   mainGroupId: csvIdArray,
+  subMainGroupId: csvIdArray,
+  itemTypeId: csvIdArray,
   hodId: csvIdArray,
   sourceMode: z.enum(['DIRECT', 'INDENT']).optional(),
   dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -63,11 +67,33 @@ const listSchema = listQuerySchema.extend({
   /** `pending` and `complete` back the dedicated SRS §11.4 sub-tabs. */
   view: z.enum(['all', 'pending', 'complete']).default('all'),
   overdue: z.enum(['true', 'false']).optional(),
+  /** The orders the PO KPIs count (Total PO Value, Purchase Orders, …): every one but cancelled. */
+  excludeCancelled: z.enum(['true', 'false']).optional(),
 });
 
-function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+/**
+ * A PO line still to be received: on an issued, open order (a DRAFT was never sent to
+ * the supplier), not closed, with quantity outstanding. The Pending view, the overdue
+ * filter and the pending KPIs (analytics) share this one rule, so a pending KPI opens
+ * exactly the orders it counts. `alias` is a v_po_line_balance row.
+ */
+export const pendingLineSql = (alias: string): string =>
+  `${alias}.is_receivable AND ${alias}.po_status IN ('OPEN', 'PARTIALLY_RECEIVED')`;
+
+/** The list's filters (paging and sort aside): what the PO KPIs and charts count by, too. */
+export type PoListFilter = Omit<z.infer<typeof listSchema>, 'page' | 'pageSize' | 'sortBy' | 'sortDir'>;
+
+/**
+ * The order lines the list's item-level filters select (item, department, cost centre,
+ * groups, type, HOD), as a condition on `line`; '' when none is set (domain/item-scope.ts).
+ * The list, its total tiles, its lines export and the PO KPIs and charts all use it.
+ */
+export const poLineScope = (q: PoListFilter, b: SqlBuilder, line: string): string => itemLineScope(q, b, line);
+
+export function buildPoFilter(q: PoListFilter): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
+  if (q.excludeCancelled === 'true') b.addRaw("h.status <> 'CANCELLED'");
   b.addIn('h.supplier_id', q.supplierId);
   b.addIn('h.po_type_id', q.poTypeId);
   b.addIn('h.created_by', q.userId);
@@ -75,38 +101,28 @@ function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   b.add('h.po_date >= ?', q.dateFrom);
   b.add('h.po_date <= ?', q.dateTo);
 
-  if (q.departmentId && q.departmentId.length > 0) {
-    const p = b.push(q.departmentId);
-    b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.department_id = ANY(${p}))`);
-  }
-  if (q.costCentreId && q.costCentreId.length > 0) {
-    const p = b.push(q.costCentreId);
-    b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.cost_centre_id = ANY(${p}))`);
-  }
-  if (q.mainGroupId && q.mainGroupId.length > 0) {
-    const p = b.push(q.mainGroupId);
-    b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.main_group_id = ANY(${p}))`);
-  }
-  if (q.hodId && q.hodId.length > 0) {
-    const p = b.push(q.hodId);
-    b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id JOIN lookups d ON d.id = i.department_id WHERE pol.po_id = h.id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-  }
+  // An order is listed when one of its lines satisfies every item-level filter, and the
+  // Pending view and "overdue only" ask that of the pending line itself: with a separate
+  // "any line" test per filter, an order whose only pending line belonged to another
+  // department was listed as pending for this one (2026-10-17 review).
+  const scope = poLineScope(q, b, 'pl');
+  const inScope = scope ? ` AND ${scope}` : '';
+  if (scope) b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pl WHERE pl.po_id = h.id${inScope})`);
 
   // "Pending" and "Complete" are defined by the authoritative balance, not by a
-  // status string a user could have set by hand (ADR-003).
-  if (q.view === 'pending') b.addRaw('b.total_pending_qty > 0 AND h.status IN (\'OPEN\',\'PARTIALLY_RECEIVED\')');
+  // status string a user could have set by hand (ADR-003). Pending is a line still to
+  // be received (pendingLineSql), the rule the pending KPIs count by.
+  if (q.view === 'pending') {
+    b.addRaw(`EXISTS (SELECT 1 FROM v_po_line_balance pl WHERE pl.po_id = h.id AND ${pendingLineSql('pl')}${inScope})`);
+  }
   if (q.view === 'complete') b.addRaw("h.status IN ('COMPLETED','SHORT_CLOSED')");
 
   if (q.overdue === 'true') {
     b.addRaw(
-      `EXISTS (SELECT 1 FROM v_po_line_balance l
-                WHERE l.po_id = h.id AND l.is_receivable
-                  AND l.delivery_date IS NOT NULL AND l.delivery_date < CURRENT_DATE)`,
+      `EXISTS (SELECT 1 FROM v_po_line_balance pl
+                WHERE pl.po_id = h.id AND ${pendingLineSql('pl')}
+                  AND pl.delivery_date IS NOT NULL AND pl.delivery_date < CURRENT_DATE${inScope})`,
     );
-  }
-  if (q.itemId && q.itemId.length > 0) {
-    const p = b.push(q.itemId);
-    b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines l WHERE l.po_id = h.id AND l.item_id = ANY(${p}))`);
   }
   if (q.search) {
     const p = b.push(`%${q.search.toLowerCase()}%`);
@@ -119,10 +135,57 @@ function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   return b;
 }
 
-const PO_FROM = `
+export const PO_FROM = `
   FROM purchase_order_headers h
   JOIN v_po_header_balance b ON b.po_id = h.id
   JOIN suppliers s ON s.id = h.supplier_id`;
+
+export interface PoListTotals {
+  poCount: number;
+  lineCount: number;
+  totalPoQty: string;
+  totalReceivedQty: string;
+  totalPendingQty: string;
+  value: string;
+  pending: string;
+  received: string;
+  cancelledValue: string;
+  /** True when an item-level filter narrowed the sums to its lines (rows still show whole orders). */
+  lineScoped: boolean;
+}
+
+/**
+ * The list's total tiles, which the PO KPI cards read too (analytics), so a card shows
+ * exactly the tile of the list it opens. They add up the lines poLineScope selects: every
+ * line of the listed orders, or under an item-level filter only that filter's lines.
+ *
+ * `value` deliberately EXCLUDES cancelled orders so it means exactly what the
+ * `po_value_total` metric means (ADR-009 — one definition per KPI). Cancelled
+ * value is reported separately so nothing is hidden from the user.
+ */
+export async function poListTotals(q: PoListFilter): Promise<PoListTotals> {
+  const b = buildPoFilter(q);
+  const scope = poLineScope(q, b, 'tl');
+  const row = await queryOne<Omit<PoListTotals, 'lineScoped'>>(
+    `SELECT COUNT(DISTINCT h.id)::int AS "poCount",
+            (COUNT(tl.po_line_id) FILTER (WHERE h.status <> 'CANCELLED'))::int AS "lineCount",
+            COALESCE(SUM(tl.po_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPoQty",
+            COALESCE(SUM(tl.received_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalReceivedQty",
+            COALESCE(SUM(tl.pending_grn_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPendingQty",
+            COALESCE(SUM(tl.amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS value,
+            COALESCE(SUM(tl.pending_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS pending,
+            COALESCE(SUM(tl.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
+            COALESCE(SUM(tl.amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"
+       ${PO_FROM}
+       LEFT JOIN v_po_line_balance tl ON tl.po_id = h.id${scope ? ` AND ${scope}` : ''}
+       ${b.where()}`,
+    b.params,
+  );
+  return {
+    poCount: 0, lineCount: 0, totalPoQty: '0', totalReceivedQty: '0', totalPendingQty: '0',
+    value: '0', pending: '0', received: '0', cancelledValue: '0', ...row, lineScoped: Boolean(scope),
+  };
+}
 
 router.get(
   '/',
@@ -175,36 +238,7 @@ router.get(
       `SELECT h.status, COUNT(*) AS n ${PO_FROM} ${cb.where()} GROUP BY h.status`,
       cb.params,
     );
-    // Totals use their OWN builder rather than reusing the paged query's params,
-    // whose trailing LIMIT/OFFSET placeholders do not belong to an aggregate.
-    //
-    // `value` deliberately EXCLUDES cancelled orders so it means exactly what the
-    // `po_value_total` metric means (ADR-009 — one definition per KPI). Cancelled
-    // value is reported separately so nothing is hidden from the user.
-    const tb = buildPoFilter(q);
-    const totals = await queryOne<{
-      poCount: string;
-      lineCount: string;
-      totalPoQty: string;
-      totalReceivedQty: string;
-      totalPendingQty: string;
-      value: string;
-      pending: string;
-      received: string;
-      cancelledValue: string;
-    }>(
-      `SELECT COUNT(DISTINCT h.id)::int AS "poCount",
-              COALESCE(SUM(b.line_count) FILTER (WHERE h.status <> 'CANCELLED'), 0)::int AS "lineCount",
-              COALESCE(SUM(b.total_po_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPoQty",
-              COALESCE(SUM(b.total_received_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalReceivedQty",
-              COALESCE(SUM(b.total_pending_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPendingQty",
-              COALESCE(SUM(b.total_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS value,
-              COALESCE(SUM(b.pending_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS pending,
-              COALESCE(SUM(b.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
-              COALESCE(SUM(b.total_amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"
-         ${PO_FROM} ${tb.where()}`,
-      tb.params,
-    );
+    const totals = await poListTotals(q);
 
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(counts.map((c) => [c.status, Number(c.n)])),

@@ -16,7 +16,7 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { Button, Tabs, StatusBadge, Badge, Card, CardBody } from '../../components/ui';
 import { DocumentQuickViewModal } from '../../components/DocumentQuickViewModal';
-import { StatTile } from '../../components/KpiCard';
+import { StatTile, LineScopeNote } from '../../components/KpiCard';
 import { money, qty, formatDate, count, text } from '../../lib/format';
 
 interface PoRow {
@@ -77,8 +77,10 @@ export default function PoList() {
     status: filters.status, dateFrom: filters.dateFrom, dateTo: filters.dateTo,
     supplierId: filters.supplierId, poTypeId: filters.poTypeId, itemId: filters.itemId,
     userId: filters.userId, departmentId: filters.departmentId, costCentreId: filters.costCentreId,
-    mainGroupId: filters.mainGroupId, hodId: filters.hodId,
-    view, overdue: filters.overdue,
+    mainGroupId: filters.mainGroupId, subMainGroupId: filters.subMainGroupId, itemTypeId: filters.itemTypeId,
+    hodId: filters.hodId, view, overdue: filters.overdue,
+    // A KPI card's scope (Purchase Orders, Total PO Value …): every order but cancelled.
+    excludeCancelled: filters.excludeCancelled,
   });
 
   const list = useQuery({
@@ -95,6 +97,8 @@ export default function PoList() {
         pending: string;
         received: string;
         cancelledValue: string;
+        /** An item-level filter narrowed the tiles to its lines. */
+        lineScoped?: boolean;
       };
     }>(`/purchase-orders${query}`),
   });
@@ -197,7 +201,7 @@ export default function PoList() {
       />
 
       {totals && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 'var(--sp-3)', marginBottom: totals.lineScoped ? 'var(--sp-2)' : 'var(--sp-4)' }}>
           <StatTile label="Purchase Orders" value={count(totals.poCount ?? list.data?.meta.total ?? 0)} />
           <StatTile label="Line Items" value={count(totals.lineCount ?? 0)} />
           <StatTile label="Ordered Qty" value={qty(totals.totalPoQty ?? 0)} />
@@ -211,6 +215,7 @@ export default function PoList() {
           )}
         </div>
       )}
+      {totals?.lineScoped && <LineScopeNote document="order" />}
 
       {view === 'all' && (
         <div style={{ marginBottom: 'var(--sp-4)' }}>
@@ -224,7 +229,7 @@ export default function PoList() {
 
       <FilterBar
         filters={filters} setFilters={setFilters} clearFilters={clearFilters} activeCount={activeCount}
-        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'poType', 'mainGroup', 'item']}
+        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'poType', 'mainGroup', 'itemType', 'item']}
         extra={
           view === 'pending' ? (
             <Button

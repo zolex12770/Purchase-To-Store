@@ -152,3 +152,23 @@ export function sameUnit(a?: string | null, b?: string | null): boolean {
   const ka = key(a);
   return ka !== '' && ka === key(b);
 }
+
+/**
+ * Whether a code's sheet listing in unit `listingUnit` counts towards the item's
+ * Purchase stock, given the units of every sheet listing of that code (this one included).
+ *
+ * With an Item Master unit, only listings in that unit count. Without one there is
+ * nothing to compare with, so the sheets decide: a single listing, or listings that
+ * all share one unit, mix nothing and count; listings in different (or unknown) units
+ * count none. sameUnit alone refused every item with no unit, so an item created
+ * without one (the item API, or an Item Master row whose Unit cell is blank) stopped
+ * following the only sheet that lists it (2026-10-17 review of the unit rule).
+ */
+export function countsTowardsStock(
+  itemUnit: string | null | undefined,
+  listingUnit: string | null | undefined,
+  allListingUnits: ReadonlyArray<string | null | undefined>,
+): boolean {
+  if (toShortUom(itemUnit) !== '') return sameUnit(itemUnit, listingUnit);
+  return allListingUnits.length <= 1 || allListingUnits.every((u) => sameUnit(allListingUnits[0], u));
+}

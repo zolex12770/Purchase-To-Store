@@ -46,6 +46,7 @@ import {
   OPEN_QC_STATUSES, PASSED_QC_STATUSES, isOpenQcStatus, qcStatusLabel, refreshGrnQcStatus, closeOpenInspections,
 } from '../../domain/qc.js';
 import { loadCompanySettings } from '../../domain/company.js';
+import { itemLineScope } from '../../domain/item-scope.js';
 
 const router = Router();
 
@@ -81,7 +82,8 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'g.created_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   qcStatus: csvArray,
   supplierId: csvIdArray,
@@ -90,6 +92,9 @@ const listSchema = listQuerySchema.extend({
   userId: csvIdArray,
   departmentId: csvIdArray,
   costCentreId: csvIdArray,
+  mainGroupId: csvIdArray,
+  subMainGroupId: csvIdArray,
+  itemTypeId: csvIdArray,
   hodId: csvIdArray,
   mode: z.enum(['PO', 'DIRECT']).optional(),
   grnTypeId: csvIdArray,
@@ -97,45 +102,44 @@ const listSchema = listQuerySchema.extend({
   dateTo: dateStr.optional(),
 });
 
+/** The list's filters (paging and sort aside): what the GRN KPIs count by, too. */
+export type GrnListFilter = Omit<z.infer<typeof listSchema>, 'page' | 'pageSize' | 'sortBy' | 'sortDir'>;
+
+/**
+ * The receipt lines the list's item-level filters select (item, department, cost centre,
+ * groups, type, HOD), as a condition on `line`; '' when none is set (domain/item-scope.ts).
+ * The list, its total tiles, its lines export and the GRN KPIs and charts all use it.
+ */
+export const grnLineScope = (q: GrnListFilter, b: SqlBuilder, line: string): string => itemLineScope(q, b, line);
+
 // A GRN's PO reference is now nullable and possibly plural (multi-PO), so the
 // list join is LEFT — an INNER join would silently drop every Direct GRN and
 // every multi-PO GRN whose header `po_id` was left NULL.
-const GRN_FROM = `
+export const GRN_FROM = `
   FROM grn_headers g
   LEFT JOIN purchase_order_headers p ON p.id = g.po_id
   JOIN suppliers s ON s.id = g.supplier_id
   LEFT JOIN lookups gt ON gt.id = g.grn_type_id`;
 
-function buildGrnFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+export function buildGrnFilter(q: GrnListFilter): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('g.status', q.status);
   b.addIn('g.qc_status', q.qcStatus);
   b.addIn('g.supplier_id', q.supplierId);
-  b.addIn('g.po_id', q.poId);
+  // poId is matched below through the header OR the lines: a plain header match here
+  // ANDed with it dropped every multi-PO GRN whose header po_id is NULL.
   b.addIn('g.received_by_user_id', q.userId);
   b.addIn('g.grn_type_id', q.grnTypeId);
   b.add('g.grn_date >= ?', q.dateFrom);
   b.add('g.grn_date <= ?', q.dateTo);
-  if (q.departmentId && q.departmentId.length > 0) {
-    const p = b.push(q.departmentId);
-    b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id WHERE l.grn_id = g.id AND i.department_id = ANY(${p}))`);
-  }
-  if (q.costCentreId && q.costCentreId.length > 0) {
-    const p = b.push(q.costCentreId);
-    b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id WHERE l.grn_id = g.id AND i.cost_centre_id = ANY(${p}))`);
-  }
-  if (q.hodId && q.hodId.length > 0) {
-    const p = b.push(q.hodId);
-    b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id JOIN lookups d ON d.id = i.department_id WHERE l.grn_id = g.id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-  }
+  // The item-level filters the dashboard and GRN Analysis pass name receipt lines: a
+  // receipt is listed when one of its lines satisfies them all (grnLineScope).
+  const scope = grnLineScope(q, b, 'l');
+  if (scope) b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l WHERE l.grn_id = g.id AND ${scope})`);
   if (q.mode === 'DIRECT') {
     b.addRaw('NOT EXISTS (SELECT 1 FROM grn_lines l WHERE l.grn_id = g.id AND l.po_line_id IS NOT NULL)');
   } else if (q.mode === 'PO') {
     b.addRaw('EXISTS (SELECT 1 FROM grn_lines l WHERE l.grn_id = g.id AND l.po_line_id IS NOT NULL)');
-  }
-  if (q.itemId && q.itemId.length > 0) {
-    const p = b.push(q.itemId);
-    b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l WHERE l.grn_id = g.id AND l.item_id = ANY(${p}))`);
   }
   if (q.poId && q.poId.length > 0) {
     // A multi-PO GRN's header po_id may be NULL even though one of its lines
@@ -161,6 +165,51 @@ function buildGrnFilter(q: z.infer<typeof listSchema>): SqlBuilder {
     );
   }
   return b;
+}
+
+export interface GrnListTotals {
+  grn_count: string;
+  line_count: string;
+  total_qty: string;
+  total_amount: string;
+  pending_qc_count: string;
+  qc_passed_count: string;
+  qc_failed_count: string;
+  /** True when an item-level filter narrowed the sums to its lines (rows still show whole receipts). */
+  lineScoped: boolean;
+}
+
+/**
+ * The list's total tiles, which the GRN KPI cards read too (analytics), so a card shows
+ * exactly the tile of the list it opens. Quantity and value add up the lines grnLineScope
+ * selects: every line of the listed receipts, or under an item-level filter only its lines.
+ */
+/** A constant code list as SQL literals (only ever fed the fixed QC code lists). */
+const sqlCodes = (codes: readonly string[]): string => codes.map((c) => `'${c.replace(/'/g, "''")}'`).join(', ');
+
+export async function grnListTotals(q: GrnListFilter): Promise<GrnListTotals> {
+  const b = buildGrnFilter(q);
+  const scope = grnLineScope(q, b, 'gl');
+  const row = await queryOne<Omit<GrnListTotals, 'lineScoped'>>(
+    `SELECT
+       COUNT(DISTINCT g.id) AS grn_count,
+       COUNT(gl.id) AS line_count,
+       COALESCE(SUM(gl.grn_qty), 0) AS total_qty,
+       COALESCE(SUM(gl.amount), 0) AS total_amount,
+       -- The real QC codes (migration 021's CHECK, domain/qc.ts): 'PENDING', 'PASSED' and
+       -- 'FAILED' are never stored, so tiles counting them read 0 on every screen (A7 F10).
+       COUNT(DISTINCT CASE WHEN g.qc_status IN (${sqlCodes(OPEN_QC_STATUSES)}) THEN g.id END) AS pending_qc_count,
+       COUNT(DISTINCT CASE WHEN g.qc_status IN (${sqlCodes(PASSED_QC_STATUSES)}) THEN g.id END) AS qc_passed_count,
+       COUNT(DISTINCT CASE WHEN g.qc_status = 'QC_FAILED' THEN g.id END) AS qc_failed_count
+     ${GRN_FROM}
+     LEFT JOIN grn_lines gl ON gl.grn_id = g.id${scope ? ` AND ${scope}` : ''}
+     ${b.where()}`,
+    b.params,
+  );
+  return {
+    grn_count: '0', line_count: '0', total_qty: '0', total_amount: '0',
+    pending_qc_count: '0', qc_passed_count: '0', qc_failed_count: '0', ...row, lineScoped: Boolean(scope),
+  };
 }
 
 router.get(
@@ -210,23 +259,7 @@ router.get(
       cb.params,
     );
 
-    const tb = buildGrnFilter(q);
-    const totalsRow = await queryOne<{
-      grn_count: string;
-      line_count: string;
-      total_qty: string;
-      total_amount: string;
-    }>(
-      `SELECT
-         COUNT(DISTINCT g.id) AS grn_count,
-         COALESCE(COUNT(gl.id), 0) AS line_count,
-         COALESCE(SUM(gl.grn_qty), 0) AS total_qty,
-         COALESCE(SUM(gl.amount), 0) AS total_amount
-       ${GRN_FROM}
-       LEFT JOIN grn_lines gl ON gl.grn_id = g.id
-       ${tb.where()}`,
-      tb.params,
-    );
+    const totalsRow = await grnListTotals(q);
 
     // The QC tiles count the codes the GRN really stores (migration 021's CHECK).
     // They counted 'PENDING', 'PASSED' and 'FAILED', which no row ever holds, so
@@ -243,14 +276,15 @@ router.get(
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(counts.map((c) => [c.status, Number(c.n)])),
       totals: {
-        grnCount: Number(totalsRow?.grn_count ?? total),
-        lineCount: Number(totalsRow?.line_count ?? 0),
-        totalQty: Number(totalsRow?.total_qty ?? 0),
-        totalAmount: Number(totalsRow?.total_amount ?? 0),
+        grnCount: Number(totalsRow.grn_count ?? total),
+        lineCount: Number(totalsRow.line_count),
+        totalQty: Number(totalsRow.total_qty),
+        totalAmount: Number(totalsRow.total_amount),
         pendingQcCount: countOf(OPEN_QC_STATUSES),
         qcPassedCount: countOf(PASSED_QC_STATUSES),
         qcFailedCount: countOf(['QC_FAILED']),
         qcStatusCounts,
+        lineScoped: totalsRow.lineScoped,
       },
     });
   }),

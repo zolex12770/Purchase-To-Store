@@ -99,6 +99,8 @@ export function LiveDataVerifyModal({
     queryFn: () => api.get<VerificationReport>('/google-sync/verify'),
     enabled: open,
     staleTime: 60_000,
+    // A server without Google credentials answers "not configured"; asking again cannot change that.
+    retry: false,
   });
 
   const reconcileMutation = useMutation({

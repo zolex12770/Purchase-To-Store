@@ -212,7 +212,7 @@ export default function Suppliers() {
             {can('supplier.export') && (
               <Button
                 variant="secondary" size="sm" icon={<Download size={13} />}
-                onClick={() => void downloadFile(`/io/export/suppliers?format=xlsx&search=${encodeURIComponent(filters.search ?? '')}`, 'suppliers.xlsx')}
+                onClick={() => void downloadFile(`/io/export/suppliers?format=xlsx${query.replace('?', '&')}`, 'suppliers.xlsx')}
               >
                 Export
               </Button>
@@ -253,7 +253,7 @@ export default function Suppliers() {
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(s) => setDetailId(s.id)}
         selectedKey={detailId}
-        onExport={can('supplier.export') ? (format) => void downloadFile(`/io/export/suppliers?format=${format}`, `suppliers.${format}`) : undefined}
+        onExport={can('supplier.export') ? (format) => void downloadFile(`/io/export/suppliers?format=${format}${query.replace('?', '&')}`, `suppliers.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle="No suppliers yet"
         emptyMessage="Add your first supplier, or import the Supplier Master from Excel."

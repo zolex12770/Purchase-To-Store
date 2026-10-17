@@ -2,8 +2,10 @@ import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 import fs from 'fs';
 import path from 'path';
+import { requireGoogleKeyFile } from './config/google.js';
 
-const keyFile = 'C:/secure/google-service-account.json';
+// The configured key only; a fixed path here reached the live sheets from any checkout (F02).
+const keyFile = requireGoogleKeyFile('Nothing was read.');
 const spreadsheetId = '1Dyj3Ws9gyR2zOe6p6RafQrKUFyLKIFN5h-3XDe9KD9I';
 
 async function auditSheet() {

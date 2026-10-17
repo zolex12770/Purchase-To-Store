@@ -82,6 +82,11 @@ const PILL_PRIORITY: FilterKey[] = [
   'mainGroup', 'itemType', 'costCentre', 'user', 'hod',
 ];
 
+const SCOPE_LABELS: Record<string, string> = {
+  excludeCancelled: 'Cancelled excluded',
+  eligibleOnly: 'Awaiting purchase order only',
+};
+
 export function FilterBar({
   filters, setFilters, clearFilters, activeCount,
   show = ['dateRange', 'supplier', 'department', 'costCentre'],
@@ -225,6 +230,10 @@ export function FilterBar({
     }
   };
 
+  // Scopes a KPI card drills in with (backend domain/metrics.ts), so the list says why it
+  // holds what the number counts, and the scope can be removed like any filter.
+  const scopes = Object.entries(SCOPE_LABELS).filter(([param]) => filters[param] === 'true');
+
   return (
     <div className="filter-bar" style={{ marginBottom: 'var(--space-3)' }} role="group" aria-label="Filters">
       {show.includes('dateRange') && (
@@ -250,6 +259,15 @@ export function FilterBar({
           </FilterPill>
         );
       })}
+
+      {scopes.map(([param, label]) => (
+        <span key={param} className="chip chip-neutral" style={{ flexShrink: 0 }}>
+          {label}
+          <button type="button" aria-label={`Remove filter: ${label}`} onClick={() => setFilters({ [param]: undefined })}>
+            <X size={12} />
+          </button>
+        </span>
+      ))}
 
       {more.length > 0 && (
         <AddFilterMenu

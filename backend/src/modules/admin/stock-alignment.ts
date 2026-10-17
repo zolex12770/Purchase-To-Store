@@ -12,8 +12,9 @@
  *   · an item is aligned only when its ledger balance plus its entries equals
  *     items.live_stock_qty to within 0.0001 (the stock-reconciliation report's own
  *     rule) — a difference is never plugged, the item is refused with its figures;
- *   · an item that already has an OPENING_ALIGNMENT row is refused, so running
- *     the same file again changes nothing;
+ *   · an item whose alignment is in place (OPENING_ALIGNMENT rows no undo points
+ *     at) is refused, so running the same file again changes nothing; after an undo
+ *     the item can be aligned again from corrected evidence;
  *   · items.live_stock_qty is never written;
  *   · the dry run returns a selectionHash over exactly what it would write, and
  *     applying requires it: the plan is rebuilt in one transaction with the items
@@ -108,12 +109,18 @@ export async function planAlignment(run: Run, entries: AlignmentEntry[], opts: {
        FROM items WHERE id = ANY($1::bigint[]) ORDER BY id${opts.lock ? ' FOR UPDATE' : ''}`,
     [ids],
   );
-  const ledger = await run<{ item_id: string; balance: string; aligned_rows: number; aligned_on: string | null; undone_on: string | null }>(
-    `SELECT item_id, SUM(inward_qty - outward_qty)::text AS balance,
-            COUNT(*) FILTER (WHERE reference_type = $2 AND reference_id IS NULL)::int AS aligned_rows,
-            MIN(txn_date) FILTER (WHERE reference_type = $2 AND reference_id IS NULL)::text AS aligned_on,
-            MAX(txn_date) FILTER (WHERE reference_type = $2 AND reference_id IS NOT NULL)::text AS undone_on
-       FROM stock_ledger WHERE item_id = ANY($1::bigint[]) GROUP BY item_id`,
+  // Only an alignment still in place blocks a new one: a row an undo row points at
+  // (reference_id) no longer counts, so a disputed opening can be undone, corrected and
+  // aligned again. Counting every original row left an undone item unalignable for good.
+  const ledger = await run<{ item_id: string; balance: string; aligned_rows: number; aligned_on: string | null }>(
+    `WITH undone AS (
+       SELECT DISTINCT reference_id AS id FROM stock_ledger
+        WHERE item_id = ANY($1::bigint[]) AND reference_type = $2 AND reference_id IS NOT NULL)
+     SELECT l.item_id, SUM(l.inward_qty - l.outward_qty)::text AS balance,
+            COUNT(*) FILTER (WHERE l.reference_type = $2 AND l.reference_id IS NULL AND u.id IS NULL)::int AS aligned_rows,
+            MIN(l.txn_date) FILTER (WHERE l.reference_type = $2 AND l.reference_id IS NULL AND u.id IS NULL)::text AS aligned_on
+       FROM stock_ledger l LEFT JOIN undone u ON u.id = l.id
+      WHERE l.item_id = ANY($1::bigint[]) GROUP BY l.item_id`,
     [ids, ALIGNMENT_REFERENCE_TYPE],
   );
   const itemById = new Map(items.map((i) => [Number(i.id), i]));
@@ -143,8 +150,8 @@ export async function planAlignment(run: Run, entries: AlignmentEntry[], opts: {
     if ((led?.aligned_rows ?? 0) > 0) {
       refused.push({
         itemId, itemCode: item.item_code, ...figures,
-        reason: `Already aligned on ${led!.aligned_on} (${led!.aligned_rows} ${ALIGNMENT_REFERENCE_TYPE} ledger row(s)` +
-          `${led!.undone_on ? `, undone on ${led!.undone_on}` : ''}); an item is aligned once only.`,
+        reason: `Already aligned on ${led!.aligned_on} (${led!.aligned_rows} ${ALIGNMENT_REFERENCE_TYPE} ledger row(s) in place); ` +
+          'undo that alignment before aligning the item again.',
       });
       continue;
     }
@@ -305,8 +312,9 @@ export interface UndoResult {
 /**
  * Takes alignments back by appending the opposite of each alignment row; the
  * original rows stay. Each undo row points at the row it reverses (reference_id),
- * so a row is never reversed twice. items.live_stock_qty is not touched, and the
- * item stays aligned-once: the alignment is not offered for it again.
+ * so a row is never reversed twice. items.live_stock_qty is not touched. The item
+ * can then be aligned again (planAlignment counts only rows no undo points at), e.g.
+ * after its disputed opening cell is corrected.
  * MUST run inside a transaction.
  */
 export async function undoAlignment(
