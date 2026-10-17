@@ -18,6 +18,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { query, queryOne, withTransaction } from '../../db/index.js';
 import { env, paths } from '../../config/env.js';
+import { requireGoogleKeyFile } from '../../config/google.js';
+import { IntegrationError } from '../../core/errors.js';
 import { logger } from '../../core/logger.js';
 import { type AuditActor, audit } from '../../core/audit.js';
 import { collectBackupData, type BackupPayload } from '../../db/restore.js';
@@ -67,10 +69,15 @@ export interface VerificationReport {
   };
 }
 
-function getGoogleSheetsClient() {
-  const keyFile = env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || 'C:/secure/google-service-account.json';
+/**
+ * Only the configured key: the fixed fallback path let a staging copy started without
+ * the variable read the live sheets (2026-10-16 audit, F02). Checked before anything
+ * else, so an unconfigured server neither reads Google nor writes a safety backup.
+ */
+function getGoogleSheetsClient(consequence: string) {
+  const keyFile = requireGoogleKeyFile(consequence);
   if (!fs.existsSync(keyFile)) {
-    throw new Error(`Google service account key file not found at ${keyFile}`);
+    throw IntegrationError(`The service-account key file named by GOOGLE_SERVICE_ACCOUNT_KEY_FILE does not exist on this server. ${consequence}`);
   }
   const auth = new google.auth.GoogleAuth({
     keyFile,
@@ -100,7 +107,7 @@ async function fetchTabValues(sheets: any, spreadsheetId: string, tab: string): 
 export async function verifyLiveParity(): Promise<VerificationReport> {
   const sourceId = env.GOOGLE_SHEET_ID;
   const refId = env.GOOGLE_DB_SPREADSHEET_ID || '1v-r7cdHsnWBPJhe7RgaNYgnl5T7kPhvAIIf58-q770g';
-  const sheets = getGoogleSheetsClient();
+  const sheets = getGoogleSheetsClient('The live sheets were not read, so nothing could be verified.');
 
   const discrepancies: DiscrepancyItem[] = [];
   const tabSummaries: Record<string, TabSummary> = {};
@@ -459,6 +466,8 @@ export async function reconcileMasterData(options: {
   message: string;
 }> {
   const { dryRun = true, actor } = options;
+  // Before the safety backup: without credentials nothing is read, written or backed up.
+  const sheets = getGoogleSheetsClient('The Item Master sheet was not read and nothing was changed.');
 
   let backupFilename: string | undefined;
 
@@ -496,7 +505,6 @@ export async function reconcileMasterData(options: {
 
   // 2. Fetch live items from Source Sheet
   const sourceId = env.GOOGLE_SHEET_ID;
-  const sheets = getGoogleSheetsClient();
   const itemRows = await fetchTabValues(sheets, sourceId, 'Item Master');
   const header = itemRows[0] || [];
   const codeIdx = header.findIndex((h: any) => String(h).trim().toLowerCase() === 'item code');

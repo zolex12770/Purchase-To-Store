@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
-import { env } from '../config/env.js';
+import { requireGoogleKeyFile } from '../config/google.js';
 
 interface SheetAuditSummary {
   category: string;
@@ -54,7 +54,7 @@ const SOURCES = [
 
 async function run() {
   const auth = new GoogleAuth({
-    keyFile: env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || 'C:\\secure\\google-service-account.json',
+    keyFile: requireGoogleKeyFile('Nothing was read.'),
     scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
   });
   const sheets = google.sheets({ version: 'v4', auth: auth as never });

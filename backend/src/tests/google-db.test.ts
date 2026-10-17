@@ -25,7 +25,9 @@ process.env.SEED_DEMO_DATA = 'false';
 process.env.LOG_LEVEL = 'silent';
 // Must be set BEFORE config/env.js is first imported.
 process.env.GOOGLE_SHEETS_DATABASE_SPREADSHEET_ID = 'TEST_REPLICA_SHEET';
-process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = 'C:/secure/google-service-account.json';
+// The replica only needs a key to be configured; the fake Sheets API below is injected,
+// so the suite names a file that does not exist, never the real key.
+process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = 'TEST-NOT-A-REAL-SERVICE-ACCOUNT-KEY.json';
 process.env.GOOGLE_SHEETS_SYNC_ENABLED = 'true';
 
 /* ── Fake Sheets API ────────────────────────────────────────────────────────── */

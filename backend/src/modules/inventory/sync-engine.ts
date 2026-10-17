@@ -30,7 +30,7 @@
  */
 import crypto from 'node:crypto';
 import { withTransaction, txQuery, query, type Queryable } from '../../db/index.js';
-import { env } from '../../config/env.js';
+import { requireGoogleKeyFile } from '../../config/google.js';
 import { logger } from '../../core/logger.js';
 import { INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
 import {
@@ -119,10 +119,14 @@ export interface SyncOptions {
 
 /* ── Google read ────────────────────────────────────────────────────────────── */
 
+/** What an inventory sync refused without Google credentials says happened. */
+const NOT_SYNCED = 'The inventory sheets were not read and nothing was changed.';
+
 async function getSheetsClient() {
+  // Only the configured key: a fixed fallback path let a staging copy read the live sheets (F02).
+  const keyFile = requireGoogleKeyFile(NOT_SYNCED);
   const { google } = await import('googleapis');
   const { GoogleAuth } = await import('google-auth-library');
-  const keyFile = env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || 'C:\\secure\\google-service-account.json';
   const auth = new GoogleAuth({ keyFile, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
   return google.sheets({ version: 'v4', auth: auth as never });
 }
@@ -1020,15 +1024,27 @@ async function exclusive<T>(scope: string, runId: string, fn: () => Promise<T>, 
   }
 }
 
+/**
+ * Without credentials a run is refused up front, so the caller hears "not configured"
+ * rather than five failed reads and a "try again" (a test's own reader needs none).
+ */
+function assertSheetsConfigured(opts: SyncOptions): void {
+  if (!opts.reader) requireGoogleKeyFile(NOT_SYNCED);
+}
+
 export async function syncCategoryFromSheet(category: InventoryCategory, opts: SyncOptions = {}): Promise<CategorySyncResult> {
   const runId = opts.runId ?? newRunId();
-  return exclusive(category, runId, () => runCategory(category, { ...opts, runId }), !!opts.dryRun);
+  return exclusive(category, runId, async () => {
+    assertSheetsConfigured(opts);
+    return runCategory(category, { ...opts, runId });
+  }, !!opts.dryRun);
 }
 
 /** All five categories, one after another, under one run id. */
 export async function syncAllInventoryCategories(opts: SyncOptions = {}): Promise<CategorySyncResult[]> {
   const runId = opts.runId ?? newRunId();
   return exclusive('all categories', runId, async () => {
+    assertSheetsConfigured(opts);
     const out: CategorySyncResult[] = [];
     for (const category of INVENTORY_CATEGORIES) out.push(await runCategory(category, { ...opts, runId }));
     return out;

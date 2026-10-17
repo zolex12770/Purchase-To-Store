@@ -20,7 +20,7 @@ import {
 import { api } from '../lib/api';
 import { useToast } from './Toast';
 import { useAuth } from '../lib/auth';
-import { Modal, Button, Badge } from './ui';
+import { Modal, Button, Badge, ErrorState } from './ui';
 
 export interface TabSummary {
   tabName: string;
@@ -83,11 +83,13 @@ export function LiveDataVerifyModal({
   const [search, setSearch] = useState('');
   const [confirmReconcile, setConfirmReconcile] = useState(false);
 
-  const { data, isFetching, refetch } = useQuery({
+  const { data, error, isFetching, refetch } = useQuery({
     queryKey: ['live-data-verify'],
     queryFn: () => api.get<VerificationReport>('/google-sync/verify'),
     enabled: open,
     staleTime: 60_000,
+    // A server without Google credentials answers "not configured"; asking again cannot change that.
+    retry: false,
   });
 
   const reconcileMutation = useMutation({
@@ -216,6 +218,9 @@ export function LiveDataVerifyModal({
             )}
           </div>
         </div>
+
+        {/* Why there is no report, e.g. a server with no Google credentials (staging). */}
+        {error && !isFetching && <ErrorState error={error} onRetry={() => void refetch()} />}
 
         {/* Confirmation banner if requested */}
         {confirmReconcile && (

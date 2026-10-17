@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
-import { env } from '../config/env.js';
+import { requireGoogleKeyFile } from '../config/google.js';
 
 const TABS_TO_INSPECT = [
   { cat: 'RM', sheetId: '1smKiS3li81F7aH2pQ0JGgDLp7302d48FJkvWefRf8R4', tab: 'GRN Inward' },
@@ -18,7 +18,7 @@ const TABS_TO_INSPECT = [
 
 async function inspectTxnTabs() {
   const auth = new GoogleAuth({
-    keyFile: env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || 'C:\\secure\\google-service-account.json',
+    keyFile: requireGoogleKeyFile('Nothing was read.'),
     scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
   });
   const sheets = google.sheets({ version: 'v4', auth: auth as never });
