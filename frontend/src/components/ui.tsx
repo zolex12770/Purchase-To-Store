@@ -373,7 +373,8 @@ export function panelTabStep(
   return backward ? before - 1 : count - after;
 }
 
-const follows = (a: Node, b: Node) => Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+/** `a` comes before `b` in the document. */
+const precedes = (a: Node, b: Node) => Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
 
 /** The trigger, or the last stop inside it when it is a container (the search box). */
 const triggerStop = (anchor: HTMLElement): HTMLElement =>
@@ -387,7 +388,7 @@ const triggerStop = (anchor: HTMLElement): HTMLElement =>
 function stopAfter(anchor: HTMLElement, panel: HTMLElement): HTMLElement {
   const dialog = [...traps].reverse().find((t) => t.contains(anchor));
   const stops = tabbablesIn(dialog ?? document.body).filter((el) => !panel.contains(el));
-  return stops.find((el) => !anchor.contains(el) && follows(anchor, el)) ?? (dialog ? stops[0] : undefined) ?? anchor;
+  return stops.find((el) => !anchor.contains(el) && precedes(anchor, el)) ?? (dialog ? stops[0] : undefined) ?? anchor;
 }
 
 /**
@@ -525,13 +526,13 @@ export function Popover({
     // React bubbles events out of a nested portal too; only this panel's own.
     if (!panel || !anchor || !panel.contains(focus)) return;
     const menu = focus.closest<HTMLElement>('[role="menu"]');
-    const inMenu = Boolean(menu && panel.contains(menu));
-    const unit = inMenu ? menu! : focus;
+    const unit = menu && panel.contains(menu) ? menu : focus;
+    const inMenu = unit !== focus;
     const stops = tabbablesIn(panel);
     const step = panelTabStep({
       count: stops.length,
-      before: stops.filter((s) => !unit.contains(s) && follows(s, unit)).length,
-      after: stops.filter((s) => s !== unit && !(inMenu && unit.contains(s)) && follows(unit, s)).length,
+      before: stops.filter((s) => !unit.contains(s) && precedes(s, unit)).length,
+      after: stops.filter((s) => s !== unit && !(inMenu && unit.contains(s)) && precedes(unit, s)).length,
       inMenu,
     }, e.shiftKey);
     if (step === 'native') return;

@@ -17,10 +17,10 @@ describe('icon button tooltip', () => {
   });
 
   it('keeps the wrapper when a tooltip has nothing to say', () => {
-    const child = () => createElement('button', { type: 'button' }, 'x');
-    const empty = renderToStaticMarkup(createElement(Tooltip, { content: '' }, child()));
-    const full = renderToStaticMarkup(createElement(Tooltip, { content: 'Why' }, child()));
-    const off = renderToStaticMarkup(createElement(Tooltip, { content: 'Why', disabled: true }, child()));
+    const children = createElement('button', { type: 'button' }, 'x');
+    const empty = renderToStaticMarkup(createElement(Tooltip, { content: '', children }));
+    const full = renderToStaticMarkup(createElement(Tooltip, { content: 'Why', children }));
+    const off = renderToStaticMarkup(createElement(Tooltip, { content: 'Why', disabled: true, children }));
     expect(empty).toBe(full);
     expect(off).toBe(full);
   });
