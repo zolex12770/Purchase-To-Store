@@ -7,7 +7,9 @@
  * 2,718, poId 1 vs 2,718; the requisition Mine / HOD / Store-queue views 22, 20 and 591
  * requisitions vs all 1,256 in the file; audit entity=grn 44 vs 1,430. Every case is
  * pinned here as list total == export rows, and the same rows. The Item, User and
- * Supplier lists, whose exports took one filter or none, are pinned too.
+ * Supplier lists, whose exports took one filter or none, are pinned too. A lines export
+ * holds the lines the list's tiles add up: under an item-level filter (item, department,
+ * …) only that filter's lines of each listed document (2026-10-17 review).
  *
  * Real PGlite database, migrated and seeded from scratch.
  */
@@ -301,11 +303,14 @@ describe('Indents', () => {
     expect((await expectParity('indents', 'indents', { search: 'XPAR-CABLE' }, keys)).total).toBe(2);
   });
 
-  it('the lines export holds every line of exactly those indents', async () => {
+  it("the lines export holds the item's lines of exactly those indents, as many as the Line Items tile", async () => {
     const l = await list('indents', { itemId: ids.cable });
     const file = await exportFile('indent-lines', { itemId: ids.cable });
     expect([...new Set(file.rows.map((r) => r['Indent No']))].sort()).toEqual(l.data.map((r) => String(r.indent_no)).sort());
+    // The indent for both items lists whole, but its bolt line is not the cable's.
+    expect(new Set(file.rows.map((r) => r['Item Code']))).toEqual(new Set(['XPAR-CABLE']));
     expect(file.rows).toHaveLength(Number(l.meta.totals?.lineCount));
+    expect(file.rows).toHaveLength(2);
   });
 });
 
@@ -404,5 +409,61 @@ describe('Exports are complete or refused', () => {
     const { EXPORT_ROW_CAP, refuseTruncatedExport } = await import('../core/http.js');
     expect(() => refuseTruncatedExport(EXPORT_ROW_CAP)).not.toThrow();
     expect(() => refuseTruncatedExport(EXPORT_ROW_CAP + 1)).toThrow(/would exceed 2,00,000 rows/);
+  });
+});
+
+// Last, so the documents it adds change no figure pinned above.
+describe('Item-level filters: the lines export holds the lines the tiles add up (2026-10-17 review)', () => {
+  const filters = () => ({ departmentId: ids.dept });
+
+  beforeAll(async () => {
+    // An order and a direct receipt mixing the department's cable with the bolt, which has none.
+    const po = await request(app).post('/api/v1/purchase-orders').set(auth(adminToken)).send({
+      supplierId: ids.supplierTwo, poTypeId: ids.poType, issue: true,
+      lines: [
+        { itemId: ids.cable, poQty: '2', rate: '100', discountPct: '0', sources: [] },
+        { itemId: ids.bolt, poQty: '7', rate: '50', discountPct: '0', sources: [] },
+      ],
+    });
+    expect(po.status).toBe(201);
+    ids.poMixed = po.body.data.id;
+    const grn = await request(app).post('/api/v1/grn').set(auth(adminToken)).send({
+      mode: 'DIRECT', supplierId: ids.supplierTwo, post: true,
+      lines: [{ itemId: ids.cable, grnQty: '1', rate: '100' }, { itemId: ids.bolt, grnQty: '4', rate: '50' }],
+    });
+    expect(grn.status).toBe(201);
+    ids.grnMixed = grn.body.data.id;
+  });
+
+  it("purchase orders: each order whole, and only the department's lines in the lines export", async () => {
+    const { file: orders } = await expectParity('purchase-orders', 'purchase-orders', filters(), { list: 'po_no', file: 'PO No' });
+    const l = await list('purchase-orders', filters());
+    expect(l.data.map((r) => Number(r.id))).toContain(ids.poMixed);
+    expect(l.meta.totals?.lineScoped).toBe(true);
+    const lines = await exportFile('po-lines', filters());
+    expect([...new Set(lines.rows.map((r) => r['PO No']))].sort()).toEqual(orders.rows.map((r) => r['PO No']).sort());
+    expect(new Set(lines.rows.map((r) => r['Item Code']))).toEqual(new Set(['XPAR-CABLE']));
+    expect(lines.rows).toHaveLength(Number(l.meta.totals?.lineCount));
+    // The tile adds up the same lines: the mixed order's cable line is 2 of its 9.
+    expect(Number(l.meta.totals?.totalPoQty)).toBe(lines.rows.reduce((s, r) => s + Number(r['PO Qty']), 0));
+  });
+
+  it("goods receipts: each receipt whole, and only the department's lines in the lines export", async () => {
+    const { file: receipts } = await expectParity('grn', 'grn', filters(), { list: 'grn_no', file: 'GRN No' });
+    const l = await list('grn', filters());
+    expect(l.data.map((r) => Number(r.id))).toContain(ids.grnMixed);
+    const lines = await exportFile('grn-lines', filters());
+    expect([...new Set(lines.rows.map((r) => r['GRN No']))].sort()).toEqual(receipts.rows.map((r) => r['GRN No']).sort());
+    expect(new Set(lines.rows.map((r) => r['Item Code']))).toEqual(new Set(['XPAR-CABLE']));
+    expect(lines.rows).toHaveLength(Number(l.meta.totals?.lineCount));
+    expect(Number(l.meta.totals?.totalQty)).toBe(lines.rows.reduce((s, r) => s + Number(r['GRN Qty']), 0));
+  });
+
+  it('without an item-level filter the lines export holds every line of the listed documents', async () => {
+    const l = await list('purchase-orders', { supplierId: ids.supplierTwo });
+    expect(l.meta.totals?.lineScoped).toBe(false);
+    const lines = await exportFile('po-lines', { supplierId: ids.supplierTwo });
+    expect(new Set(lines.rows.map((r) => r['Item Code']))).toEqual(new Set(['XPAR-CABLE', 'XPAR-BOLT']));
+    expect(lines.rows).toHaveLength(Number(l.meta.totals?.lineCount));
   });
 });
