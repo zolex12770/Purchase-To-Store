@@ -40,6 +40,20 @@ export async function withTransaction<T>(fn: (tx: Queryable) => Promise<T>): Pro
   return db.transaction(fn);
 }
 
+/**
+ * Runs `fn` in a read-only transaction whose statements all read one snapshot, for
+ * figures that must add up to one another (the receipt evidence summary's parts and
+ * their whole). On a PostgreSQL server a plain BEGIN is READ COMMITTED, where each
+ * statement takes a fresh snapshot and a GRN posted between two of them shows in one
+ * and not the other; PGlite runs one transaction at a time, so there it changes nothing.
+ */
+export async function withSnapshot<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+  return withTransaction(async (tx) => {
+    await tx.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+    return fn(tx);
+  });
+}
+
 /** Query helper bound to a specific handle (pool or transaction). */
 export async function txQuery<T = Record<string, unknown>>(
   tx: Queryable,

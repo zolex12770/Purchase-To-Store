@@ -22,6 +22,10 @@
 -- row names it whose GRN line still has no PO line and whose GRN is POSTED
 -- (purchase-order/receipt-evidence.ts).
 --
+-- A PO deleted from the ERP leaves its rows in place with po_id cleared: the row
+-- keeps the PO number the tab names, so the receipt then counts as one naming a
+-- PO the ERP does not hold, instead of silently dropping out of every count.
+--
 -- The reasons are store-grn-links.ts HOLD_REASONS, plus UNDONE.
 -- ============================================================================
 
@@ -34,7 +38,7 @@ CREATE TABLE IF NOT EXISTS store_grn_link_holds (
   grn_no       TEXT           NOT NULL,
   item_code    TEXT           NOT NULL,
   grn_qty      NUMERIC(18, 4) NOT NULL,
-  po_id        BIGINT         REFERENCES purchase_order_headers (id) ON DELETE CASCADE,
+  po_id        BIGINT         REFERENCES purchase_order_headers (id) ON DELETE SET NULL,
   po_line_id   BIGINT         REFERENCES purchase_order_lines (id) ON DELETE SET NULL,
   po_no        TEXT,
   reason       TEXT           NOT NULL,
@@ -48,3 +52,6 @@ CREATE TABLE IF NOT EXISTS store_grn_link_holds (
 
 CREATE INDEX IF NOT EXISTS idx_store_grn_link_holds_po ON store_grn_link_holds (po_id);
 CREATE INDEX IF NOT EXISTS idx_store_grn_link_holds_grn_line ON store_grn_link_holds (grn_line_id);
+-- The other two foreign keys act on delete: a GRN or a PO line deleted must not scan the table.
+CREATE INDEX IF NOT EXISTS idx_store_grn_link_holds_grn ON store_grn_link_holds (grn_id);
+CREATE INDEX IF NOT EXISTS idx_store_grn_link_holds_po_line ON store_grn_link_holds (po_line_id);

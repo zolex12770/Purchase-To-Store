@@ -123,7 +123,10 @@ export interface RestoreResult {
 /**
  * Replaces the contents of every backup table with the payload.
  * MUST be called inside a transaction: either the database ends up exactly as the
- * backup described, or it is left completely untouched.
+ * backup described, or it is left completely untouched. Once that transaction has
+ * committed, the caller analyses the database (statistics.ts analyseDatabase): the
+ * restored rows have no planner statistics, and without them the receipt evidence
+ * summary took 76.7 s on a copy restored from the 2026-10-17 backup.
  */
 export async function restoreFromPayload(
   tx: Queryable,

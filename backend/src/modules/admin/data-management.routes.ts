@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 import express, { Router, type Request } from 'express';
 import { z } from 'zod';
-import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
+import { query, queryOne, withTransaction, withSnapshot, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { asyncHandler, sendOk, validateBody, validateQuery, listQuerySchema, offsetOf } from '../../core/http.js';
 import { BusinessRuleError, ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { requirePermission, requireSuperAdmin, invalidateAuthState } from '../../auth/middleware.js';
@@ -31,9 +31,9 @@ import {
 } from './stock-alignment.js';
 import {
   STORE_GRN_TAB, planStoreGrnLinks, applyStoreGrnLinks, undoStoreGrnLinks, describeLinkPlan,
-  summariseLinkPlan, runIn, type SheetReader,
+  summariseLinkPlan, previouslyUndoneLines, runIn, type SheetReader,
 } from './store-grn-links.js';
-import { REASON_TEXT } from '../purchase-order/receipt-evidence.js';
+import { REASON_TEXT, standingHoldsNaming } from '../purchase-order/receipt-evidence.js';
 import { readSheet } from '../google-sync/engine.js';
 
 const router = Router();
@@ -777,6 +777,12 @@ async function inspectDependencies(entity: string, id: number): Promise<{
     if (Number(grnRefs?.n ?? 0) > 0) {
       blockingReasons.push(`Purchase Order is referenced by ${grnRefs?.n} GRN(s). Cannot hard-delete.`);
     }
+    // Store receipts the GRN link repair held back that name this PO (their GRN header
+    // names no PO, so the count above misses them). Not blocking: a deleted PO's rows keep
+    // its number and count as receipts naming a PO the ERP does not hold (migration 030).
+    dependencies.push({
+      table: 'store_grn_link_holds', label: 'Store receipts awaiting link that name it', count: await standingHoldsNaming(id),
+    });
   } else if (entity === 'grn') {
     // stock_ledger has no grn_id column — the old query failed with HTTP 500 for
     // every GRN (staging, GRN 12379). A GRN's entries carry reference_type 'GRN'
@@ -1640,12 +1646,20 @@ router.post(
     // and the embedded database serves one transaction at a time.
     const grid = await grnTabReaderOf(req)(STORE_GRN_TAB);
     if (dryRun) {
-      // One read-only transaction, so every figure comes from the same moment.
-      const plan = await withTransaction((tx) => planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds, sameSupplierPairs }));
+      // One read-only snapshot, so every figure comes from the same moment.
+      const { plan, previouslyUndone } = await withSnapshot(async (tx) => {
+        const p = await planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds, sameSupplierPairs });
+        return { plan: p, previouslyUndone: await previouslyUndoneLines(runIn(tx), p) };
+      });
       // reasonText: each reason in the words the PO screen uses, for the held list a
-      // purchase user works through (the screen's CSV download).
+      // purchase user works through (the screen's CSV download). previouslyUndone: the
+      // lines a Super Admin took back that this plan would link again, or keeps out.
+      const relinked = previouslyUndone.filter((u) => u.wouldLink).length;
       sendOk(res, {
-        dryRun: true, ...describeLinkPlan(plan), reasonText: REASON_TEXT, message: `${summariseLinkPlan(plan)} Nothing was changed.`,
+        dryRun: true, ...describeLinkPlan(plan), reasonText: REASON_TEXT, previouslyUndone,
+        message: `${summariseLinkPlan(plan)}${relinked > 0
+          ? ` ${relinked} of these line(s) were linked before and taken back by a Super Admin; keep them out (excludeGrnLineIds) unless they are to be linked again.`
+          : ''} Nothing was changed.`,
       });
       return;
     }

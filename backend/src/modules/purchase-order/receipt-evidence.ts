@@ -23,10 +23,15 @@
  *   none_recorded  otherwise: genuinely pending.
  * This module only reads. It never links or creates anything, and a PO keeps its
  * pending quantity and value until a receipt is posted or linked.
+ *
+ * Every set is built once per statement (an ARRAY, an InitPlan, or a MATERIALIZED CTE)
+ * and each PO is looked up in it. A correlated count per PO let a database without
+ * planner statistics hash every GRN line again for each of 2,003 POs: 32.4 s for one
+ * PO export on a copy restored from the 2026-10-17 backup (db/statistics.ts).
  */
 import { query, txQuery, type Queryable } from '../../db/index.js';
-import { toQty } from '../../domain/money.js';
-import { PO_AFTER_RECEIPT_DAYS, type HoldReason } from '../admin/store-grn-links.js';
+import { dec, toQty } from '../../domain/money.js';
+import { PO_AFTER_RECEIPT_DAYS, STORE_GRN_TAB, type HoldReason } from '../admin/store-grn-links.js';
 
 /** What the PO list filter `receiptEvidence` selects among the POs, in order of precedence. */
 export const RECEIPT_EVIDENCE = ['awaiting_link', 'sheet_only', 'none_recorded'] as const;
@@ -53,50 +58,107 @@ export const AWAITING_LINK_FROM = `store_grn_link_holds k
   JOIN grn_lines gl ON gl.id = k.grn_line_id AND gl.po_line_id IS NULL
   JOIN grn_headers gh ON gh.id = gl.grn_id AND gh.status = 'POSTED'`;
 
-/** SQL: the latest finished sync of the business sheet (google_sync_jobs; NULL before the first). */
-const LATEST_SYNC_JOB_ID = `(SELECT max(j.id) FROM google_sync_jobs j WHERE j.status IN ('SUCCESS', 'PARTIAL'))`;
-
 /**
- * THE definition of a receipt on the store sheet only, written once (alias e): a GRN
- * tab line the ERP does not hold, still open as of the latest finished sync. The
- * engine records such a line once, under the run that first reports it, keeps it open
- * while every later run still reports it, and closes it once a complete run of the tab
- * no longer does: the GRN was posted in the ERP, or the row changed (onlyNewIssues,
- * resolveVanishedIssues). So the open rows are what the latest run reports. Taking
- * only the rows the latest run inserted would find nothing: on the 2026-10-17 backup
- * all 148 open lines were recorded by run 2774, and the latest, 2780, still reported
- * them without recording them again. Rows of a run still in progress wait for it to
- * finish.
+ * SQL: the latest finished sync of the business sheet that read the GRN tab through.
+ * Its outcome for the tab (google_sync_jobs.detail) carries issuesResolved, which the
+ * engine sets only once resolveVanishedIssues has checked the tab's open issues against
+ * every row of it (runSyncLocked). A run that did not get that far (a heading renamed,
+ * MISSING_COLUMN; the read failing, SHEET_FAILED; the tab switched off in the mappings;
+ * a run of other tabs only) left those issues unchecked, so it is not what they are as
+ * of, even though such a run still ends PARTIAL. On the 2026-10-17 backup every run from
+ * 2774 to 2780 read the tab through (6,953 rows).
  */
-export const SHEET_ONLY_WHERE = `e.sheet_name = 'GRN' AND e.error_code = 'MISSING_IN_ERP' AND e.resolved_at IS NULL
-  AND e.job_id <= ${LATEST_SYNC_JOB_ID}`;
-
-/** The PO a sheet line names, compared as the link repair compares PO numbers: trimmed, ignoring case. */
-const sheetLineNames = (poNo: string) => `upper(trim(e.incoming_value->>'poNo')) = upper(trim(${poNo}))`;
-
-/** SQL: how many standing hold rows name the PO whose id is the SQL expression `poId`. */
-export const awaitingLinkCount = (poId: string): string =>
-  `(SELECT COUNT(*)::int FROM ${AWAITING_LINK_FROM} WHERE k.po_id = ${poId})`;
-
-/** SQL: how many receipts on the store sheet only name the PO numbered by the SQL expression `poNo`. */
-export const storeSheetReceiptCount = (poNo: string): string =>
-  `(SELECT COUNT(*)::int FROM google_sync_errors e WHERE ${SHEET_ONLY_WHERE} AND ${sheetLineNames(poNo)})`;
+export const LATEST_GRN_READ_JOB_ID = `(SELECT max(j.id) FROM google_sync_jobs j
+  WHERE j.status IN ('SUCCESS', 'PARTIAL')
+    AND jsonb_path_exists(j.detail, '$[*] ? (@.sheet == "${STORE_GRN_TAB}" && @.issuesResolved.type() == "number")'))`;
 
 /**
- * SQL condition: the PO header aliased `po` falls in the evidence class `evidence`.
- * Each set of POs is read once per query, as an array (an InitPlan), and every PO is
- * looked up in it: on the analysed 2026-10-17 copy the receipt evidence summary took
- * 0.12 s so, against 0.2 s with a correlated subquery per PO (migrate.ts analyses the
- * tables for 030). Neither array holds a NULL, so NOT ... = ANY is plainly true or false.
+ * THE definition of the receipts on the store sheet only, written once: one row per
+ * GRN tab line the ERP lacks, still open as of the latest complete read of the tab.
+ * The engine records such a line once, under the run that first reports it, keeps it
+ * open while every later read still reports it, and closes it once a read no longer
+ * does (onlyNewIssues, resolveVanishedIssues). So the open rows recorded up to that read
+ * are what it reported; rows of a run still in progress wait for it to finish.
+ *
+ * posted_since: an ERP receipt for the same PO and item, posted after the sync first
+ * reported the line, covers its quantity. Posting the receipt in the ERP does not close
+ * the line: the sync looks for an ERP GRN under the sheet's own GRN number (engine.ts),
+ * and a GRN posted in the ERP takes the ERP's number (GRN-YYYYMMDD-NNNN). On the
+ * 2026-10-17 review copy Z/SM/00043's sheet line ZG/SM/0084 (365.8) was posted as
+ * GRN-20261017-0001 and the next sync still reported it, so the PO kept asking for the
+ * receipt to be posted, inviting a second posting. Such a line no longer counts and
+ * the PO screen lists it as posted under another number. The quantity posted since is
+ * matched to the PO's lines for the item in sheet row order, so a smaller delivery
+ * posted meanwhile clears no line it does not cover.
+ *
+ * Columns: issue_id, po_key (the PO number named, upper case, trimmed; never NULL),
+ * grn_no, item_code, grn_qty, sheet_row, reported_at, posted_since, posted_grn_nos.
+ */
+export const SHEET_LINES = `
+  WITH sheet_open AS (
+    SELECT e.id AS issue_id, e.row_number AS sheet_row, e.created_at AS reported_at,
+           NULLIF(upper(trim(e.incoming_value->>'poNo')), '') AS po_key,
+           NULLIF(trim(e.incoming_value->>'grnNo'), '') AS grn_no,
+           trim(COALESCE(e.incoming_value->>'itemCode', '')) AS item_code,
+           CASE WHEN (e.incoming_value->>'grnQty') ~ '^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$'
+                THEN (e.incoming_value->>'grnQty')::numeric ELSE 0 END AS grn_qty
+      FROM google_sync_errors e
+     WHERE e.sheet_name = '${STORE_GRN_TAB}' AND e.error_code = 'MISSING_IN_ERP' AND e.resolved_at IS NULL
+       AND e.job_id <= ${LATEST_GRN_READ_JOB_ID}
+  ), sheet_posted AS (
+    SELECT g.po_key, g.item_key, SUM(pgl.grn_qty) AS qty, string_agg(DISTINCT pgh.grn_no, ', ' ORDER BY pgh.grn_no) AS grn_nos
+      FROM (SELECT po_key, upper(item_code) AS item_key, min(reported_at) AS first_reported
+              FROM sheet_open WHERE po_key IS NOT NULL GROUP BY po_key, upper(item_code)) g
+      JOIN purchase_order_headers pph ON upper(trim(pph.po_no)) = g.po_key
+      JOIN purchase_order_lines ppl ON ppl.po_id = pph.id
+      JOIN grn_lines pgl ON pgl.po_line_id = ppl.id
+      JOIN grn_headers pgh ON pgh.id = pgl.grn_id AND pgh.status = 'POSTED'
+     WHERE g.item_key IN (upper(pgl.item_code), upper(ppl.item_code), upper(ppl.item_description))
+       AND COALESCE(pgh.posted_at, pgh.created_at) > g.first_reported
+     GROUP BY g.po_key, g.item_key
+  )
+  SELECT o.issue_id, o.po_key, o.grn_no, o.item_code, o.grn_qty, o.sheet_row, o.reported_at,
+         COALESCE(SUM(o.grn_qty) OVER (PARTITION BY o.po_key, upper(o.item_code) ORDER BY o.sheet_row NULLS LAST, o.issue_id
+                                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) <= p.qty, FALSE) AS posted_since,
+         p.grn_nos AS posted_grn_nos
+    FROM sheet_open o
+    LEFT JOIN sheet_posted p ON p.po_key = o.po_key AND p.item_key = upper(o.item_code)
+   WHERE o.po_key IS NOT NULL`;
+
+/** SQL: the ERP POs a standing hold row names. */
+const AWAITING_PO_IDS = `SELECT DISTINCT k.po_id FROM ${AWAITING_LINK_FROM} WHERE k.po_id IS NOT NULL`;
+/** SQL: the PO numbers (upper case, trimmed) the receipts still on the store sheet only name. */
+const SHEET_ONLY_PO_KEYS = `SELECT DISTINCT s.po_key FROM (${SHEET_LINES}) s WHERE NOT s.posted_since`;
+
+/**
+ * SQL condition: the PO header aliased `po` (any row with its id and po_no) falls in the
+ * evidence class `evidence`. Each set of POs is read once per query, as an array (an
+ * InitPlan), and every PO is looked up in it. Neither array holds a NULL, so
+ * NOT ... = ANY is plainly true or false.
  */
 export function receiptEvidenceCondition(evidence: ReceiptEvidence, po: string): string {
-  const awaiting = `${po}.id = ANY (ARRAY(SELECT DISTINCT k.po_id FROM ${AWAITING_LINK_FROM} WHERE k.po_id IS NOT NULL))`;
-  const onSheet = `upper(trim(${po}.po_no)) = ANY (ARRAY(SELECT DISTINCT upper(trim(e.incoming_value->>'poNo')) FROM google_sync_errors e
-      WHERE ${SHEET_ONLY_WHERE} AND e.incoming_value->>'poNo' IS NOT NULL))`;
+  const awaiting = `${po}.id = ANY (ARRAY(${AWAITING_PO_IDS}))`;
+  const onSheet = `upper(trim(${po}.po_no)) = ANY (ARRAY(${SHEET_ONLY_PO_KEYS}))`;
   if (evidence === 'awaiting_link') return awaiting;
   if (evidence === 'sheet_only') return `(NOT ${awaiting} AND ${onSheet})`;
   return `(NOT ${awaiting} AND NOT ${onSheet})`;
 }
+
+/**
+ * The per-PO counts a PO list row and its export carry (store_receipts_awaiting_link,
+ * store_sheet_receipts): a WITH clause, the joins that use it on the PO header aliased
+ * `po`, and the two columns. Each set is counted once (MATERIALIZED) and joined.
+ */
+export const EVIDENCE_COUNTS_WITH = `ev_awaiting AS MATERIALIZED (
+    SELECT k.po_id, COUNT(*)::int AS n FROM ${AWAITING_LINK_FROM} WHERE k.po_id IS NOT NULL GROUP BY k.po_id
+  ), ev_sheet AS MATERIALIZED (
+    SELECT s.po_key, COUNT(*)::int AS n FROM (${SHEET_LINES}) s WHERE NOT s.posted_since GROUP BY s.po_key
+  )`;
+export const evidenceCountJoins = (po: string): string =>
+  `LEFT JOIN ev_awaiting ON ev_awaiting.po_id = ${po}.id
+   LEFT JOIN ev_sheet ON ev_sheet.po_key = upper(trim(${po}.po_no))`;
+export const EVIDENCE_COUNT_COLUMNS =
+  'COALESCE(ev_awaiting.n, 0) AS store_receipts_awaiting_link, COALESCE(ev_sheet.n, 0) AS store_sheet_receipts';
 
 /** Each reason in plain words for a purchase user; the row's `detail` carries the figures. */
 export const REASON_TEXT: Record<HoldRowReason, string> = {
@@ -119,6 +181,8 @@ export const HOLD_ROW_REASONS = Object.keys(REASON_TEXT) as HoldRowReason[];
 const isoOf = (v: Date | string): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
 
 export interface StoreReceiptAwaitingLink {
+  /** The hold row (store_grn_link_holds.id): unique, unlike a GRN and item, which may repeat on one GRN. */
+  holdId: number;
   grnId: number;
   grnNo: string;
   grnDate: string;
@@ -135,11 +199,11 @@ export interface StoreReceiptAwaitingLink {
 /** The store receipts awaiting link that name one PO (GET /purchase-orders/:id). */
 export async function storeReceiptsAwaitingLink(poId: number): Promise<StoreReceiptAwaitingLink[]> {
   const rows = await query<{
-    grn_id: number; grn_no: string; grn_date: string; item_code: string; grn_qty: string;
+    id: number; grn_id: number; grn_no: string; grn_date: string; item_code: string; grn_qty: string;
     po_line_no: number | null; reason: HoldRowReason; detail: string; recorded_at: Date | string;
   }>(
     // The date as text whatever the DateStyle, as the link run reads it.
-    `SELECT gh.id AS grn_id, gh.grn_no, to_char(gh.grn_date, 'YYYY-MM-DD') AS grn_date, k.item_code,
+    `SELECT k.id, gh.id AS grn_id, gh.grn_no, to_char(gh.grn_date, 'YYYY-MM-DD') AS grn_date, k.item_code,
             k.grn_qty::text AS grn_qty, pol.line_no AS po_line_no, k.reason, k.detail, k.recorded_at
        FROM ${AWAITING_LINK_FROM}
        LEFT JOIN purchase_order_lines pol ON pol.id = k.po_line_id
@@ -148,13 +212,15 @@ export async function storeReceiptsAwaitingLink(poId: number): Promise<StoreRece
     [poId],
   );
   return rows.map((r) => ({
-    grnId: Number(r.grn_id), grnNo: r.grn_no, grnDate: r.grn_date, itemCode: r.item_code, grnQty: toQty(r.grn_qty),
-    poLineNo: r.po_line_no == null ? null : Number(r.po_line_no),
+    holdId: Number(r.id), grnId: Number(r.grn_id), grnNo: r.grn_no, grnDate: r.grn_date, itemCode: r.item_code,
+    grnQty: toQty(r.grn_qty), poLineNo: r.po_line_no == null ? null : Number(r.po_line_no),
     reason: r.reason, reasonText: REASON_TEXT[r.reason] ?? r.reason, detail: r.detail, recordedAt: isoOf(r.recorded_at),
   }));
 }
 
 export interface StoreSheetReceipt {
+  /** The sync issue (google_sync_errors.id) that records the line: unique per line. */
+  issueId: number;
   /** Null for a tab row without a GRN number, which the sync compares by PO and item. */
   grnNo: string | null;
   itemCode: string;
@@ -163,56 +229,86 @@ export interface StoreSheetReceipt {
   sheetRow: number | null;
   /** When the sync first reported the line. */
   reportedAt: string;
-}
-
-/** The receipts on the store sheet only that name one PO, by its number (GET /purchase-orders/:id). */
-export async function storeSheetReceipts(poNo: string): Promise<StoreSheetReceipt[]> {
-  const rows = await query<{ grn_no: string | null; item_code: string | null; grn_qty: string | null; row_number: number | null; created_at: Date | string }>(
-    `SELECT e.incoming_value->>'grnNo' AS grn_no, e.incoming_value->>'itemCode' AS item_code,
-            e.incoming_value->>'grnQty' AS grn_qty, e.row_number, e.created_at
-       FROM google_sync_errors e
-      WHERE ${SHEET_ONLY_WHERE} AND ${sheetLineNames('$1')}
-      ORDER BY e.row_number NULLS LAST, e.id`,
-    [poNo],
-  );
-  return rows.map((r) => ({
-    grnNo: r.grn_no?.trim() || null, itemCode: (r.item_code ?? '').trim(), grnQty: toQty(r.grn_qty),
-    sheetRow: r.row_number == null ? null : Number(r.row_number), reportedAt: isoOf(r.created_at),
-  }));
+  /** What the ERP has received so far on this PO's lines for the item. */
+  erpReceivedOnPoLine: string;
+  /** That already covers the line's quantity: posting it again would likely receive it twice. */
+  erpReceiptCoversIt: boolean;
+  /** Posted in the ERP since the sync first reported the line, under these GRN numbers. */
+  postedAs: string | null;
 }
 
 /**
- * The receipt lines awaiting link on the POs the subquery `poIds` selects (its
- * parameters in `params`), in all and by reason. A line naming two of those POs
- * counts once.
+ * The GRN tab lines naming one PO that the ERP lacks under their own GRN number
+ * (GET /purchase-orders/:id): those still on the sheet only, and those an ERP receipt
+ * posted since covers (posted under another number; their sync issue stays open until
+ * it is resolved or the sheet's GRN number is corrected).
+ */
+export async function storeSheetReceipts(poId: number, poNo: string): Promise<{ onSheetOnly: StoreSheetReceipt[]; postedInErp: StoreSheetReceipt[] }> {
+  const rows = await query<{
+    issue_id: number; grn_no: string | null; item_code: string; grn_qty: string; sheet_row: number | null;
+    reported_at: Date | string; posted_since: boolean; posted_grn_nos: string | null; received_qty: string;
+  }>(
+    `WITH bal AS MATERIALIZED (
+       SELECT upper(b.item_code) AS code, upper(b.item_description) AS text, b.received_qty FROM v_po_line_balance b WHERE b.po_id = $1
+     )
+     SELECT s.issue_id, s.grn_no, s.item_code, s.grn_qty::text AS grn_qty, s.sheet_row, s.reported_at, s.posted_since, s.posted_grn_nos,
+            (SELECT COALESCE(SUM(b.received_qty), 0) FROM bal b WHERE upper(s.item_code) IN (b.code, b.text))::text AS received_qty
+       FROM (${SHEET_LINES}) s
+      WHERE s.po_key = upper(trim($2))
+      ORDER BY s.sheet_row NULLS LAST, s.issue_id`,
+    [poId, poNo],
+  );
+  const lines = rows.map((r): StoreSheetReceipt & { postedSince: boolean } => ({
+    issueId: Number(r.issue_id), grnNo: r.grn_no?.trim() || null, itemCode: r.item_code, grnQty: toQty(r.grn_qty),
+    sheetRow: r.sheet_row == null ? null : Number(r.sheet_row), reportedAt: isoOf(r.reported_at),
+    erpReceivedOnPoLine: toQty(r.received_qty),
+    erpReceiptCoversIt: dec(r.received_qty).greaterThan(0) && dec(r.received_qty).greaterThanOrEqualTo(dec(r.grn_qty)),
+    postedAs: r.posted_since ? r.posted_grn_nos : null,
+    postedSince: Boolean(r.posted_since),
+  }));
+  const strip = ({ postedSince: _s, ...line }: StoreSheetReceipt & { postedSince: boolean }): StoreSheetReceipt => line;
+  return {
+    onSheetOnly: lines.filter((l) => !l.postedSince).map(strip),
+    postedInErp: lines.filter((l) => l.postedSince).map(strip),
+  };
+}
+
+/**
+ * The receipt lines awaiting link on the POs of the pending list `listed` (SQL selecting
+ * h.id and h.po_no, its parameters in `params`) that fall in 'awaiting link', in all and
+ * by reason. A line naming two of those POs counts once. The list is read once
+ * (MATERIALIZED), so its pending test is never run again for each hold row.
  */
 export async function awaitingLinkLines(
-  db: Queryable, poIds: string, params: unknown[],
+  db: Queryable, listed: string, params: unknown[],
 ): Promise<{ receiptLines: number; byReason: Record<HoldRowReason, number> }> {
-  const rows = await txQuery<{ reason: HoldRowReason; lines: number }>(
+  const rows = await txQuery<{ reason: HoldRowReason | null; lines: number }>(
     db,
-    `SELECT k.reason, COUNT(DISTINCT k.grn_line_id)::int AS lines
+    `WITH listed AS MATERIALIZED (${listed})
+     SELECT k.reason, COUNT(DISTINCT k.grn_line_id)::int AS lines
        FROM ${AWAITING_LINK_FROM}
-      WHERE k.po_id IN (${poIds})
-      GROUP BY k.reason`,
-    params,
-  );
-  const [all] = await txQuery<{ lines: number }>(
-    db,
-    `SELECT COUNT(DISTINCT k.grn_line_id)::int AS lines FROM ${AWAITING_LINK_FROM} WHERE k.po_id IN (${poIds})`,
+      WHERE k.po_id IN (SELECT l.id FROM listed l WHERE ${receiptEvidenceCondition('awaiting_link', 'l')})
+      GROUP BY GROUPING SETS ((k.reason), ())`,
     params,
   );
   const byReason = Object.fromEntries(HOLD_ROW_REASONS.map((r) => [r, 0])) as Record<HoldRowReason, number>;
-  for (const r of rows) byReason[r.reason] = Number(r.lines);
-  return { receiptLines: Number(all?.lines ?? 0), byReason };
+  let receiptLines = 0;
+  for (const r of rows) {
+    // The grand total comes back with no reason (reason is NOT NULL in the table).
+    if (r.reason === null) receiptLines = Number(r.lines);
+    else byReason[r.reason] = Number(r.lines);
+  }
+  return { receiptLines, byReason };
 }
 
-/** The receipt lines on the store sheet only that name a PO the subquery `poNos` selects (its parameters in `params`). */
-export async function storeSheetLines(db: Queryable, poNos: string, params: unknown[]): Promise<number> {
+/** The receipt lines still on the store sheet only that name a PO of the pending list `listed` falling in 'sheet only'. */
+export async function storeSheetLines(db: Queryable, listed: string, params: unknown[]): Promise<number> {
   const [r] = await txQuery<{ lines: number }>(
     db,
-    `SELECT COUNT(*)::int AS lines FROM google_sync_errors e
-      WHERE ${SHEET_ONLY_WHERE} AND upper(trim(e.incoming_value->>'poNo')) IN (SELECT upper(trim(x.po_no)) FROM (${poNos}) x)`,
+    `WITH listed AS MATERIALIZED (${listed})
+     SELECT COUNT(*)::int AS lines FROM (${SHEET_LINES}) s
+      WHERE NOT s.posted_since
+        AND s.po_key IN (SELECT upper(trim(l.po_no)) FROM listed l WHERE ${receiptEvidenceCondition('sheet_only', 'l')})`,
     params,
   );
   return Number(r?.lines ?? 0);
@@ -220,7 +316,8 @@ export async function storeSheetLines(db: Queryable, poNos: string, params: unkn
 
 /**
  * Receipt lines awaiting link whose GRN tab row names a PO number the ERP does not
- * hold, and how many such numbers: POs the PO register has not brought in.
+ * hold, and how many such numbers: POs the PO register has not brought in, or deleted
+ * since (migration 030 then keeps the number and clears the PO).
  */
 export async function receiptsNamingPosNotInErp(db: Queryable): Promise<{ receiptLines: number; poNos: number }> {
   const [r] = await txQuery<{ lines: number; po_nos: number }>(
@@ -240,10 +337,30 @@ export async function latestHoldRecord(db: Queryable): Promise<{ asOf: string | 
   return { asOf: r ? isoOf(r.recorded_at) : null, runId: r?.run_id ?? null };
 }
 
-/** The sync run the store-sheet evidence is as of: the latest finished one. */
-export async function latestSheetSync(db: Queryable): Promise<{ jobId: number | null; asOf: string | null }> {
-  const [r] = await txQuery<{ id: number; finished_at: Date | string | null }>(
-    db, `SELECT id, finished_at FROM google_sync_jobs WHERE id = ${LATEST_SYNC_JOB_ID}`,
+/**
+ * The sync run the store-sheet evidence is as of (the latest that read the GRN tab
+ * through), and how many runs have finished since without reading it: while that is
+ * above 0, receipts posted or corrected since may still be listed.
+ */
+export async function latestSheetRead(db: Queryable): Promise<{ jobId: number | null; asOf: string | null; laterRuns: number }> {
+  const [r] = await txQuery<{ id: number | null; finished_at: Date | string | null; later_runs: number }>(
+    db,
+    `SELECT g.id, j.finished_at,
+            (SELECT COUNT(*)::int FROM google_sync_jobs x WHERE x.status <> 'RUNNING' AND x.id > COALESCE(g.id, 0)) AS later_runs
+       FROM (SELECT ${LATEST_GRN_READ_JOB_ID} AS id) g
+       LEFT JOIN google_sync_jobs j ON j.id = g.id`,
   );
-  return { jobId: r ? Number(r.id) : null, asOf: r?.finished_at ? isoOf(r.finished_at) : null };
+  return {
+    jobId: r?.id == null ? null : Number(r.id),
+    asOf: r?.finished_at ? isoOf(r.finished_at) : null,
+    laterRuns: Number(r?.later_runs ?? 0),
+  };
+}
+
+/** How many store receipts awaiting link name the PO (the Data Management inspector). */
+export async function standingHoldsNaming(poId: number): Promise<number> {
+  const [r] = await query<{ n: number }>(
+    `SELECT COUNT(DISTINCT k.grn_line_id)::int AS n FROM ${AWAITING_LINK_FROM} WHERE k.po_id = $1`, [poId],
+  );
+  return Number(r?.n ?? 0);
 }

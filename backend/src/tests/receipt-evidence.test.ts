@@ -408,17 +408,23 @@ describe('Store receipts awaiting link — the PO list, its export and the PO sc
     expect(res.status).toBe(200);
     expect(res.body.data.storeReceiptsAwaitingLink).toEqual([
       {
+        holdId: expect.any(Number),
         grnId: grns['ZG/RE/0006']!.id, grnNo: 'ZG/RE/0006', grnDate: '2026-10-01', itemCode: 'RE-F', grnQty: '1.0000', poLineNo: 1,
         reason: 'GRN_PARTLY_HELD', reasonText: 'Another line of the same GRN is held, and a GRN is linked whole.',
         detail: expect.stringMatching(/^ZG\/RE\/0006 is linked whole or not at all, and 1 of its line\(s\) are held: RE-H \(ITEM_NOT_ON_PO\)/),
         recordedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
       },
       {
+        holdId: expect.any(Number),
         grnId: grns['ZG/RE/0006']!.id, grnNo: 'ZG/RE/0006', grnDate: '2026-10-01', itemCode: 'RE-H', grnQty: '1.0000', poLineNo: null,
         reason: 'ITEM_NOT_ON_PO', reasonText: 'The PO named on the GRN tab has no line for this item.',
         detail: 'Z/RE/00006 has no line for RE-H (its 2 line(s): RE-F, RE-G).', recordedAt: expect.any(String),
       },
     ]);
+    // Each row carries its hold row's id: a GRN may hold the same item twice with the same
+    // reason and detail (ZG/PM/0008 on the 2026-10-17 copy), so nothing else keys it.
+    const ids = res.body.data.storeReceiptsAwaitingLink.map((r: { holdId: number }) => r.holdId);
+    expect(new Set(ids).size).toBe(ids.length);
     const over = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00005']!.id}`)).set(auth(adminToken));
     expect(over.body.data.storeReceiptsAwaitingLink).toMatchObject([{
       reason: 'OVER_RECEIPT', poLineNo: 1,
@@ -437,7 +443,7 @@ describe('Store receipts awaiting link — the summary', () => {
     expect(s.pending.pos).toBe(11);
     expect(s.awaitingLink).toMatchObject({ pos: 8, receiptLines: 8 });
     // No sync of the business sheet has run, so nothing is on the store sheet only.
-    expect(s.sheetOnly).toEqual({ pos: 0, value: '0', receiptLines: 0, asOf: null, jobId: null });
+    expect(s.sheetOnly).toEqual({ pos: 0, value: '0', receiptLines: 0, asOf: null, jobId: null, laterRuns: 0 });
     expect(s.noneRecorded.pos).toBe(3);
     expect([cents(s.pending.value), cents(s.awaitingLink.value), cents(s.noneRecorded.value)]).toEqual([730000, 570000, 160000]);
     expect(s.awaitingLink.pos + s.sheetOnly.pos + s.noneRecorded.pos).toBe(s.pending.pos);
@@ -501,6 +507,25 @@ describe('Store receipts awaiting link — undo, a later apply, and receipts tha
     expect(cents(s.awaitingLink.value) + cents(s.noneRecorded.value)).toBe(cents(s.pending.value));
   });
 
+  it('lists a line a Super Admin took back that the next run would link again, and the run that keeps it out', async () => {
+    // The tab still names Z/RE/00010, so the link rules link it again; the Data Management
+    // panel keeps such lines out unless the Super Admin chooses to link them again.
+    const line = grns['ZG/RE/0011']!.lines[0]!;
+    const d = await dryRun();
+    expect(d.totals.linkable).toBe(1);
+    expect(d.previouslyUndone).toEqual([{
+      grnLineId: line, grnId: grns['ZG/RE/0011']!.id, grnNo: 'ZG/RE/0011', itemCode: 'RE-N', grnQty: '4.0000', poNo: 'Z/RE/00010',
+      wouldLink: true, undoAuditId: expect.any(Number), undoneAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      undoReason: 'Purchase says ZG/RE/0011 was against another PO',
+    }]);
+    expect(d.message).toMatch(/1 of these line\(s\) were linked before and taken back by a Super Admin; keep them out/);
+    const kept = await dryRun({ excludeGrnLineIds: [line] });
+    expect(kept.totals.linkable).toBe(0);
+    expect(kept.previouslyUndone).toMatchObject([{ grnLineId: line, wouldLink: false, poNo: 'Z/RE/00010' }]);
+    expect(kept.message).not.toMatch(/taken back/);
+    expect(await holdCount()).toBe(15);
+  });
+
   it('a later apply replaces the record as usual', async () => {
     const d = await dryRun();
     expect(d.totals.linkable).toBe(1);
@@ -508,6 +533,8 @@ describe('Store receipts awaiting link — undo, a later apply, and receipts tha
     const rows = await holds();
     expect(rows.some((r) => r.reason === 'UNDONE')).toBe(false);
     expect(rows).toHaveLength(14);
+    // Linked again by choice: the latest entry for the line is a link, not an undo.
+    expect((await dryRun()).previouslyUndone).toEqual([]);
   });
 
   it('a receipt linked since, or whose GRN is cancelled since, no longer counts', async () => {
@@ -603,7 +630,9 @@ describe('Receipts on the store sheet only — GRN tab lines the sync keeps open
     expect(s.pending.pos).toBe(11);
     expect(s.awaitingLink).toMatchObject({ pos: 7, receiptLines: 7 });
     const [run] = await query<{ finished_at: Date }>('SELECT finished_at FROM google_sync_jobs WHERE id = $1', [jobs[1]]);
-    expect(s.sheetOnly).toEqual({ pos: 2, value: '1100.00', receiptLines: 3, asOf: new Date(run!.finished_at).toISOString(), jobId: jobs[1] });
+    expect(s.sheetOnly).toEqual({
+      pos: 2, value: '1100.00', receiptLines: 3, asOf: new Date(run!.finished_at).toISOString(), jobId: jobs[1], laterRuns: 0,
+    });
     expect(s.noneRecorded.pos).toBe(2);
     expect([cents(s.pending.value), cents(s.awaitingLink.value), cents(s.sheetOnly.value), cents(s.noneRecorded.value)])
       .toEqual([730000, 520000, 110000, 100000]);
@@ -635,10 +664,14 @@ describe('Receipts on the store sheet only — GRN tab lines the sync keeps open
     const doc = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00008']!.id}`)).set(auth(adminToken));
     expect(doc.status).toBe(200);
     expect(doc.body.data.storeReceiptsAwaitingLink).toEqual([]);
+    const onSheet = { erpReceivedOnPoLine: '0.0000', erpReceiptCoversIt: false, postedAs: null, reportedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) };
     expect(doc.body.data.storeSheetReceipts).toEqual([
-      { grnNo: 'ZG/RE/0102', itemCode: 'RE-L', grnQty: '2.0000', sheetRow: 3, reportedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) },
-      { grnNo: null, itemCode: 'RE-L', grnQty: '1.0000', sheetRow: 4, reportedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) },
+      { issueId: expect.any(Number), grnNo: 'ZG/RE/0102', itemCode: 'RE-L', grnQty: '2.0000', sheetRow: 3, ...onSheet },
+      { issueId: expect.any(Number), grnNo: null, itemCode: 'RE-L', grnQty: '1.0000', sheetRow: 4, ...onSheet },
     ]);
+    expect(doc.body.data.storeSheetReceiptsPostedInErp).toEqual([]);
+    // Keyed by the sync issue that records each line.
+    expect(new Set(doc.body.data.storeSheetReceipts.map((r: { issueId: number }) => r.issueId)).size).toBe(2);
     const both = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00003']!.id}`)).set(auth(adminToken));
     expect(both.body.data.storeReceiptsAwaitingLink).toMatchObject([{ grnNo: 'ZG/RE/0003', reason: 'SEVERAL_POS' }]);
     expect(both.body.data.storeSheetReceipts).toMatchObject([{ grnNo: 'ZG/RE/0103', itemCode: 'RE-C', grnQty: '1.0000', sheetRow: 5 }]);
@@ -646,23 +679,154 @@ describe('Receipts on the store sheet only — GRN tab lines the sync keeps open
     expect(plain.body.data.storeSheetReceipts).toEqual([]);
   });
 
-  it('waits for a run in progress to finish, and skips a failed one', async () => {
-    const [running] = await query<{ id: number }>(`INSERT INTO google_sync_jobs (status, trigger_source) VALUES ('RUNNING', 'SCHEDULED') RETURNING id::int AS id`);
-    await query(
+  it('waits for a run in progress to finish, and is as of the latest run that read the GRN tab through', async () => {
+    const missing = (job: number, row: number, grn: string, po: string) => query(
       `INSERT INTO google_sync_errors (job_id, sheet_name, row_number, column_name, business_key, severity, error_code, error_message, incoming_value)
-       VALUES ($1, 'GRN', 8, 'GRN No', 'ZG/RE/0106 / RE-S', 'CONFLICT', 'MISSING_IN_ERP', 'GRN ZG/RE/0106 line RE-S (5) is in the sheet but not in the ERP.',
-               '{"poNo": "Z/RE/00014", "grnNo": "ZG/RE/0106", "grnQty": 5, "itemCode": "RE-S"}'::jsonb)`,
+       VALUES ($1, 'GRN', $2, 'GRN No', $3, 'CONFLICT', 'MISSING_IN_ERP', 'GRN line is in the sheet but not in the ERP.', $4::jsonb)`,
+      [job, row, `${grn} / RE-S`, JSON.stringify({ poNo: po, grnNo: grn, grnQty: 5, itemCode: 'RE-S' })],
+    );
+    const [running] = await query<{ id: number }>(`INSERT INTO google_sync_jobs (status, trigger_source) VALUES ('RUNNING', 'SCHEDULED') RETURNING id::int AS id`);
+    await missing(running!.id, 8, 'ZG/RE/0106', 'Z/RE/00014');
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only' })).toEqual(['Z/RE/00002', 'Z/RE/00008']);
+    expect((await summary()).sheetOnly).toMatchObject({ pos: 2, jobId: jobs[1], laterRuns: 0 });
+    // It finishes, having read the tab through (its outcome for the tab carries issuesResolved).
+    await query(
+      `UPDATE google_sync_jobs SET status = 'PARTIAL', finished_at = now(),
+              detail = '[{"sheet": "GRN", "entity": "grns", "rowsRead": 8, "conflicts": 6, "issuesResolved": 0}]'::jsonb
+        WHERE id = $1`,
       [running!.id],
     );
-    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only' })).toEqual(['Z/RE/00002', 'Z/RE/00008']);
-    expect((await summary()).sheetOnly).toMatchObject({ pos: 2, jobId: jobs[1] });
-    await query(`UPDATE google_sync_jobs SET status = 'PARTIAL', finished_at = now() WHERE id = $1`, [running!.id]);
-    await query(`INSERT INTO google_sync_jobs (status, trigger_source, finished_at) VALUES ('FAILED', 'SCHEDULED', now())`);
     expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only' })).toEqual(['Z/RE/00002', 'Z/RE/00008', 'Z/RE/00014']);
     const s = await summary();
-    expect(s.sheetOnly).toMatchObject({ pos: 3, receiptLines: 4, jobId: running!.id });
+    expect(s.sheetOnly).toMatchObject({ pos: 3, receiptLines: 4, jobId: running!.id, laterRuns: 0 });
     expect(s.noneRecorded.pos).toBe(1);
     expect(cents(s.awaitingLink.value) + cents(s.sheetOnly.value) + cents(s.noneRecorded.value)).toBe(cents(s.pending.value));
+
+    // Later runs that did not read the tab through still end PARTIAL (2026-10-17 review):
+    // a heading renamed, a run of the PO tab only, and a run that failed. None of them
+    // checked the tab's open issues, so the lines stay as of the run before; a line one
+    // of them carries is not counted, and the summary says how many runs went by.
+    const [renamed] = await query<{ id: number }>(
+      `INSERT INTO google_sync_jobs (status, trigger_source, finished_at, detail)
+       VALUES ('PARTIAL', 'SCHEDULED', now(), '[{"sheet": "GRN", "entity": "grns", "rowsRead": 0, "rejected": 8, "message": "Missing required column(s): Po No."}]'::jsonb)
+       RETURNING id::int AS id`,
+    );
+    await missing(renamed!.id, 9, 'ZG/RE/0107', 'Z/RE/00007');
+    await query(`INSERT INTO google_sync_jobs (status, trigger_source, finished_at, detail)
+                 VALUES ('SUCCESS', 'MANUAL', now(), '[{"sheet": "Purchase Order", "entity": "purchase_orders", "rowsRead": 3, "issuesResolved": 0}]'::jsonb)`);
+    await query(`INSERT INTO google_sync_jobs (status, trigger_source, finished_at, detail) VALUES ('FAILED', 'SCHEDULED', now(), '[]'::jsonb)`);
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only' })).toEqual(['Z/RE/00002', 'Z/RE/00008', 'Z/RE/00014']);
+    const later = await summary();
+    expect(later.sheetOnly).toMatchObject({ pos: 3, receiptLines: 4, jobId: running!.id, laterRuns: 3, asOf: s.sheetOnly.asOf });
+    await query(`DELETE FROM google_sync_errors WHERE job_id = $1`, [renamed!.id]);
+  });
+});
+
+describe('Receipts on the store sheet only — posted in the ERP under another number', () => {
+  // The sync looks for an ERP GRN under the sheet's own GRN number; a GRN posted through
+  // the ERP gets the ERP's number, so the sync keeps reporting the line (2026-10-17 review:
+  // Z/SM/00043's ZG/SM/0084, posted as GRN-20261017-0001, still asked to be posted).
+  const sheetSync = async (tab: string[][]) => (await import('../modules/google-sync/engine.js'))
+    .runSync({ trigger: 'SCHEDULED', sheets: ['GRN'], reader: async (sheet: string) => (sheet === 'GRN' ? tab : []) });
+  const blank = ['', '', '', '', '', '', '', ''];
+  const postGrn = async (po: string, qty: string) => {
+    const res = await request(app).post(api('/grn')).set(auth(adminToken))
+      .send({ mode: 'PO', invoiceNo: `RE-INV-${po.slice(-2)}-${qty}`, lines: [{ poLineId: pos[po]!.lines[0], grnQty: qty }], post: true });
+    expect([res.status, res.body.error?.message]).toEqual([201, undefined]);
+    return String(res.body.data.grn_no ?? res.body.data.grnNo);
+  };
+  let erpGrnNo = '';
+
+  it('stops counting a sheet line once an ERP receipt posted after the sync reported it covers it', async () => {
+    await mkItem('RE-T');
+    await mkItem('RE-U');
+    await mkPo('Z/RE/00015', [['RE-T', '10']]);
+    await mkPo('Z/RE/00016', [['RE-U', '10']]);
+    // The earlier rows where they were (their issues stay as they are), row 6 cleared
+    // (the line an administrator resolved), and two new lines.
+    const tab = [
+      HEADER,
+      row('ZG/RE/0101', 'RE-B', '3', 'Z/RE/00002'),
+      row('ZG/RE/0102', 'RE-L', '2', ' z/re/00008 '),
+      row('', 'RE-L', '1', 'Z/RE/00008'),
+      row('ZG/RE/0103', 'RE-C', '1', 'Z/RE/00003'),
+      blank,
+      row('ZG/RE/0201', 'RE-T', '4', 'Z/RE/00015'), // row 7: posted below through the ERP, as GRN-…
+      row('ZG/RE/0202', 'RE-U', '3', 'Z/RE/00016'), // row 8: a smaller delivery of 2 is posted meanwhile
+    ];
+    await sheetSync(tab);
+    const sheetBefore = await listNos({ view: 'pending', receiptEvidence: 'sheet_only' });
+    expect(sheetBefore).toEqual(expect.arrayContaining(['Z/RE/00015', 'Z/RE/00016']));
+
+    erpGrnNo = await postGrn('Z/RE/00015', '4');
+    expect(erpGrnNo).toMatch(/^GRN-\d{8}-\d{4}$/);
+    await postGrn('Z/RE/00016', '2');
+    const again = await sheetSync(tab);
+    expect(again.status).not.toBe('FAILED');
+    // The sync still reports ZG/RE/0201: no ERP GRN carries that number.
+    const [issue] = await query<{ resolved_at: Date | null }>(
+      `SELECT resolved_at FROM google_sync_errors WHERE sheet_name = 'GRN' AND business_key = 'ZG/RE/0201 / RE-T' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(issue!.resolved_at).toBeNull();
+
+    // Z/RE/00015 leaves 'sheet only': 6 of its 10 are still to come and nothing else is
+    // recorded against it. Z/RE/00016 stays: the 2 posted do not cover the sheet's 3.
+    const sheetAfter = await listNos({ view: 'pending', receiptEvidence: 'sheet_only' });
+    expect(sheetAfter).not.toContain('Z/RE/00015');
+    expect(sheetAfter).toContain('Z/RE/00016');
+    expect(await listNos({ view: 'pending', receiptEvidence: 'none_recorded', search: 'Z/RE/00015' })).toEqual(['Z/RE/00015']);
+    expect((await list({ search: 'Z/RE/0001' })).data.filter((r) => ['Z/RE/00015', 'Z/RE/00016'].includes(r.po_no))
+      .map((r) => [r.po_no, (r as unknown as { store_sheet_receipts: number }).store_sheet_receipts]).sort())
+      .toEqual([['Z/RE/00015', 0], ['Z/RE/00016', 1]]);
+    for (const params of [{ view: 'pending', receiptEvidence: 'sheet_only' }, { view: 'pending', receiptEvidence: 'none_recorded' }]) {
+      expect([params, await exportNos(params)]).toEqual([params, await listNos(params)]);
+    }
+    const s = await summary();
+    expect(s.awaitingLink.pos + s.sheetOnly.pos + s.noneRecorded.pos).toBe(s.pending.pos);
+    expect(cents(s.awaitingLink.value) + cents(s.sheetOnly.value) + cents(s.noneRecorded.value)).toBe(cents(s.pending.value));
+  });
+
+  it('lists such a line on the PO screen as posted under the ERP\'s number, and says what the ERP has received', async () => {
+    const done = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00015']!.id}`)).set(auth(adminToken));
+    expect(done.body.data.storeSheetReceipts).toEqual([]);
+    expect(done.body.data.storeSheetReceiptsPostedInErp).toEqual([{
+      issueId: expect.any(Number), grnNo: 'ZG/RE/0201', itemCode: 'RE-T', grnQty: '4.0000', sheetRow: 7,
+      reportedAt: expect.any(String), erpReceivedOnPoLine: '4.0000', erpReceiptCoversIt: true, postedAs: erpGrnNo,
+    }]);
+    const partly = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00016']!.id}`)).set(auth(adminToken));
+    expect(partly.body.data.storeSheetReceipts).toEqual([{
+      issueId: expect.any(Number), grnNo: 'ZG/RE/0202', itemCode: 'RE-U', grnQty: '3.0000', sheetRow: 8,
+      reportedAt: expect.any(String), erpReceivedOnPoLine: '2.0000', erpReceiptCoversIt: false, postedAs: null,
+    }]);
+    expect(partly.body.data.storeSheetReceiptsPostedInErp).toEqual([]);
+  });
+
+  it('takes no receipt posted before the sync reported a line as that line, but says the ERP has received as much', async () => {
+    // The ERP received 2 on Z/RE/00017 first; the sync then reports a sheet line of 2 for
+    // it. Nothing proves the two are one receipt, so the PO stays 'sheet only'; the PO
+    // screen says the ERP's 2 already cover the line (and offers no Receive material).
+    await mkItem('RE-V');
+    await mkPo('Z/RE/00017', [['RE-V', '10']]);
+    await postGrn('Z/RE/00017', '2');
+    const [job] = await query<{ id: number }>(
+      `INSERT INTO google_sync_jobs (status, trigger_source, finished_at, detail)
+       VALUES ('PARTIAL', 'SCHEDULED', now(), '[{"sheet": "GRN", "entity": "grns", "rowsRead": 9, "conflicts": 1, "issuesResolved": 0}]'::jsonb)
+       RETURNING id::int AS id`,
+    );
+    await query(
+      `INSERT INTO google_sync_errors (job_id, sheet_name, row_number, column_name, business_key, severity, error_code, error_message, incoming_value, created_at)
+       VALUES ($1, 'GRN', 9, 'GRN No', 'ZG/RE/0203 / RE-V', 'CONFLICT', 'MISSING_IN_ERP', 'GRN line is in the sheet but not in the ERP.',
+               '{"poNo": "Z/RE/00017", "grnNo": "ZG/RE/0203", "grnQty": 2, "itemCode": "RE-V"}'::jsonb, now() + interval '1 second')`,
+      [job!.id],
+    );
+    const doc = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00017']!.id}`)).set(auth(adminToken));
+    expect(doc.body.data.storeSheetReceipts).toMatchObject([
+      { grnNo: 'ZG/RE/0203', grnQty: '2.0000', erpReceivedOnPoLine: '2.0000', erpReceiptCoversIt: true, postedAs: null },
+    ]);
+    expect(doc.body.data.storeSheetReceiptsPostedInErp).toEqual([]);
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only', search: 'Z/RE/00017' })).toEqual(['Z/RE/00017']);
+    await query('DELETE FROM google_sync_errors WHERE job_id = $1', [job!.id]);
+    await query('DELETE FROM google_sync_jobs WHERE id = $1', [job!.id]);
   });
 });
 
@@ -696,5 +860,64 @@ describe('Store receipts awaiting link — the record itself', () => {
     await withTransaction((tx) => restoreFromPayload(tx, { data }));
     expect(await holds()).toEqual(before);
     expect(await summary()).toEqual(beforeSummary);
+  });
+
+  it('keeps a deleted PO\'s held receipts, as naming a PO the ERP does not hold, and the inspector lists them first', async () => {
+    // Z/RE/00004 is named, with Z/RE/00003, by ZG/RE/0003's held receipt (SEVERAL_POS); its
+    // GRN header names no PO, so the GRN count of the inspector never saw it.
+    const id = pos['Z/RE/00004']!.id;
+    const inspect = await request(app).get(api(`/admin/data-management/inspect/purchase_orders/${id}`)).set(auth(adminToken));
+    expect(inspect.status).toBe(200);
+    expect(inspect.body.data.dependencies).toContainEqual({ table: 'store_grn_link_holds', label: 'Store receipts awaiting link that name it', count: 1 });
+    expect(inspect.body.data.canHardDelete).toBe(true);
+    const before = await summary();
+    const del = await request(app).post(api('/admin/data-management/hard-delete')).set(auth(adminToken))
+      .send({ entity: 'purchase_orders', id, confirm: 'DELETE' });
+    expect(del.status).toBe(200);
+    expect((await holds()).filter((r) => r.po_no === 'Z/RE/00004')).toMatchObject([{ po_id: null, reason: 'SEVERAL_POS', grn_no: 'ZG/RE/0003' }]);
+    const after = await summary();
+    expect(after.notInErp).toEqual({ receiptLines: before.notInErp.receiptLines + 1, poNos: before.notInErp.poNos + 1 });
+    // Still awaiting link on Z/RE/00003, the other PO the tab names.
+    expect(await flagOf('Z/RE/00003')).toBe(1);
+  });
+});
+
+describe('Planner statistics — a restored database is analysed, and the summary reads one snapshot', () => {
+  const statsOf = async () => Object.fromEntries((await query<{ tablename: string; n: number }>(
+    `SELECT tablename, COUNT(*)::int AS n FROM pg_stats
+      WHERE schemaname = 'public' AND tablename IN ('grn_lines', 'purchase_order_lines') GROUP BY tablename`,
+  )).map((r) => [r.tablename, Number(r.n)]));
+
+  it('reads the summary from one snapshot, read only', async () => {
+    const { withSnapshot } = await import('../db/index.js');
+    const seen = await withSnapshot(async (tx) => ({
+      level: (await tx.query<{ transaction_isolation: string }>('SHOW transaction_isolation')).rows[0]!.transaction_isolation,
+      readOnly: (await tx.query<{ transaction_read_only: string }>('SHOW transaction_read_only')).rows[0]!.transaction_read_only,
+    }));
+    expect(seen).toEqual({ level: 'repeatable read', readOnly: 'on' });
+    await expect(withSnapshot((tx) => tx.query('UPDATE store_grn_link_holds SET detail = detail'))).rejects.toThrow(/read-only/);
+  });
+
+  it('start-up analyses a database whose PO or GRN lines have rows but no statistics, and only then', async () => {
+    const { ensurePlannerStatistics } = await import('../db/statistics.js');
+    await query(`DELETE FROM pg_statistic WHERE starelid IN ('grn_lines'::regclass, 'purchase_order_lines'::regclass)`);
+    expect(await statsOf()).toEqual({});
+    expect(await ensurePlannerStatistics()).toEqual({ analysed: true, tables: ['purchase_order_lines', 'grn_lines'] });
+    const after = await statsOf();
+    expect([after.grn_lines! > 0, after.purchase_order_lines! > 0]).toEqual([true, true]);
+    expect(await ensurePlannerStatistics()).toEqual({ analysed: false, tables: [] });
+  });
+
+  it('Admin restore analyses what it restored once it has committed', async () => {
+    // A restore into a fresh folder left no statistics: on such a copy of the 2026-10-17
+    // backup the summary took 76.7 s and froze every other request (2026-10-17 review).
+    await query(`DELETE FROM pg_statistic WHERE starelid IN ('grn_lines'::regclass, 'purchase_order_lines'::regclass)`);
+    expect(await statsOf()).toEqual({});
+    const backup = await request(app).post(api('/backup')).set(auth(adminToken)).send({ notes: 'receipt evidence: restore analyses' });
+    expect(backup.status).toBe(201);
+    const restored = await request(app).post(api(`/backup/${backup.body.data.id}/restore`)).set(auth(adminToken)).send({ confirm: 'RESTORE' });
+    expect(restored.status).toBe(200);
+    const after = await statsOf();
+    expect([after.grn_lines! > 0, after.purchase_order_lines! > 0]).toEqual([true, true]);
   });
 });

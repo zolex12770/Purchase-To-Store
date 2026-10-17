@@ -1195,6 +1195,72 @@ export async function undoStoreGrnLinks(
   return result;
 }
 
+/** A line a Super Admin unlinked that the plan would link again, or that it keeps out (EXCLUDED). */
+export interface UndoneLine {
+  grnLineId: number;
+  grnId: number;
+  grnNo: string;
+  itemCode: string;
+  grnQty: string;
+  /** The PO the plan would link it to, or the one its tab rows name when it is kept out. */
+  poNo: string | null;
+  /** True when the plan links it again; false when this run keeps it out. */
+  wouldLink: boolean;
+  undoAuditId: number;
+  undoneAt: string;
+  undoReason: string;
+}
+
+/**
+ * The plan's lines whose latest audit entry of this repair is an undo: a Super Admin
+ * took their link back, and nothing has linked them since. The link rules do not know
+ * about undo, so while the tab still names the same PO a plain re-run links them again
+ * on the same evidence, and the apply's record then replaces their UNDONE rows (seen on
+ * the 2026-10-17 review copy: ZG/TM/0159 undone, then linked again by the next run from
+ * the Data Management panel). The dry run lists them, and the panel keeps them out of
+ * its run (excludeGrnLineIds) unless the Super Admin chooses to link them again.
+ */
+export async function previouslyUndoneLines(run: Run, plan: LinkPlan): Promise<UndoneLine[]> {
+  const entries = await run<{ id: number; created_at: Date | string; after_data: Record<string, unknown> | null }>(
+    `SELECT id, created_at, after_data FROM audit_logs
+      WHERE entity = $1 AND after_data->>'kind' IN ('links', 'undo') ORDER BY id`,
+    [LINK_AUDIT_ENTITY],
+  );
+  const latest = new Map<number, { kind: string; auditId: number; at: string; reason: string }>();
+  for (const e of entries) {
+    const kind = String(e.after_data?.kind);
+    const links = Array.isArray(e.after_data?.links) ? e.after_data!.links as Array<{ grnLineId: number }> : [];
+    const at = e.created_at instanceof Date ? e.created_at.toISOString() : new Date(e.created_at).toISOString();
+    for (const l of links) {
+      latest.set(Number(l.grnLineId), { kind, auditId: Number(e.id), at, reason: String(e.after_data?.reason ?? '') });
+    }
+  }
+  const undone = (id: number) => {
+    const last = latest.get(id);
+    return last?.kind === 'undo' ? last : null;
+  };
+  const out: UndoneLine[] = [];
+  for (const l of plan.links) {
+    const u = undone(l.grnLineId);
+    if (u) {
+      out.push({
+        grnLineId: l.grnLineId, grnId: l.grnId, grnNo: l.grnNo, itemCode: l.itemCode, grnQty: l.grnQty, poNo: l.poNo,
+        wouldLink: true, undoAuditId: u.auditId, undoneAt: u.at, undoReason: u.reason,
+      });
+    }
+  }
+  for (const h of plan.held) {
+    const u = h.reason === 'EXCLUDED' ? undone(h.grnLineId) : null;
+    if (u) {
+      out.push({
+        grnLineId: h.grnLineId, grnId: h.grnId, grnNo: h.grnNo, itemCode: h.itemCode, grnQty: h.grnQty, poNo: h.poNos?.[0] ?? null,
+        wouldLink: false, undoAuditId: u.auditId, undoneAt: u.at, undoReason: u.reason,
+      });
+    }
+  }
+  return out.sort((a, b) => a.grnLineId - b.grnLineId);
+}
+
 /** The link run each 'links' audit entry belongs to. */
 const runIdsOf = (entries: AuditRow[]) => new Map(entries.map((e) => [Number(e.id), String(e.after_data?.runId ?? `audit #${e.id}`)]));
 

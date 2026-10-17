@@ -17,12 +17,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { chromium } from 'playwright';
 import {
-  query, queryOne, withTransaction, txQuery, txQueryOne, getDatabase, SqlBuilder, type Queryable,
+  query, queryOne, withTransaction, withSnapshot, txQuery, txQueryOne, getDatabase, SqlBuilder, type Queryable,
 } from '../../db/index.js';
 import { renderPoDocumentHtml, type PoDocumentData } from './po-document.js';
 import {
-  RECEIPT_EVIDENCE, receiptEvidenceCondition, awaitingLinkCount, storeSheetReceiptCount, awaitingLinkLines,
-  storeSheetLines, latestHoldRecord, latestSheetSync, receiptsNamingPosNotInErp,
+  RECEIPT_EVIDENCE, receiptEvidenceCondition, EVIDENCE_COUNTS_WITH, EVIDENCE_COUNT_COLUMNS, evidenceCountJoins,
+  awaitingLinkLines, storeSheetLines, latestHoldRecord, latestSheetRead, receiptsNamingPosNotInErp,
   storeReceiptsAwaitingLink as storeReceiptsAwaitingLinkOf, storeSheetReceipts as storeSheetReceiptsOf,
   type ReceiptEvidence,
 } from './receipt-evidence.js';
@@ -227,8 +227,11 @@ router.get(
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
 
+    // The receipt evidence counts are each built once and joined (EVIDENCE_COUNTS_WITH):
+    // its store receipts awaiting link, and its receipts on the store's GRN sheet only.
     const rows = await query(
-      `SELECT h.id, h.po_no, h.po_date, h.po_time, h.status, h.source_mode, h.remarks,
+      `WITH ${EVIDENCE_COUNTS_WITH}
+       SELECT h.id, h.po_no, h.po_date, h.po_time, h.status, h.source_mode, h.remarks,
               h.delivery_date, h.currency_code, h.payment_terms, h.issued_at, h.close_reason,
               h.po_type_id, pt.name AS po_type_name,
               h.supplier_id, s.supplier_name, s.supplier_code, s.city AS supplier_city,
@@ -250,11 +253,11 @@ router.get(
               -- Store receipts the link repair held back that name this PO, and receipts
               -- the store recorded on its GRN sheet only: its goods may have come although
               -- nothing is received against it in the ERP (receipt-evidence.ts).
-              ${awaitingLinkCount('h.id')} AS store_receipts_awaiting_link,
-              ${storeSheetReceiptCount('h.po_no')} AS store_sheet_receipts
+              ${EVIDENCE_COUNT_COLUMNS}
          ${PO_FROM}
          LEFT JOIN lookups pt ON pt.id = h.po_type_id
          LEFT JOIN users u ON u.id = h.created_by
+         ${evidenceCountJoins('h')}
          ${b.where()}
         ORDER BY ${order}, h.id DESC
         LIMIT ${limit} OFFSET ${offset}`,
@@ -282,9 +285,14 @@ router.get(
    (genuinely pending). Pending is the Pending PO list itself under the same filters:
    buildPoFilter's pending view and its total tiles (poListTotals), which are also the
    dashboard's Pending POs and Pending PO Value cards (analytics). The parts are that
-   list filtered by receiptEvidence, a property of the order, and are read in the one
-   transaction with the whole, so a GRN posted or a sync finishing meanwhile cannot
-   make them disagree: they add up to it exactly. */
+   list filtered by receiptEvidence, a property of the order, and are all read from one
+   snapshot (withSnapshot), so a GRN posted or a sync finishing meanwhile cannot make
+   them disagree: they add up to it exactly. The receipt lines are counted on the
+   pending list read once (MATERIALIZED): on a copy without planner statistics, counting
+   them through the list's own filter ran its pending test again for every sheet line,
+   71 s of the summary's 76.7 s (2026-10-17 review). sheetOnly.asOf is the latest sync
+   run that read the GRN tab through, and laterRuns how many have finished since
+   without reading it. */
 
 router.get(
   '/receipt-evidence/summary',
@@ -293,17 +301,17 @@ router.get(
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<PoListFilter>(res);
     const pendingOf = (receiptEvidence?: ReceiptEvidence): PoListFilter => ({ ...q, view: 'pending', receiptEvidence });
-    const awaitingSet = buildPoFilter(pendingOf('awaiting_link'));
-    const sheetSet = buildPoFilter(pendingOf('sheet_only'));
-    const s = await withTransaction(async (tx) => ({
+    const listed = buildPoFilter(pendingOf());
+    const listedSql = `SELECT h.id, h.po_no ${PO_FROM} ${listed.where()}`;
+    const s = await withSnapshot(async (tx) => ({
       pending: await poListTotals(pendingOf(), tx),
       awaiting: await poListTotals(pendingOf('awaiting_link'), tx),
       sheet: await poListTotals(pendingOf('sheet_only'), tx),
       none: await poListTotals(pendingOf('none_recorded'), tx),
-      awaitingLines: await awaitingLinkLines(tx, `SELECT h.id ${PO_FROM} ${awaitingSet.where()}`, awaitingSet.params),
-      sheetLines: await storeSheetLines(tx, `SELECT h.po_no ${PO_FROM} ${sheetSet.where()}`, sheetSet.params),
+      awaitingLines: await awaitingLinkLines(tx, listedSql, listed.params),
+      sheetLines: await storeSheetLines(tx, listedSql, listed.params),
       hold: await latestHoldRecord(tx),
-      sync: await latestSheetSync(tx),
+      sheetRead: await latestSheetRead(tx),
       notInErp: await receiptsNamingPosNotInErp(tx),
     }));
     sendOk(res, {
@@ -311,7 +319,10 @@ router.get(
       runId: s.hold.runId,
       pending: { pos: s.pending.poCount, value: s.pending.pending },
       awaitingLink: { pos: s.awaiting.poCount, value: s.awaiting.pending, ...s.awaitingLines },
-      sheetOnly: { pos: s.sheet.poCount, value: s.sheet.pending, receiptLines: s.sheetLines, asOf: s.sync.asOf, jobId: s.sync.jobId },
+      sheetOnly: {
+        pos: s.sheet.poCount, value: s.sheet.pending, receiptLines: s.sheetLines,
+        asOf: s.sheetRead.asOf, jobId: s.sheetRead.jobId, laterRuns: s.sheetRead.laterRuns,
+      },
       noneRecorded: { pos: s.none.poCount, value: s.none.pending },
       notInErp: s.notInErp,
     });
@@ -412,11 +423,16 @@ router.get(
 
     // Store receipts the link repair held back that name this PO, and receipts the
     // store recorded on its GRN sheet only: received goods the ERP cannot yet count
-    // against it, so its pending quantity may not be pending.
+    // against it, so its pending quantity may not be pending. Sheet lines an ERP
+    // receipt posted since covers are listed apart: posted under another GRN number,
+    // their sync issue only needs resolving.
     const storeReceiptsAwaitingLink = await storeReceiptsAwaitingLinkOf(id);
-    const storeSheetReceipts = await storeSheetReceiptsOf(String(header.po_no));
+    const sheet = await storeSheetReceiptsOf(id, String(header.po_no));
 
-    sendOk(res, { ...header, lines, grns, sourceIndents, storeReceiptsAwaitingLink, storeSheetReceipts });
+    sendOk(res, {
+      ...header, lines, grns, sourceIndents, storeReceiptsAwaitingLink,
+      storeSheetReceipts: sheet.onSheetOnly, storeSheetReceiptsPostedInErp: sheet.postedInErp,
+    });
   }),
 );
 

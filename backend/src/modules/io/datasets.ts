@@ -19,7 +19,7 @@ import { listSchema as itemListSchema, buildItemFilter } from '../masters/item.r
 import { listSchema as supplierListSchema, buildSupplierFilter } from '../masters/supplier.routes.js';
 import { listSchema as indentListSchema, buildIndentFilter, indentLineScope } from '../indent/routes.js';
 import { listSchema as poListSchema, buildPoFilter, poLineScope, PO_FROM } from '../purchase-order/routes.js';
-import { awaitingLinkCount, storeSheetReceiptCount } from '../purchase-order/receipt-evidence.js';
+import { EVIDENCE_COUNTS_WITH, EVIDENCE_COUNT_COLUMNS, evidenceCountJoins } from '../purchase-order/receipt-evidence.js';
 import { listSchema as grnListSchema, buildGrnFilter, grnLineScope, GRN_FROM } from '../grn/routes.js';
 import {
   listSchema as requisitionListSchema, buildFilter as buildRequisitionFilter, LIST_FROM as REQUISITION_FROM,
@@ -276,19 +276,21 @@ export const DATASETS: Record<string, DatasetDef> = {
       const b = buildPoFilter(q);
       b.addIn('h.id', q.ids);
       return {
-        sql: `SELECT h.po_no, h.po_date, h.po_time, pt.name AS po_type_name, s.supplier_name,
+        // The receipt evidence counts are each built once and joined, as on the list.
+        sql: `WITH ${EVIDENCE_COUNTS_WITH}
+              SELECT h.po_no, h.po_date, h.po_time, pt.name AS po_type_name, s.supplier_name,
                      h.status, h.source_mode,
                      (SELECT string_agg(DISTINCT src.indent_no, ', ')
                         FROM v_po_line_sources src WHERE src.po_id = h.id) AS source_indents,
                      b.line_count, b.total_po_qty, b.total_received_qty, b.total_pending_qty,
                      b.total_amount, b.received_amount, b.pending_amount,
                      h.payment_terms, h.delivery_date, h.remarks,
-                     ${awaitingLinkCount('h.id')} AS store_receipts_awaiting_link,
-                     ${storeSheetReceiptCount('h.po_no')} AS store_sheet_receipts
+                     ${EVIDENCE_COUNT_COLUMNS}
                 FROM purchase_order_headers h
                 JOIN v_po_header_balance b ON b.po_id = h.id
                 JOIN suppliers s ON s.id = h.supplier_id
                 LEFT JOIN lookups pt ON pt.id = h.po_type_id
+                ${evidenceCountJoins('h')}
                WHERE ${inList('h.id', 'h.id', PO_FROM, b)}
                ORDER BY h.po_date DESC, h.po_no DESC`,
         params: b.params,
