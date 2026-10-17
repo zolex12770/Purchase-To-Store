@@ -27,20 +27,24 @@ import { renderGrnDocumentHtml, type GrnDocumentData } from './grn-document.js';
 import { renderLabelSheetHtml, type LabelData } from './label-document.js';
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery,
-  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray,
+  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray, attachmentDisposition,
 } from '../../core/http.js';
 import { NotFoundError, BusinessRuleError, ValidationError } from '../../core/errors.js';
 import { requirePermission } from '../../auth/middleware.js';
 import { audit, auditIn, actorFrom } from '../../core/audit.js';
 import { nextDocumentNumber, dateStamp, timeStamp, toDateOnly } from '../../domain/numbering.js';
-import { assertGrnTransition, assertGrnEditable, assertNotAlready, type GrnStatus } from '../../domain/status.js';
+import { assertGrnTransition, assertGrnEditable, assertNotAlready, statusLabel, type GrnStatus } from '../../domain/status.js';
 import {
   lockPoLineBalance, assertGrnReceiptAllowed, recomputePoStatus, type PoLineBalance,
 } from '../../domain/quantities.js';
 import { toQty, toRate, dec, distributeQty } from '../../domain/money.js';
 import {
-  inwardGrnLine, reverseGrnLine, adjustGrnLineStock, hasRequisitionConsumption, usableQtyOf, type GrnLineForStock,
+  inwardGrnLine, reverseGrnLine, adjustGrnLineStock, hasRequisitionConsumption, usableQtyOf,
+  stockReceivedByGrnLine, assertGrnCancelCovered, type GrnLineForStock,
 } from '../../domain/stock.js';
+import {
+  OPEN_QC_STATUSES, PASSED_QC_STATUSES, isOpenQcStatus, qcStatusLabel, refreshGrnQcStatus, closeOpenInspections,
+} from '../../domain/qc.js';
 import { loadCompanySettings } from '../../domain/company.js';
 
 const router = Router();
@@ -212,23 +216,29 @@ router.get(
       line_count: string;
       total_qty: string;
       total_amount: string;
-      pending_qc_count: string;
-      qc_passed_count: string;
-      qc_failed_count: string;
     }>(
       `SELECT
          COUNT(DISTINCT g.id) AS grn_count,
          COALESCE(COUNT(gl.id), 0) AS line_count,
          COALESCE(SUM(gl.grn_qty), 0) AS total_qty,
-         COALESCE(SUM(gl.amount), 0) AS total_amount,
-         COUNT(DISTINCT CASE WHEN g.qc_status = 'PENDING' THEN g.id END) AS pending_qc_count,
-         COUNT(DISTINCT CASE WHEN g.qc_status = 'PASSED' THEN g.id END) AS qc_passed_count,
-         COUNT(DISTINCT CASE WHEN g.qc_status = 'FAILED' THEN g.id END) AS qc_failed_count
+         COALESCE(SUM(gl.amount), 0) AS total_amount
        ${GRN_FROM}
        LEFT JOIN grn_lines gl ON gl.grn_id = g.id
        ${tb.where()}`,
       tb.params,
     );
+
+    // The QC tiles count the codes the GRN really stores (migration 021's CHECK).
+    // They counted 'PENDING', 'PASSED' and 'FAILED', which no row ever holds, so
+    // all three read 0 on every screen (A7 F10). Pending QC is everything still
+    // held for inspection, QC Passed includes acceptance with deviation.
+    const qb = buildGrnFilter(q);
+    const qcCounts = await query<{ qc_status: string; n: string }>(
+      `SELECT g.qc_status, COUNT(*) AS n ${GRN_FROM} ${qb.where()} GROUP BY g.qc_status`,
+      qb.params,
+    );
+    const qcStatusCounts: Record<string, number> = Object.fromEntries(qcCounts.map((c) => [c.qc_status, Number(c.n)]));
+    const countOf = (codes: readonly string[]) => codes.reduce((n, code) => n + (qcStatusCounts[code] ?? 0), 0);
 
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(counts.map((c) => [c.status, Number(c.n)])),
@@ -237,9 +247,10 @@ router.get(
         lineCount: Number(totalsRow?.line_count ?? 0),
         totalQty: Number(totalsRow?.total_qty ?? 0),
         totalAmount: Number(totalsRow?.total_amount ?? 0),
-        pendingQcCount: Number(totalsRow?.pending_qc_count ?? 0),
-        qcPassedCount: Number(totalsRow?.qc_passed_count ?? 0),
-        qcFailedCount: Number(totalsRow?.qc_failed_count ?? 0),
+        pendingQcCount: countOf(OPEN_QC_STATUSES),
+        qcPassedCount: countOf(PASSED_QC_STATUSES),
+        qcFailedCount: countOf(['QC_FAILED']),
+        qcStatusCounts,
       },
     });
   }),
@@ -539,19 +550,17 @@ router.post(
 
 router.get(
   '/labels/pdf',
-  // Counts as a print (it moves print_count below), like POST /labels/print.
+  // The PDF is the printable label set, so it needs the print right. It no
+  // longer counts the print itself: a GET must not change data, and a refused
+  // or abandoned download was counted as a print (A7 F16). The Labels screen
+  // records the print through POST /labels/print once the PDF has arrived.
   requirePermission('grn.print'),
   validateQuery(labelIdsSchema),
-  asyncHandler(async (req, res) => {
+  asyncHandler(async (_req, res) => {
     const { ids } = parsedQuery<z.infer<typeof labelIdsSchema>>(res);
     const labels = await loadLabelData(ids);
     if (labels.length === 0) throw NotFoundError('Label(s)');
     const html = renderLabelSheetHtml(labels);
-
-    await execute(
-      'UPDATE grn_line_mlns SET print_count = print_count + 1, last_printed_at = now() WHERE id = ANY($1)',
-      [ids],
-    );
 
     const browser = await chromium.launch();
     try {
@@ -568,7 +577,7 @@ router.get(
         margin: { top: '0mm', bottom: '0mm', left: '0mm', right: '0mm' },
       });
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="labels-${Date.now()}.pdf"`);
+      res.setHeader('Content-Disposition', attachmentDisposition(`labels-${Date.now()}`, 'pdf'));
       res.send(pdf);
     } finally {
       await browser.close();
@@ -819,9 +828,9 @@ async function resolveGrnLines(
   return { resolved, supplierId, poIdsTouched };
 }
 
-/** Inserts every line and returns exactly what `inwardGrnLine`/`reverseGrnLine` need to move stock, in line order. */
-async function insertGrnLines(tx: Queryable, grnId: number, resolved: ResolvedLine[]): Promise<GrnLineForStock[]> {
-  const inserted: GrnLineForStock[] = [];
+/** Inserts the lines, numbered from `firstLineNo`, and returns their ids in line order. */
+async function insertGrnLines(tx: Queryable, grnId: number, resolved: ResolvedLine[], firstLineNo = 1): Promise<number[]> {
+  const ids: number[] = [];
   for (const [i, r] of resolved.entries()) {
     const { line, itemSnapshot: s } = r;
     const row = await txQueryOne<{ id: number }>(
@@ -833,7 +842,7 @@ async function insertGrnLines(tx: Queryable, grnId: number, resolved: ResolvedLi
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
        RETURNING id`,
       [
-        grnId, i + 1, r.poLineBalance ? line.poLineId : null, s.id, s.item_code, s.item_description, s.item_specification,
+        grnId, firstLineNo + i, r.poLineBalance ? line.poLineId : null, s.id, s.item_code, s.item_description, s.item_specification,
         toQty(line.grnQty),
         line.invoiceQty == null || line.invoiceQty === '' ? null : toQty(line.invoiceQty),
         s.uom_id, s.rate,
@@ -849,26 +858,129 @@ async function insertGrnLines(tx: Queryable, grnId: number, resolved: ResolvedLi
         line.remarks,
       ],
     );
-    inserted.push({
-      id: row!.id, item_id: s.id, po_line_id: r.poLineBalance ? line.poLineId! : null,
-      grn_qty: toQty(line.grnQty),
-      accepted_qty: line.acceptedQty == null || line.acceptedQty === '' ? null : toQty(line.acceptedQty),
-      uom_id: s.uom_id, batch_no: line.batchNo, receipt_location: line.location,
-    });
+    ids.push(row!.id);
   }
-  return inserted;
+  return ids;
 }
 
-/** Runs stock inward + MLN issuance for every line of a GRN that is being posted right now. */
-async function inwardAllLines(
-  tx: Queryable,
-  lines: GrnLineForStock[],
-  ctx: { grnId: number; grnNo: string; grnDate: string; supplierId: number | null; userId: number | null },
-): Promise<void> {
-  for (const [i, line] of lines.entries()) {
-    await inwardGrnLine(tx, line, { ...ctx, srNo: i + 1 });
-  }
+/* ── Posting: the one place a GRN line is received ────────────────────────────
+ * POST /grn and PUT /grn/:id with post:true, POST /grn/:id/post, and a line
+ * added to a GRN that is already posted all receive their lines here (A7 F03).
+ * Only POST /grn/:id/post used to hold back an item that needs quality
+ * inspection; the GRN form posts through POST /grn, so a qc_required item went
+ * straight into stock and no inspection was ever raised.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+interface LineToReceive extends GrnLineForStock {
+  line_no: number;
+  item_code: string;
+  item_description: string;
+  qc_required: boolean;
 }
+
+async function loadLinesToReceive(tx: Queryable, grnId: number, lineIds?: number[]): Promise<LineToReceive[]> {
+  return txQuery<LineToReceive>(
+    tx,
+    `SELECT gl.id, gl.line_no, gl.po_line_id, gl.item_id, gl.item_code, gl.item_description,
+            gl.grn_qty, gl.accepted_qty, gl.uom_id, gl.batch_no, gl.receipt_location,
+            COALESCE(i.qc_required, FALSE) AS qc_required
+       FROM grn_lines gl
+       LEFT JOIN items i ON i.id = gl.item_id
+      WHERE gl.grn_id = $1 ${lineIds ? 'AND gl.id = ANY($2::bigint[])' : ''}
+      ORDER BY gl.line_no`,
+    lineIds ? [grnId, lineIds] : [grnId],
+  );
+}
+
+interface GrnForReceipt { id: number; grnNo: string; grnDate: string; supplierId: number }
+
+/**
+ * Receives posted lines. A line whose item needs quality inspection
+ * (items.qc_required) is held: no stock and no MLN, a PENDING_QC inspection
+ * instead, and QC releases what it accepts (qc/routes.ts). Every other line goes
+ * into stock with its MLN now. Each MLN's SR. NO. is its line's number.
+ */
+async function receiveLines(
+  tx: Queryable, grn: GrnForReceipt, lines: LineToReceive[], userId: number,
+): Promise<{ inwarded: number; heldForQc: number }> {
+  let inwarded = 0;
+  let heldForQc = 0;
+  let supplierName: string | null = null;
+  for (const line of lines) {
+    if (!line.qc_required) {
+      await inwardGrnLine(tx, line, {
+        grnId: grn.id, grnNo: grn.grnNo, grnDate: grn.grnDate, supplierId: grn.supplierId, srNo: line.line_no, userId,
+      });
+      inwarded += 1;
+      continue;
+    }
+    supplierName ??= (await txQueryOne<{ supplier_name: string }>(
+      tx, 'SELECT supplier_name FROM suppliers WHERE id = $1', [grn.supplierId],
+    ))?.supplier_name ?? '';
+    await tx.query(
+      `INSERT INTO qc_inspections
+         (grn_id, grn_line_id, grn_no, item_id, item_code, item_name, supplier_id, supplier_name,
+          received_qty, accepted_qty, rejected_qty, uom_id, uom_code, status, remarks)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,$10,'','PENDING_QC','Awaiting quality inspection')`,
+      [
+        grn.id, line.id, grn.grnNo, line.item_id, line.item_code, line.item_description,
+        grn.supplierId, supplierName, line.grn_qty, line.uom_id,
+      ],
+    );
+    heldForQc += 1;
+  }
+  return { inwarded, heldForQc };
+}
+
+/**
+ * Posts a saved DRAFT GRN: re-checks every PO line against its live balance,
+ * marks the GRN POSTED with its initial QC status, recomputes every purchase
+ * order it touches (and `alsoRecompute`, e.g. the PO a draft edit moved away
+ * from) and receives its lines. The caller holds the header's row lock. The
+ * GRN is still DRAFT when the balances are read, so its own lines do not count
+ * against them yet.
+ */
+async function postGrn(
+  tx: Queryable, grnId: number, userId: number, alsoRecompute: (number | null)[] = [],
+): Promise<{ grnNo: string; poIds: number[]; poStatuses: string[]; qcStatus: string; inwarded: number; heldForQc: number }> {
+  const header = await txQueryOne<{ grn_no: string; grn_date: string; supplier_id: number }>(
+    tx, 'SELECT grn_no, grn_date, supplier_id FROM grn_headers WHERE id = $1', [grnId],
+  );
+  if (!header) throw NotFoundError('GRN');
+  const lines = await loadLinesToReceive(tx, grnId);
+  if (lines.length === 0) throw BusinessRuleError('Add at least one line before posting this GRN.');
+
+  const poIds = new Set<number>();
+  for (const line of lines) {
+    if (line.po_line_id == null) continue;
+    const balance = await lockPoLineBalance(tx, line.po_line_id);
+    assertGrnReceiptAllowed(balance, line.grn_qty, '0');
+    poIds.add(Number(balance.po_id));
+  }
+
+  const qcStatus = lines.some((l) => l.qc_required) ? 'PENDING_QC' : 'NOT_APPLICABLE';
+  await tx.query(
+    `UPDATE grn_headers
+        SET status = 'POSTED', qc_status = $3, posted_at = now(), posted_by = $2, updated_at = now(), updated_by = $2
+      WHERE id = $1`,
+    [grnId, userId, qcStatus],
+  );
+  const poStatuses: string[] = [];
+  for (const poId of poIds) poStatuses.push(await recomputePoStatus(tx, poId));
+  for (const poId of new Set(alsoRecompute)) {
+    if (poId != null && !poIds.has(Number(poId))) await recomputePoStatus(tx, Number(poId));
+  }
+
+  const received = await receiveLines(tx, {
+    id: grnId, grnNo: header.grn_no, grnDate: toDateOnly(header.grn_date), supplierId: header.supplier_id,
+  }, lines, userId);
+  return { grnNo: header.grn_no, poIds: [...poIds], poStatuses, qcStatus, ...received };
+}
+
+/** " 2 line(s) are held for quality inspection …", or nothing when none is. */
+const qcHoldNote = (heldForQc: number) => (heldForQc > 0
+  ? ` ${heldForQc} line(s) are held for quality inspection and go into stock when QC passes them.`
+  : '');
 
 router.post(
   '/',
@@ -914,35 +1026,31 @@ router.post(
       const grnNo = await nextDocumentNumber(tx, 'GRN', when);
       const status: GrnStatus = body.post ? 'POSTED' : 'DRAFT';
 
+      // Saved as a draft first; posting it is postGrn's job, the same step as
+      // every other posting route.
       const header = await txQueryOne<{ id: number }>(
         tx,
         `INSERT INTO grn_headers
            (grn_no, grn_date, grn_time, po_id, supplier_id, grn_type_id,
             invoice_no, invoice_date, challan_no, challan_date, vehicle_no,
             transporter_name, driver_name, lr_no, lr_date,
-            received_by_user_id, remarks, status, posted_at, posted_by, created_by, updated_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21)
+            received_by_user_id, remarks, status, created_by, updated_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'DRAFT',$18,$18)
          RETURNING id`,
         [
           grnNo, dateStamp(when), timeStamp(), headerPoId, supplierId, body.grnTypeId ?? null,
           body.invoiceNo, body.invoiceDate ?? null, body.challanNo, body.challanDate ?? null, body.vehicleNo,
           body.transporterName, body.driverName, body.lrNo, body.lrDate ?? null,
-          body.receivedByUserId ?? userId, body.remarks, status,
-          body.post ? new Date().toISOString() : null, body.post ? userId : null, userId,
+          body.receivedByUserId ?? userId, body.remarks, userId,
         ],
       );
       if (!header) throw new Error('Failed to create GRN header.');
 
-      const insertedLines = await insertGrnLines(tx, header.id, resolved);
+      await insertGrnLines(tx, header.id, resolved);
 
       // Posting is what moves the balance, assigns MLNs and inwards stock; a
       // draft leaves every PO, MLN and stock balance untouched.
-      if (body.post) {
-        for (const poId of poIdsTouched) await recomputePoStatus(tx, poId);
-        await inwardAllLines(tx, insertedLines, {
-          grnId: header.id, grnNo, grnDate: dateStamp(when), supplierId, userId,
-        });
-      }
+      const posted = body.post ? await postGrn(tx, header.id, userId) : null;
 
       await auditIn(tx, {
         actor: actorFrom(req), action: body.post ? 'POST' : 'CREATE', entity: 'grn',
@@ -950,6 +1058,7 @@ router.post(
         after: {
           grnNo, status, mode: body.mode, lineCount: body.lines.length,
           poCount: poIdsTouched.size, poIds: [...poIdsTouched],
+          ...(posted ? { qcStatus: posted.qcStatus, heldForQc: posted.heldForQc } : {}),
         },
       });
 
@@ -959,6 +1068,32 @@ router.post(
     sendCreated(res, await queryOne('SELECT * FROM grn_headers WHERE id = $1', [id]));
   }),
 );
+
+/**
+ * Locks the GRN's header and refuses the save unless the GRN is still in the
+ * status PUT /grn/:id chose its path by. That status is read before the
+ * transaction, and while a long transaction (an inventory sheet sync) holds
+ * the database, waiting requests take turns, so another user's post or cancel
+ * can commit in between. A second Post of the same draft would rewrite the
+ * lines of the GRN the first had just posted; an edit of a GRN cancelled
+ * meanwhile put stock that never arrived on it and raised a quality inspection
+ * no decision could close (review of 2026-10-17).
+ */
+async function lockGrnInStatus(
+  tx: Queryable, id: number, grnNo: string, expected: GrnStatus,
+): Promise<{ supplier_id: number; grn_date: string }> {
+  const locked = await txQueryOne<{ status: GrnStatus; supplier_id: number; grn_date: string }>(
+    tx, 'SELECT status, supplier_id, grn_date FROM grn_headers WHERE id = $1 FOR UPDATE', [id],
+  );
+  if (!locked) throw NotFoundError('GRN');
+  if (locked.status !== expected) {
+    throw BusinessRuleError(
+      `GRN ${grnNo} has just been ${statusLabel(locked.status).toLowerCase()} by someone else — reload it before saving.`,
+      { status: locked.status },
+    );
+  }
+  return locked;
+}
 
 /**
  * PUT /grn/:id for an already-POSTED GRN (Section 4). Header fields (invoice/
@@ -971,6 +1106,12 @@ router.post(
  * stock against that item; everything else on the line (batch, location,
  * packing, remarks, rate/invoice qty) stays editable regardless, since none
  * of it feeds the pooled balance a Requisition may already rely on.
+ *
+ * A line under quality inspection put into stock only what QC released, so
+ * its quantities are QC's: while the inspection is open a corrected received
+ * quantity moves no stock and becomes the inspection's received quantity;
+ * once QC has decided, the received quantity is locked. Its accepted and
+ * rejected quantities are the inspection's and are kept as QC recorded them.
  */
 async function updatePostedGrn(
   req: Request, res: Response, id: number,
@@ -978,20 +1119,25 @@ async function updatePostedGrn(
   body: GrnBody, userId: number,
 ): Promise<void> {
   await withTransaction(async (tx) => {
-    const header = await txQueryOne<{ supplier_id: number }>(
-      tx, 'SELECT supplier_id FROM grn_headers WHERE id = $1 FOR UPDATE', [id],
-    );
-    const supplierId = header!.supplier_id;
+    const header = await lockGrnInStatus(tx, id, before.grn_no, 'POSTED');
+    const supplierId = header.supplier_id;
 
     const existingLines = await txQuery<{
       id: number; line_no: number; po_line_id: number | null; item_id: number; item_code: string;
       grn_qty: string; accepted_qty: string | null; rejected_qty: string | null;
       uom_id: number | null; batch_no: string; receipt_location: string;
+      qc_id: number | null; qc_status: string | null; qc_accepted: string | null; qc_rejected: string | null;
     }>(
       tx,
-      `SELECT id, line_no, po_line_id, item_id, item_code, grn_qty, accepted_qty, rejected_qty,
-              uom_id, batch_no, receipt_location
-         FROM grn_lines WHERE grn_id = $1 ORDER BY line_no`,
+      `SELECT gl.id, gl.line_no, gl.po_line_id, gl.item_id, gl.item_code, gl.grn_qty, gl.accepted_qty, gl.rejected_qty,
+              gl.uom_id, gl.batch_no, gl.receipt_location,
+              qi.id AS qc_id, qi.status AS qc_status, qi.accepted_qty AS qc_accepted, qi.rejected_qty AS qc_rejected
+         FROM grn_lines gl
+         LEFT JOIN LATERAL (
+           SELECT q.id, q.status, q.accepted_qty, q.rejected_qty FROM qc_inspections q
+            WHERE q.grn_line_id = gl.id ORDER BY q.id DESC LIMIT 1
+         ) qi ON TRUE
+        WHERE gl.grn_id = $1 ORDER BY gl.line_no`,
       [id],
     );
     const byId = new Map(existingLines.map((l) => [l.id, l]));
@@ -1035,7 +1181,8 @@ async function updatePostedGrn(
       }
     }
 
-    let maxLineNo = existingLines.reduce((m, l) => Math.max(m, l.line_no), 0);
+    const maxLineNo = existingLines.reduce((m, l) => Math.max(m, l.line_no), 0);
+    const grnDate = body.grnDate ?? toDateOnly(header.grn_date);
 
     for (const line of submittedExisting) {
       const existing = byId.get(line.id!);
@@ -1055,22 +1202,44 @@ async function updatePostedGrn(
         );
       }
 
+      const underQc = existing.qc_id != null;
       const newGrnQty = toQty(line.grnQty);
-      const newAccepted = line.acceptedQty == null || line.acceptedQty === '' ? null : toQty(line.acceptedQty);
-      const newRejected = line.rejectedQty == null || line.rejectedQty === '' ? null : toQty(line.rejectedQty);
+      const newAccepted = underQc ? existing.accepted_qty
+        : line.acceptedQty == null || line.acceptedQty === '' ? null : toQty(line.acceptedQty);
+      const newRejected = underQc ? existing.rejected_qty
+        : line.rejectedQty == null || line.rejectedQty === '' ? null : toQty(line.rejectedQty);
       const oldUsable = usableQtyOf(existing);
       const newUsable = usableQtyOf({ grn_qty: newGrnQty, accepted_qty: newAccepted });
-      const qtyChanged = dec(newUsable).minus(dec(oldUsable)).abs().greaterThan(0.00005)
-        || dec(newGrnQty).minus(dec(existing.grn_qty)).abs().greaterThan(0.00005);
+      const receivedChanged = dec(newGrnQty).minus(dec(existing.grn_qty)).abs().greaterThan(0.00005);
+      const qtyChanged = receivedChanged || (!underQc && dec(newUsable).minus(dec(oldUsable)).abs().greaterThan(0.00005));
 
       if (qtyChanged) {
-        const consumed = await hasRequisitionConsumption(tx, existing.item_id);
-        if (consumed) {
-          throw BusinessRuleError(
-            `${existing.item_code} (line ${existing.line_no}) has already been issued against a Requisition — ` +
-            `its received quantity can no longer be corrected. Other details on this line remain editable.`,
-            { itemCode: existing.item_code, lineNo: existing.line_no },
-          );
+        if (underQc) {
+          if (!isOpenQcStatus(existing.qc_status!)) {
+            throw BusinessRuleError(
+              `${existing.item_code} (line ${existing.line_no}) has been through quality inspection ` +
+              `(${qcStatusLabel(existing.qc_status!)}) — its received quantity can no longer be corrected. ` +
+              `Other details on this line remain editable.`,
+              { itemCode: existing.item_code, lineNo: existing.line_no, qcStatus: existing.qc_status },
+            );
+          }
+          const recorded = dec(existing.qc_accepted ?? '0').plus(dec(existing.qc_rejected ?? '0'));
+          if (dec(newGrnQty).lessThan(recorded)) {
+            throw BusinessRuleError(
+              `${existing.item_code} (line ${existing.line_no}): QC has already recorded ${toQty(recorded)} as accepted ` +
+              `or rejected, so the received quantity cannot go below that.`,
+              { itemCode: existing.item_code, lineNo: existing.line_no, recordedByQc: toQty(recorded) },
+            );
+          }
+        } else {
+          const consumed = await hasRequisitionConsumption(tx, existing.item_id);
+          if (consumed) {
+            throw BusinessRuleError(
+              `${existing.item_code} (line ${existing.line_no}) has already been issued against a Requisition — ` +
+              `its received quantity can no longer be corrected. Other details on this line remain editable.`,
+              { itemCode: existing.item_code, lineNo: existing.line_no },
+            );
+          }
         }
         if (body.mode === 'PO' && existing.po_line_id) {
           const balance = await lockPoLineBalance(tx, existing.po_line_id);
@@ -1104,19 +1273,29 @@ async function updatePostedGrn(
         ],
       );
 
-      if (qtyChanged) {
+      if (qtyChanged && underQc) {
+        // The material is still held, so stock does not move: the inspection
+        // now checks the corrected quantity.
+        await tx.query(
+          'UPDATE qc_inspections SET received_qty = $2, updated_at = now() WHERE id = $1',
+          [existing.qc_id, newGrnQty],
+        );
+      } else if (qtyChanged) {
         const delta = dec(newUsable).minus(dec(oldUsable));
         await adjustGrnLineStock(
           tx,
           { id: existing.id, item_id: existing.item_id, po_line_id: existing.po_line_id, grn_qty: newGrnQty, accepted_qty: newAccepted, uom_id: existing.uom_id, batch_no: line.batchNo, receipt_location: line.location },
           toQty(delta),
-          { grnId: id, grnNo: before.grn_no, grnDate: body.grnDate ?? dateStamp(new Date()), supplierId: supplierId, userId },
+          { grnId: id, grnNo: before.grn_no, grnDate, supplierId: supplierId, userId },
         );
       }
     }
 
-    // Brand-new lines added to an already-posted GRN inward immediately —
-    // adding stock never conflicts with anything a Requisition already relied on.
+    // Brand-new lines added to an already-posted GRN are received at once,
+    // through the same step as a posting — an item that needs inspection is
+    // held for QC — and adding stock never conflicts with anything a
+    // Requisition already relied on.
+    let heldForQc = 0;
     if (submittedNew.length > 0) {
       const { resolved, supplierId: newSupplierId, poIdsTouched: newPoIds } =
         await resolveGrnLines(tx, body.mode, submittedNew, new Map());
@@ -1134,44 +1313,13 @@ async function updatePostedGrn(
           `Create a separate GRN for the other supplier instead.`,
         );
       }
-      const inserted: GrnLineForStock[] = [];
-      for (const [i, r] of resolved.entries()) {
-        const { line, itemSnapshot: s } = r;
-        const row = await txQueryOne<{ id: number }>(
-          tx,
-          `INSERT INTO grn_lines
-             (grn_id, line_no, po_line_id, item_id, item_code, item_description, item_specification,
-              grn_qty, invoice_qty, uom_id, rate, accepted_qty, rejected_qty, receipt_location,
-              batch_no, package_count, packing_type, expiry_date, label_count, label_qty, remarks)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-           RETURNING id`,
-          [
-            id, maxLineNo + i + 1, r.poLineBalance ? line.poLineId : null, s.id, s.item_code, s.item_description, s.item_specification,
-            toQty(line.grnQty),
-            line.invoiceQty == null || line.invoiceQty === '' ? null : toQty(line.invoiceQty),
-            s.uom_id, s.rate,
-            line.acceptedQty == null || line.acceptedQty === '' ? null : toQty(line.acceptedQty),
-            line.rejectedQty == null || line.rejectedQty === '' ? null : toQty(line.rejectedQty),
-            line.location, line.batchNo,
-            line.packageCount == null || line.packageCount === '' ? null : toQty(line.packageCount),
-            line.packingType, line.expiryDate ?? null,
-            line.labelCount == null || line.labelCount === '' ? null : toQty(line.labelCount),
-            line.labelQty == null || line.labelQty === '' ? null : toQty(line.labelQty),
-            line.remarks,
-          ],
-        );
-        inserted.push({
-          id: row!.id, item_id: s.id, po_line_id: r.poLineBalance ? line.poLineId! : null,
-          grn_qty: toQty(line.grnQty),
-          accepted_qty: line.acceptedQty == null || line.acceptedQty === '' ? null : toQty(line.acceptedQty),
-          uom_id: s.uom_id, batch_no: line.batchNo, receipt_location: line.location,
-        });
-      }
-      maxLineNo += resolved.length;
+      const newLineIds = await insertGrnLines(tx, id, resolved, maxLineNo + 1);
       for (const poId of newPoIds) poIdsTouched.add(poId);
-      await inwardAllLines(tx, inserted, {
-        grnId: id, grnNo: before.grn_no, grnDate: body.grnDate ?? dateStamp(new Date()), supplierId, userId,
-      });
+      const received = await receiveLines(
+        tx, { id, grnNo: before.grn_no, grnDate, supplierId }, await loadLinesToReceive(tx, id, newLineIds), userId,
+      );
+      heldForQc = received.heldForQc;
+      if (heldForQc > 0) await refreshGrnQcStatus(tx, id);
     }
 
     // All PO lines on this GRN (pre-existing + newly added) resolve their
@@ -1204,7 +1352,7 @@ async function updatePostedGrn(
     await auditIn(tx, {
       actor: actorFrom(req), action: 'UPDATE', entity: 'grn', entityId: id, entityLabel: before.grn_no,
       before: { lineCount: existingLines.length },
-      after: { lineCount: body.lines.length, newLines: submittedNew.length, poIds: [...poIdsTouched] },
+      after: { lineCount: body.lines.length, newLines: submittedNew.length, poIds: [...poIdsTouched], heldForQc },
     });
   });
 
@@ -1220,6 +1368,8 @@ router.put(
     const body = req.body as GrnBody;
     const userId = req.user!.id;
 
+    // This status only picks the path: each path reads it again under the row
+    // lock (lockGrnInStatus) before it writes anything.
     const before = await queryOne<{ grn_no: string; status: GrnStatus; po_id: number | null }>(
       'SELECT grn_no, status, po_id FROM grn_headers WHERE id = $1', [id],
     );
@@ -1243,7 +1393,7 @@ router.put(
     }
 
     await withTransaction(async (tx) => {
-      await tx.query('SELECT id FROM grn_headers WHERE id = $1 FOR UPDATE', [id]);
+      await lockGrnInStatus(tx, id, before.grn_no, 'DRAFT');
       await tx.query('DELETE FROM grn_lines WHERE grn_id = $1', [id]);
 
       // A DRAFT contributes nothing to any PO balance, so prior quantities are
@@ -1277,38 +1427,34 @@ router.put(
                 grn_date = COALESCE($5, grn_date), invoice_no = $6, invoice_date = $7,
                 challan_no = $8, challan_date = $9, vehicle_no = $10,
                 transporter_name = $11, driver_name = $12, lr_no = $13, lr_date = $14,
-                received_by_user_id = $15, remarks = $16, status = $17,
-                posted_at = COALESCE(posted_at, $18), posted_by = COALESCE(posted_by, $19),
-                updated_at = now(), updated_by = $19
+                received_by_user_id = $15, remarks = $16,
+                updated_at = now(), updated_by = $17
           WHERE id = $1`,
         [
           id, headerPoId, supplierId, body.grnTypeId ?? null,
           body.grnDate ?? null, body.invoiceNo, body.invoiceDate ?? null,
           body.challanNo, body.challanDate ?? null, body.vehicleNo,
           body.transporterName, body.driverName, body.lrNo, body.lrDate ?? null,
-          body.receivedByUserId ?? userId, body.remarks, status,
-          body.post ? new Date().toISOString() : null, userId,
+          body.receivedByUserId ?? userId, body.remarks, userId,
         ],
       );
 
-      const insertedLines = await insertGrnLines(tx, id, resolved);
+      await insertGrnLines(tx, id, resolved);
 
-      // A GRN can only be edited while still DRAFT (assertGrnEditable), so
-      // `body.post` here always means "posting for the first time" — the
-      // same stock/MLN treatment as the create path, never a second inward.
-      if (body.post) {
-        const allTouched = new Set<number>(poIdsTouched);
-        if (before.po_id) allTouched.add(before.po_id); // release the OLD PO too if the edit changed which PO(s) are referenced
-        for (const poId of allTouched) await recomputePoStatus(tx, poId);
-        await inwardAllLines(tx, insertedLines, {
-          grnId: id, grnNo: before.grn_no, grnDate: body.grnDate ?? dateStamp(new Date()), supplierId, userId,
-        });
-      }
+      // Only a DRAFT reaches this path, so `body.post` here always means
+      // "posting for the first time" — the same step as every other posting
+      // route, never a second inward. The OLD PO is recomputed too when the
+      // edit changed which PO(s) the GRN references.
+      const posted = body.post ? await postGrn(tx, id, userId, [before.po_id]) : null;
 
       await auditIn(tx, {
         actor: actorFrom(req), action: body.post ? 'POST' : 'UPDATE', entity: 'grn',
         entityId: id, entityLabel: before.grn_no,
-        before, after: { status, mode: body.mode, lineCount: body.lines.length, poIds: [...poIdsTouched] },
+        before,
+        after: {
+          status, mode: body.mode, lineCount: body.lines.length, poIds: [...poIdsTouched],
+          ...(posted ? { qcStatus: posted.qcStatus, heldForQc: posted.heldForQc } : {}),
+        },
       });
     });
 
@@ -1325,88 +1471,32 @@ router.post(
     const id = idParam(req);
 
     const result = await withTransaction(async (tx) => {
-      const grn = await txQueryOne<{ grn_no: string; status: GrnStatus; grn_date: string; supplier_id: number }>(
-        tx, 'SELECT grn_no, status, grn_date, supplier_id FROM grn_headers WHERE id = $1 FOR UPDATE', [id],
+      const grn = await txQueryOne<{ grn_no: string; status: GrnStatus }>(
+        tx, 'SELECT grn_no, status FROM grn_headers WHERE id = $1 FOR UPDATE', [id],
       );
       if (!grn) throw NotFoundError('GRN');
       assertNotAlready('GRN', grn.grn_no, grn.status, 'POSTED');
       assertGrnTransition(grn.status, 'POSTED');
 
-      const lines = await txQuery<{
-        id: number; po_line_id: number | null; grn_qty: string; item_code: string;
-        item_id: number; accepted_qty: string | null; uom_id: number | null; batch_no: string; receipt_location: string;
-        item_description: string; qc_required: boolean;
-      }>(
-        tx,
-        `SELECT gl.id, gl.po_line_id, gl.grn_qty, gl.item_code, gl.item_id, gl.accepted_qty,
-                gl.uom_id, gl.batch_no, gl.receipt_location, gl.item_description,
-                COALESCE(i.qc_required, FALSE) AS qc_required
-           FROM grn_lines gl
-           LEFT JOIN items i ON i.id = gl.item_id
-          WHERE gl.grn_id = $1 ORDER BY gl.line_no`,
-        [id],
-      );
-      if (lines.length === 0) throw BusinessRuleError('Add at least one line before posting this GRN.');
-
-      // Re-validate EVERY PO-based line against the live balance at post time.
-      const poIdsTouched = new Set<number>();
-      for (const line of lines) {
-        if (line.po_line_id == null) continue;
-        const balance = await lockPoLineBalance(tx, line.po_line_id);
-        assertGrnReceiptAllowed(balance, line.grn_qty, '0');
-        poIdsTouched.add(Number(balance.po_id));
-      }
-
-      const linesRequiringQc = lines.filter((l) => l.qc_required);
-      const linesWithoutQc = lines.filter((l) => !l.qc_required);
-      const initialQcStatus = linesRequiringQc.length > 0 ? 'PENDING_QC' : 'NOT_APPLICABLE';
-
-      await tx.query(
-        `UPDATE grn_headers
-            SET status = 'POSTED', qc_status = $3, posted_at = now(), posted_by = $2, updated_at = now(), updated_by = $2
-          WHERE id = $1`,
-        [id, req.user!.id, initialQcStatus],
-      );
-      const poStatuses: string[] = [];
-      for (const poId of poIdsTouched) poStatuses.push(await recomputePoStatus(tx, poId));
-
-      if (linesWithoutQc.length > 0) {
-        await inwardAllLines(tx, linesWithoutQc, {
-          grnId: id, grnNo: grn.grn_no, grnDate: toDateOnly(grn.grn_date),
-          supplierId: grn.supplier_id, userId: req.user!.id,
-        });
-      }
-
-      const supplierRow = await txQueryOne<{ supplier_name: string }>(
-        tx, 'SELECT supplier_name FROM suppliers WHERE id = $1', [grn.supplier_id],
-      );
-      for (const qcLine of linesRequiringQc) {
-        await tx.query(
-          `INSERT INTO qc_inspections
-             (grn_id, grn_line_id, grn_no, item_id, item_code, item_name, supplier_id, supplier_name,
-              received_qty, accepted_qty, rejected_qty, uom_id, uom_code, status, remarks)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,$10,'','PENDING_QC','Awaiting quality inspection')`,
-          [
-            id, qcLine.id, grn.grn_no, qcLine.item_id, qcLine.item_code, qcLine.item_description,
-            grn.supplier_id, supplierRow?.supplier_name ?? '', qcLine.grn_qty, qcLine.uom_id,
-          ],
-        );
-      }
+      const posted = await postGrn(tx, id, req.user!.id);
 
       await auditIn(tx, {
         actor: actorFrom(req), action: 'POST', entity: 'grn', entityId: id,
         entityLabel: grn.grn_no, before: { status: grn.status },
-        after: { status: 'POSTED', poIds: [...poIdsTouched], poStatuses },
+        after: {
+          status: 'POSTED', poIds: posted.poIds, poStatuses: posted.poStatuses,
+          qcStatus: posted.qcStatus, heldForQc: posted.heldForQc,
+        },
       });
 
-      return { grnNo: grn.grn_no, poStatuses };
+      return { grnNo: grn.grn_no, poStatuses: posted.poStatuses, qcStatus: posted.qcStatus, heldForQc: posted.heldForQc };
     });
 
     sendOk(res, {
       ...result,
-      message: result.poStatuses.length > 0
+      message: (result.poStatuses.length > 0
         ? `GRN ${result.grnNo} has been posted. Purchase order status: ${result.poStatuses.map((s) => s.replace(/_/g, ' ').toLowerCase()).join(', ')}.`
-        : `GRN ${result.grnNo} has been posted.`,
+        : `GRN ${result.grnNo} has been posted.`) + qcHoldNote(result.heldForQc),
     });
   }),
 );
@@ -1443,7 +1533,7 @@ router.post(
       }>(
         tx,
         `SELECT id, po_line_id, item_id, item_code, grn_qty, accepted_qty, uom_id, batch_no, receipt_location
-           FROM grn_lines WHERE grn_id = $1`,
+           FROM grn_lines WHERE grn_id = $1 ORDER BY line_no`,
         [id],
       );
       const poIdsTouched = new Set<number>();
@@ -1455,14 +1545,22 @@ router.post(
         if (balance) poIdsTouched.add(Number(balance.po_id));
       }
 
-      // Same real relationship as the edit-lock (Section 4): reversing a
-      // posted receipt whose item is still issued against a Requisition
-      // would try to pull the pooled balance below what that Requisition
-      // relies on — refuse cleanly instead of letting the item's own nonneg
-      // stock constraint fail as a raw DB error. Issues that were reversed
-      // gave their stock back and no longer count.
-      if (grn.status === 'POSTED') {
-        for (const l of lines) {
+      // Only what the receipt actually put into stock comes back out. A line
+      // held for quality inspection put in nothing, or only what QC released;
+      // cancelling used to take every line's received quantity out, including
+      // stock that had never come in (A7 F04). A DRAFT never moved stock or
+      // issued an MLN at all (Part 2/6/8).
+      const inStock = wasPosted ? await stockReceivedByGrnLine(tx, id) : new Map<number, string>();
+      const toReverse = lines.filter((l) => inStock.has(Number(l.id))).map((l) => ({ line: l, qty: inStock.get(Number(l.id))! }));
+
+      if (wasPosted) {
+        // Same real relationship as the edit-lock (Section 4): reversing a
+        // posted receipt whose item is still issued against a Requisition
+        // would try to pull the pooled balance below what that Requisition
+        // relies on — refuse cleanly instead of letting the item's own nonneg
+        // stock constraint fail as a raw DB error. Issues that were reversed
+        // gave their stock back and no longer count.
+        for (const { line: l } of toReverse) {
           const consumed = await hasRequisitionConsumption(tx, l.item_id);
           if (consumed) {
             throw BusinessRuleError(
@@ -1473,6 +1571,9 @@ router.post(
             );
           }
         }
+        // Stock that left another way (a direct issue, an adjustment, a sheet
+        // sync) is checked here too, before anything is written.
+        await assertGrnCancelCovered(tx, grn.grn_no, toReverse.map(({ line, qty }) => ({ item_id: line.item_id, qty })));
       }
 
       await tx.query(
@@ -1489,33 +1590,45 @@ router.post(
       const poStatuses: string[] = [];
       for (const poId of poIdsTouched) poStatuses.push(await recomputePoStatus(tx, poId));
 
-      // A DRAFT cancelled directly never moved stock or issued an MLN in the
-      // first place (Part 2/6/8) — only a POSTED receipt has anything to
-      // reverse. The MLN rows themselves are never deleted; their "cancelled"
-      // status is answered by joining to grn_headers.status, not erased here.
-      if (wasPosted) {
-        for (const l of lines) {
-          await reverseGrnLine(tx, l, {
-            grnId: id, grnNo: grn.grn_no, grnDate: toDateOnly(grn.grn_date),
-            supplierId: grn.supplier_id, userId: req.user!.id,
-          });
-        }
+      // The MLN rows themselves are never deleted; their "cancelled" status is
+      // answered by joining to grn_headers.status, not erased here.
+      for (const { line, qty } of toReverse) {
+        await reverseGrnLine(tx, line, qty, {
+          grnId: id, grnNo: grn.grn_no, grnDate: toDateOnly(grn.grn_date),
+          supplierId: grn.supplier_id, userId: req.user!.id,
+        });
       }
+
+      // Inspections still waiting for a decision are closed: none of their
+      // material is in stock, and a pass would add the stock of a receipt that
+      // no longer exists.
+      const qcInspectionsClosed = await closeOpenInspections(tx, id, `GRN cancelled: ${reason}`);
+      if (qcInspectionsClosed > 0) await refreshGrnQcStatus(tx, id);
 
       await auditIn(tx, {
         actor: actorFrom(req), action: 'CANCEL', entity: 'grn', entityId: id,
         entityLabel: grn.grn_no, before: { status: grn.status },
-        after: { status: 'CANCELLED', poIds: [...poIdsTouched], poStatuses, stockReversed: wasPosted }, message: reason,
+        after: {
+          status: 'CANCELLED', poIds: [...poIdsTouched], poStatuses, stockReversed: toReverse.length > 0,
+          linesReversed: toReverse.map(({ line, qty }) => ({ itemCode: line.item_code, qty })), qcInspectionsClosed,
+        },
+        message: reason,
       });
 
-      return { grnNo: grn.grn_no, poStatuses, wasPosted };
+      return { grnNo: grn.grn_no, poStatuses, wasPosted, linesReversed: toReverse.length, qcInspectionsClosed };
     });
 
+    const qcNote = result.qcInspectionsClosed > 0
+      ? ` ${result.qcInspectionsClosed} open quality inspection(s) were closed.`
+      : '';
     sendOk(res, {
       ...result,
-      message: result.wasPosted
-        ? `GRN ${result.grnNo} has been cancelled — its quantities returned to the purchase order balance and stock was reversed.`
-        : `Draft GRN ${result.grnNo} has been cancelled.`,
+      message: !result.wasPosted
+        ? `Draft GRN ${result.grnNo} has been cancelled.`
+        : result.linesReversed > 0
+          ? `GRN ${result.grnNo} has been cancelled — its quantities returned to the purchase order balance and stock was reversed.${qcNote}`
+          : `GRN ${result.grnNo} has been cancelled — its quantities returned to the purchase order balance. ` +
+            `None of its material had entered stock, so stock is unchanged.${qcNote}`,
     });
   }),
 );
@@ -1641,7 +1754,7 @@ router.get(
       });
 
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${doc.grn_no}.pdf"`);
+      res.setHeader('Content-Disposition', attachmentDisposition(doc.grn_no, 'pdf'));
       res.send(pdf);
     } finally {
       await browser.close();

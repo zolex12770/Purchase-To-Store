@@ -14,7 +14,11 @@
  *      (TRUST_PROXY values other than the default: trust-proxy.test.ts).
  *   6. Viewer's default is four view rights, and a restart never re-grants a
  *      right an administrator removed from it.
- *   7. The last active Super Admin can be neither deactivated nor demoted.
+ *   7. The route guards of 2026-10-16: printing a label needs grn.print, the GRN
+ *      analysis reports grn.analyze, queuing a replica reconcile sync.admin.
+ *   8. The User Master import changes a Super Admin account only for a Super Admin.
+ *   9. The last active Super Admin can be neither deactivated nor demoted, nor
+ *      deactivated by an import.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
@@ -401,7 +405,137 @@ describe('the Viewer role', () => {
   });
 });
 
-/* ── 7. The last active Super Admin (runs last: it deactivates the others) ──── */
+/* ── 7. Route guards on label printing, GRN analysis and replica reconcile ─── */
+
+describe('the rights moved on 2026-10-16', () => {
+  let labelId = 0;
+  const printCount = async () =>
+    Number((await query<{ n: string }>('SELECT print_count AS n FROM grn_line_mlns WHERE id = $1', [labelId]))[0]!.n);
+
+  beforeAll(async () => {
+    const uomId = (await request(app).get(api('/lookups/options')).set(auth(adminToken))).body.data.UOM[0].id;
+    const supplier = await request(app).post(api('/suppliers')).set(auth(adminToken))
+      .send({ supplierName: 'Security Guards Supplier Pvt Ltd', city: 'Pune', state: 'Maharashtra', paymentTerms: 'NET30' });
+    expect(supplier.status).toBe(201);
+    const item = await request(app).post(api('/items')).set(auth(adminToken))
+      .send({ itemCode: 'T-SEC-LABEL', itemDescription: 'Security label item', uomId, standardRate: '10' });
+    expect(item.status).toBe(201);
+    const grn = await request(app).post(api('/grn')).set(auth(adminToken)).send({
+      mode: 'DIRECT', supplierId: supplier.body.data.id, post: true,
+      lines: [{ itemId: item.body.data.id, grnQty: '2', rate: '10' }],
+    });
+    expect(grn.status).toBe(201);
+    labelId = Number((await request(app).get(api(`/grn/labels?grnId=${grn.body.data.id}`)).set(auth(adminToken))).body.data[0].id);
+
+    await createRole('T_SEC_GRN_VIEW', ['grn.view']);
+    await createRole('T_SEC_GRN_PRINT', ['grn.view', 'grn.print']);
+    await createRole('T_SEC_GRN_ANALYZE', ['grn.view', 'grn.analyze']);
+    await createRole('T_SEC_SYNC_VIEW', ['sync.view']);
+    await createRole('T_SEC_SYNC_ADMIN', ['sync.view', 'sync.admin']);
+    await createUser('T-SEC-GRNVIEW', ['T_SEC_GRN_VIEW']);
+    await createUser('T-SEC-GRNPRINT', ['T_SEC_GRN_PRINT']);
+    await createUser('T-SEC-GRNANALYZE', ['T_SEC_GRN_ANALYZE']);
+    await createUser('T-SEC-SYNCVIEW', ['T_SEC_SYNC_VIEW']);
+    await createUser('T-SEC-SYNCADMIN', ['T_SEC_SYNC_ADMIN']);
+  });
+
+  it('printing a label needs grn.print; a GRN viewer may preview it, and a refused print is not counted', async () => {
+    const viewer = (await signIn('T-SEC-GRNVIEW')).accessToken;
+    const printer = (await signIn('T-SEC-GRNPRINT')).accessToken;
+
+    expect((await request(app).get(api(`/grn/labels/print-view?ids=${labelId}`)).set(auth(viewer))).status).toBe(200);
+    expect((await request(app).post(api('/grn/labels/print')).set(auth(viewer)).send({ ids: [labelId] })).status).toBe(403);
+    expect((await request(app).get(api(`/grn/labels/pdf?ids=${labelId}`)).set(auth(viewer))).status).toBe(403);
+    expect(await printCount()).toBe(0);
+
+    expect((await request(app).get(api(`/grn/labels/pdf?ids=${labelId}`)).set(auth(printer))).status).toBe(200);
+    expect(await printCount()).toBe(0); // the PDF is not the print record (A7 F16)
+    expect((await request(app).post(api('/grn/labels/print')).set(auth(printer)).send({ ids: [labelId] })).status).toBe(200);
+    expect(await printCount()).toBe(1);
+  });
+
+  it('the GRN analysis reports need grn.analyze', async () => {
+    const viewer = (await signIn('T-SEC-GRNVIEW')).accessToken;
+    const analyst = (await signIn('T-SEC-GRNANALYZE')).accessToken;
+    for (const path of ['/grn/analysis/po-wise', '/grn/analysis/item-wise', '/grn/analysis/supplier-wise', '/grn/analysis/summary']) {
+      expect((await request(app).get(api(path)).set(auth(viewer))).status).toBe(403);
+      expect((await request(app).get(api(path)).set(auth(analyst))).status).toBe(200);
+    }
+  });
+
+  it('queuing a replica reconcile needs sync.admin', async () => {
+    const viewer = (await signIn('T-SEC-SYNCVIEW')).accessToken;
+    const syncAdmin = (await signIn('T-SEC-SYNCADMIN')).accessToken;
+    const reconcileJobs = async () =>
+      Number((await query<{ n: string }>(`SELECT COUNT(*) AS n FROM google_db_jobs WHERE kind = 'RECONCILE'`))[0]!.n);
+
+    const before = await reconcileJobs();
+    expect((await request(app).post(api('/google-db/reconcile')).set(auth(viewer)).send({})).status).toBe(403);
+    expect(await reconcileJobs()).toBe(before);
+
+    expect((await request(app).post(api('/google-db/reconcile')).set(auth(syncAdmin)).send({})).status).toBe(200);
+    expect(await reconcileJobs()).toBe(before + 1);
+    // No scheduler runs in a test; nothing is left queued either.
+    expect((await request(app).post(api('/google-db/cancel-job')).set(auth(syncAdmin)).send({})).status).toBe(200);
+    expect(await query(`SELECT id FROM google_db_jobs WHERE status IN ('QUEUED', 'RUNNING')`)).toEqual([]);
+  });
+});
+
+/* ── 8. The User Master import ─────────────────────────────────────────────── */
+
+describe('the User Master import', () => {
+  type Row = [employeeId: string, employeeName: string, designation: string];
+  let importer = '';
+  const csv = (rows: Row[]) => Buffer.from(['Employee ID,Employee Name,Designation', ...rows.map((r) => r.join(','))].join('\r\n'), 'utf8');
+  const preview = (token: string, rows: Row[]) =>
+    request(app).post(api('/io/import/users/preview')).set(auth(token)).attach('file', csv(rows), 'users.csv');
+  const commit = (token: string, jobId: number, mode: 'STRICT' | 'PARTIAL' = 'STRICT') =>
+    request(app).post(api(`/io/import/${jobId}/commit`)).set(auth(token)).send({ mode });
+  const nameOf = async (employeeId: string) =>
+    (await query<{ employee_name: string }>('SELECT employee_name FROM users WHERE employee_id = $1', [employeeId]))[0]!.employee_name;
+
+  beforeAll(async () => {
+    await createRole('T_SEC_IMPORT', ['user.view', 'user.import']);
+    await createUser('T-SEC-IMPORTER', ['T_SEC_IMPORT']);
+    await createUser('T-SEC-IMPORTED', ['EMPLOYEE']);
+    importer = (await signIn('T-SEC-IMPORTER')).accessToken;
+  });
+
+  it('refuses a Super Admin row to an importer who is not one, at preview and at commit', async () => {
+    const job = await preview(importer, [['T-SEC-SA2', 'Renamed by import', 'test'], ['T-SEC-IMPORTED', 'Imported rename', 'test']]);
+    expect(job.status).toBe(201);
+    expect(job.body.data).toMatchObject({ validRows: 1, invalidRows: 1, updateCount: 1 });
+    const refusedRow = (job.body.data.preview as { raw: Record<string, string>; status: string; action: string | null; errors: { message: string }[] }[])
+      .find((p) => p.raw['Employee ID'] === 'T-SEC-SA2')!;
+    expect(refusedRow).toMatchObject({ status: 'INVALID', action: null });
+    expect(refusedRow.errors[0]!.message).toMatch(/Super Admin account/);
+
+    expect((await commit(importer, job.body.data.jobId)).status).toBe(422); // STRICT: a row is invalid
+    const partial = await commit(importer, job.body.data.jobId, 'PARTIAL');
+    expect(partial.status).toBe(200);
+    expect(partial.body.data).toMatchObject({ updated: 1, skipped: 1 });
+    expect(await nameOf('T-SEC-SA2')).toBe('Security T-SEC-SA2');
+    expect(await nameOf('T-SEC-IMPORTED')).toBe('Imported rename');
+
+    // A preview a Super Admin made is refused when this importer commits it, and nothing is written.
+    const bySuperAdmin = await preview(adminToken, [['T-SEC-SA2', 'Renamed by import', 'test']]);
+    expect(bySuperAdmin.body.data).toMatchObject({ validRows: 1, invalidRows: 0 });
+    const hijack = await commit(importer, bySuperAdmin.body.data.jobId);
+    expect(hijack.status).toBe(403);
+    expect(hijack.body.error.message).toMatch(/Super Admin/);
+    expect(await nameOf('T-SEC-SA2')).toBe('Security T-SEC-SA2');
+  });
+
+  it('lets a Super Admin change a Super Admin account', async () => {
+    const job = await preview(adminToken, [['T-SEC-SA2', 'Security T-SEC-SA2', 'Imported designation']]);
+    expect(job.status).toBe(201);
+    expect((await commit(adminToken, job.body.data.jobId)).status).toBe(200);
+    expect((await query<{ designation: string }>(`SELECT designation FROM users WHERE employee_id = 'T-SEC-SA2'`))[0]!.designation)
+      .toBe('Imported designation');
+  });
+});
+
+/* ── 9. The last active Super Admin (runs last: it deactivates the others) ──── */
 
 describe('the last active Super Admin', () => {
   it('can be neither deactivated nor demoted', async () => {
@@ -440,5 +574,36 @@ describe('the last active Super Admin', () => {
       .send({ entity: 'users', ids: supers.map((s) => Number(s.id)), isActive: true });
     expect(reactivated.status).toBe(200);
     await expect(assertActiveSuperAdminRemains(undefined, [adminUserId])).resolves.toBeUndefined();
+  });
+
+  it('is not deactivated by a User Master import of its own row', async () => {
+    const others = await query<{ id: string }>(
+      `SELECT u.id FROM users u
+         JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id
+        WHERE r.code = 'SUPER_ADMIN' AND u.is_active AND u.deleted_at IS NULL AND u.id <> $1`,
+      [adminUserId],
+    );
+    for (const other of others) {
+      expect((await request(app).delete(api(`/users/${other.id}`)).set(auth(adminToken))).status).toBe(200);
+    }
+    // 10221 is the only active Super Admin. The import writes Employee ID, Name and
+    // Designation only; activation stays an ERP decision.
+    const name = (await query<{ employee_name: string }>('SELECT employee_name FROM users WHERE id = $1', [adminUserId]))[0]!.employee_name;
+    const job = await request(app).post(api('/io/import/users/preview')).set(auth(adminToken))
+      .attach('file', Buffer.from(`Employee ID,Employee Name,Designation\r\n10221,${name},Imported\r\n`, 'utf8'), 'users.csv');
+    expect(job.status).toBe(201);
+    expect(job.body.data).toMatchObject({ validRows: 1, updateCount: 1 });
+    expect((await request(app).post(api(`/io/import/${job.body.data.jobId}/commit`)).set(auth(adminToken)).send({})).status).toBe(200);
+
+    const row = (await query<{ is_active: boolean; deleted_at: string | null; designation: string }>(
+      'SELECT is_active, deleted_at, designation FROM users WHERE id = $1', [adminUserId],
+    ))[0]!;
+    expect(row).toEqual({ is_active: true, deleted_at: null, designation: 'Imported' });
+    expect((await request(app).get(api('/auth/me')).set(auth(adminToken))).body.data.roles).toContain('SUPER_ADMIN');
+    await signIn('10221', BOOTSTRAP_PASSWORD);
+
+    const reactivated = await request(app).post(api('/admin/data-management/bulk-toggle-active')).set(auth(adminToken))
+      .send({ entity: 'users', ids: others.map((o) => Number(o.id)), isActive: true });
+    expect(reactivated.status).toBe(200);
   });
 });

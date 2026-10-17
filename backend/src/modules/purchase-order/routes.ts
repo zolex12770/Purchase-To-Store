@@ -20,7 +20,7 @@ import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } fro
 import { renderPoDocumentHtml, type PoDocumentData } from './po-document.js';
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery,
-  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray,
+  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray, attachmentDisposition,
 } from '../../core/http.js';
 import { NotFoundError, BusinessRuleError, ValidationError, AuthorizationError } from '../../core/errors.js';
 import { requirePermission, hasPermission } from '../../auth/middleware.js';
@@ -375,7 +375,8 @@ router.get(
       });
 
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${doc.po_no}.pdf"`);
+      // Imported PO numbers carry slashes (Z/PM/00368): see attachmentDisposition.
+      res.setHeader('Content-Disposition', attachmentDisposition(doc.po_no, 'pdf'));
       res.send(pdf);
     } finally {
       await browser.close();

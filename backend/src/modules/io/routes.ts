@@ -23,6 +23,7 @@ import { DATASETS, DATASET_KEYS, type DatasetFilters, type ColumnDef } from './d
 import { env } from '../../config/env.js';
 import { parseNumericInput, toRate } from '../../domain/money.js';
 import { logger } from '../../core/logger.js';
+import { assertMayChangeUsers, superAdminsAmong } from '../admin/super-admin-guard.js';
 
 const router = Router();
 
@@ -277,6 +278,10 @@ const IMPORT_ENTITIES: Record<string, ImportEntity> = {
       { field: 'currency_code', headers: ['Currency'], maxLength: 10 },
     ],
   },
+  // Profile columns only. Activation, roles and passwords stay ERP decisions,
+  // as in the User Master sheet sync, so an import can never deactivate an
+  // account — the last active Super Admin included (super-admin-guard.ts).
+  // A new account is created inactive (see the commit below).
   users: {
     key: 'users', title: 'User Master', permission: 'user.import',
     table: 'users', keyField: 'employee_id',
@@ -496,6 +501,31 @@ router.post(
       });
     }
 
+    // Only a Super Admin may change a Super Admin account (super-admin-guard.ts).
+    // This import updates every matched account by Employee ID, so a user
+    // administrator who is not one could rename or re-designate the Super Admin,
+    // which the Users screen refuses (security review, 2026-10-16). The row is
+    // refused here, and the commit checks again.
+    if (entity.key === 'users' && !req.user!.isSuperAdmin) {
+      const updates = parsed.filter((p) => p.action === 'UPDATE');
+      const keyOf = (p: { data: Record<string, unknown> }) => String(p.data[entity.keyField] ?? '').toLowerCase().trim();
+      const matched = updates.length === 0 ? [] : await query<{ id: number; k: string }>(
+        'SELECT id, lower(employee_id) AS k FROM users WHERE deleted_at IS NULL AND lower(employee_id) = ANY($1::text[])',
+        [updates.map(keyOf)],
+      );
+      const supers = new Set(await superAdminsAmong(undefined, matched.map((m) => Number(m.id))));
+      const superKeys = new Set(matched.filter((m) => supers.has(Number(m.id))).map((m) => m.k.trim()));
+      for (const p of updates) {
+        if (!superKeys.has(keyOf(p))) continue;
+        p.errors.push({
+          field: entity.fields.find((f) => f.field === entity.keyField)!.headers[0]!,
+          message: 'This is a Super Admin account. Only a Super Admin can change it.',
+        });
+        p.status = 'INVALID';
+        p.action = null;
+      }
+    }
+
     const validCount = parsed.filter((p) => p.status === 'VALID').length;
 
     // The preview is persisted so "confirm" commits exactly what was reviewed —
@@ -660,6 +690,21 @@ router.post(
         "SELECT id, row_number, action, parsed_data FROM import_rows WHERE job_id = $1 AND status = 'VALID' ORDER BY row_number",
         [id],
       );
+
+      // Checked again where the rows are written: an account may have become a
+      // Super Admin since the preview, and a preview a Super Admin made can be
+      // committed by another administrator.
+      if (entity.key === 'users') {
+        const keys = rows
+          .filter((r) => r.action === 'UPDATE')
+          .map((r) => String((r.parsed_data ?? {})[entity.keyField] ?? '').toLowerCase().trim());
+        if (keys.length > 0) {
+          const targets = await txQuery<{ id: number }>(
+            tx, 'SELECT id FROM users WHERE deleted_at IS NULL AND lower(employee_id) = ANY($1::text[])', [keys],
+          );
+          await assertMayChangeUsers(tx, req, targets.map((t) => Number(t.id)));
+        }
+      }
 
       let inserted = 0;
       let updated = 0;

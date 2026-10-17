@@ -58,8 +58,9 @@ function labelStatus(r: LabelRow): { label: string; tone: 'success' | 'warning' 
 export default function GrnLabels() {
   const toast = useToast();
   const { can } = useAuth();
-  // Printing and the PDF count as prints (the lot's print count moves), so the
-  // server asks for grn.print; previewing needs only the view right.
+  // Printing and the PDF need grn.print, and both record the print (the lot's
+  // print count moves) through POST /grn/labels/print; previewing needs only
+  // the view right.
   const canPrint = can('grn.print');
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -170,12 +171,21 @@ export default function GrnLabels() {
 
   const downloadPdf = async () => {
     if (selectedIds.length === 0) return;
+    const ids = [...selectedIds];
     setDownloading(true);
     try {
-      await downloadFile(`/grn/labels/pdf?ids=${selectedIds.join(',')}`, `grn-labels-${Date.now()}.pdf`);
-      void list.refetch();
+      await downloadFile(`/grn/labels/pdf?ids=${ids.join(',')}`, `grn-labels-${Date.now()}.pdf`);
     } catch (err) {
       toast.fromError(err, 'Could not download the label PDF');
+      setDownloading(false);
+      return;
+    }
+    // The PDF itself no longer counts as a print (a GET must not change data):
+    // the print is recorded here, once the file has arrived, like the browser print.
+    try {
+      await registerPrint.mutateAsync(ids);
+    } catch {
+      // registerPrint's own onError has told the user.
     } finally {
       setDownloading(false);
     }

@@ -12,7 +12,7 @@
  * different numbers, with no risk of the duplicate-under-concurrency failure
  * a hand-rolled counter row would need extra locking to avoid.
  */
-import { txQueryOne, type Queryable } from '../db/index.js';
+import { txQuery, txQueryOne, type Queryable } from '../db/index.js';
 import { dec, toQty } from './money.js';
 import { BusinessRuleError } from '../core/errors.js';
 
@@ -169,9 +169,73 @@ export async function inwardGrnLine(
 }
 
 /**
+ * What each line of a GRN actually put into stock: the net of its GRN ledger
+ * entries (the inward at posting or at QC release, plus any later correction).
+ * Not `usableQtyOf`: a line held for quality inspection put in nothing until QC
+ * passed it, and then only what QC accepted, so its received quantity says
+ * nothing about stock (A7 F04). Lines that put nothing in are absent.
+ */
+export async function stockReceivedByGrnLine(tx: Queryable, grnId: number): Promise<Map<number, string>> {
+  const rows = await txQuery<{ grn_line_id: number; qty: string }>(
+    tx,
+    `SELECT grn_line_id, SUM(inward_qty - outward_qty) AS qty
+       FROM stock_ledger
+      WHERE reference_type = 'GRN' AND reference_id = $1 AND grn_line_id IS NOT NULL
+      GROUP BY grn_line_id
+     HAVING SUM(inward_qty - outward_qty) > 0`,
+    [grnId],
+  );
+  return new Map(rows.map((r) => [Number(r.grn_line_id), toQty(r.qty)]));
+}
+
+/**
+ * Refuses a GRN cancel, before anything is written, when an item no longer has
+ * the stock the cancel would take back out. The received stock can have left
+ * through a direct issue, a count adjustment or an inventory-sheet sync, none of
+ * which the requisition guard sees; the cancel then used to fail half-way on
+ * chk_items_live_stock_nonneg with a bare data-rule error (A7 F04). Lines of
+ * the same item are added up, and the item rows stay locked for the reversal.
+ */
+export async function assertGrnCancelCovered(
+  tx: Queryable,
+  grnNo: string,
+  lines: { item_id: number; qty: string }[],
+): Promise<void> {
+  const needed = new Map<number, ReturnType<typeof dec>>();
+  for (const l of lines) needed.set(Number(l.item_id), (needed.get(Number(l.item_id)) ?? dec(0)).plus(dec(l.qty)));
+  if (needed.size === 0) return;
+
+  const items = await txQuery<{ id: number; item_code: string; live_stock_qty: string }>(
+    tx,
+    'SELECT id, item_code, live_stock_qty FROM items WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE',
+    [[...needed.keys()]],
+  );
+  const short = items
+    .map((i) => ({ itemCode: i.item_code, inStock: dec(i.live_stock_qty), takesOut: needed.get(Number(i.id))! }))
+    .filter((i) => i.inStock.lessThan(i.takesOut));
+  if (short.length === 0) return;
+
+  const first = short[0]!;
+  throw BusinessRuleError(
+    `${grnNo} cannot be cancelled: it would take ${toQty(first.takesOut)} of ${first.itemCode} back out of stock, ` +
+    `but only ${toQty(first.inStock)} is in stock now, so the stock would go below zero. ` +
+    `Part of this receipt has already left the store (an issue, an adjustment or a stock sync). ` +
+    `Bring that stock back first, or correct the GRN's details instead of cancelling it.` +
+    (short.length > 1 ? ` ${short.length - 1} more item(s) on this GRN are short as well.` : ''),
+    {
+      items: short.map((s) => ({
+        itemCode: s.itemCode, inStock: toQty(s.inStock), cancelTakesOut: toQty(s.takesOut),
+        shortBy: toQty(s.takesOut.minus(s.inStock)),
+      })),
+    },
+  );
+}
+
+/**
  * Reverses a previously-posted GRN line's stock inward on cancellation
- * (Part 8) — subtracts exactly the same usable quantity that was added, so a
- * cancel-right-after-post always returns the item to its pre-receipt balance.
+ * (Part 8) — takes out exactly `qty`, what the line put in
+ * (`stockReceivedByGrnLine`), so a cancel-right-after-post always returns the
+ * item to its pre-receipt balance.
  * The MLN itself is NEVER deleted (Part 2: immutable once issued) — its
  * "still active" status is answered by joining to grn_headers.status, not by
  * any column on grn_line_mlns.
@@ -179,6 +243,7 @@ export async function inwardGrnLine(
 export async function reverseGrnLine(
   tx: Queryable,
   line: GrnLineForStock,
+  qty: string,
   ctx: { grnId: number; grnNo: string; grnDate: string; supplierId: number | null; userId: number | null },
 ): Promise<{ newBalance: string }> {
   const item = await txQueryOne<{ id: number; item_code: string; live_stock_qty: string }>(
@@ -186,11 +251,10 @@ export async function reverseGrnLine(
   );
   if (!item) throw new Error(`Item ${line.item_id} not found while reversing stock inward.`);
 
-  const usable = usableQtyOf(line);
+  const usable = toQty(qty);
   const after = dec(item.live_stock_qty).minus(dec(usable));
-  // Only requisition consumption is checked before a cancel; the received stock
-  // may also have left through a direct issue or an adjustment since. Refuse in
-  // words rather than tripping chk_items_live_stock_nonneg as a bare data-rule error.
+  // assertGrnCancelCovered has refused this already; kept so no caller can trip
+  // chk_items_live_stock_nonneg as a bare data-rule error.
   if (after.isNegative()) {
     throw BusinessRuleError(
       `Cancelling ${ctx.grnNo} would take ${item.item_code}'s stock below zero ` +

@@ -205,4 +205,24 @@ export function toKolkataEndOfDay(dateStr: string): string {
   return `${dateStr}T23:59:59.999+05:30`;
 }
 
+/**
+ * `Content-Disposition` for a download named after a document number.
+ *
+ * The PO register import of 2026-10-16 brought 2,003 purchase orders numbered
+ * like Z/PM/00368, and the PDF went out as filename="Z/PM/00368.pdf": a slash is
+ * a folder separator to the browser, and a quote would end the value early. Path
+ * and reserved characters become hyphens, quotes are dropped, and anything a
+ * header cannot carry (control characters, non-ASCII) is replaced, so
+ * Z/PM/00368 is saved as Z-PM-00368.pdf.
+ */
+export function attachmentDisposition(name: string, extension: string): string {
+  const safe = name
+    .replace(/["'`]/g, '')
+    .replace(/[\\/:*?<>|%]|[^\x20-\x7e]/g, '-')
+    .replace(/\s+/g, ' ')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[\s.-]+|[\s.-]+$/g, '');
+  return `attachment; filename="${safe || 'document'}.${extension}"`;
+}
+
 export { AppError };
