@@ -18,12 +18,19 @@
  *      filter; its export holds exactly the rows the list shows.
  *   4. GET /purchase-orders/:id lists the receipts awaiting link with the reason in
  *      words; GET /purchase-orders/receipt-evidence/summary splits the pending POs so
- *      that the two parts add up to the pending list's totals, which equal the
+ *      that the parts add up to the pending list's totals, which equal the
  *      dashboard's Pending POs and Pending PO Value; PO view permission is needed.
  *   5. A receipt linked since, or a GRN cancelled since, no longer counts.
+ *   6. Receipts on the store's GRN sheet only (the GRN tab lines the business-sheet sync
+ *      keeps open as MISSING_IN_ERP, as of the latest finished sync): a third class
+ *      after 'awaiting link' and before 'none recorded'; the three add up to pending;
+ *      the filter, its export, the list's count and the PO screen; a line the latest
+ *      run no longer reports, one an administrator resolved, and one of a run still in
+ *      progress do not count; one first recorded by an older run and still reported does.
  *
  * Real PGlite database, migrated and seeded from scratch. The GRN tab is a grid handed
- * to the app in place of the Google read (app.locals.storeGrnTabReader).
+ * to the app in place of the Google read (app.locals.storeGrnTabReader), and to the
+ * sync engine's own run (runSync's reader).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
@@ -352,14 +359,19 @@ describe('Store receipts awaiting link — the PO list, its export and the PO sc
     expect(pending).toEqual(['Z/RE/00002', 'Z/RE/00003', 'Z/RE/00004', 'Z/RE/00005', 'Z/RE/00006', 'Z/RE/00007', 'Z/RE/00008',
       'Z/RE/00009', 'Z/RE/00011', 'Z/RE/00013', 'Z/RE/00014']);
     const awaiting = await listNos({ view: 'pending', receiptEvidence: 'awaiting_link' });
+    const sheet = await listNos({ view: 'pending', receiptEvidence: 'sheet_only' });
     const none = await listNos({ view: 'pending', receiptEvidence: 'none_recorded' });
     expect(awaiting).toEqual(['Z/RE/00003', 'Z/RE/00004', 'Z/RE/00005', 'Z/RE/00006', 'Z/RE/00007', 'Z/RE/00009', 'Z/RE/00011', 'Z/RE/00013']);
+    expect(sheet).toEqual([]);
     expect(none).toEqual(['Z/RE/00002', 'Z/RE/00008', 'Z/RE/00014']);
-    expect([...awaiting, ...none].sort()).toEqual(pending);
-    // With a supplier filter, and with a search.
+    expect([...awaiting, ...sheet, ...none].sort()).toEqual(pending);
+    // With a supplier filter, a search, an item (which selects lines) and the Complete view.
     expect(await listNos({ view: 'pending', receiptEvidence: 'awaiting_link', supplierId: sup.S3! })).toEqual(['Z/RE/00013']);
     expect(await listNos({ view: 'pending', receiptEvidence: 'none_recorded', supplierId: sup.S3! })).toEqual(['Z/RE/00014']);
     expect(await listNos({ view: 'pending', receiptEvidence: 'awaiting_link', search: 'RE-M' })).toEqual(['Z/RE/00009']);
+    expect(await listNos({ view: 'pending', receiptEvidence: 'awaiting_link', itemId: items['RE-C']! })).toEqual(['Z/RE/00003', 'Z/RE/00004']);
+    expect(await listNos({ view: 'pending', receiptEvidence: 'none_recorded', itemId: items['RE-C']! })).toEqual([]);
+    expect(await listNos({ view: 'complete', receiptEvidence: 'none_recorded' })).toEqual(['Z/RE/00001', 'Z/RE/00010']);
     // The cancelled PO is flagged in the full list but is not pending.
     expect(await listNos({ receiptEvidence: 'awaiting_link', status: 'CANCELLED' })).toEqual(['Z/RE/00012']);
     // The list's totals follow the filter.
@@ -384,7 +396,7 @@ describe('Store receipts awaiting link — the PO list, its export and the PO sc
     const res = await request(app).get(api('/io/export/purchase-orders')).query({ format: 'csv', view: 'pending', receiptEvidence: 'awaiting_link' })
       .set(auth(adminToken));
     expect(res.text).toMatch(/View: pending {2}· {2}Store receipt awaiting link/);
-    expect(res.text.split('\r\n').find((l) => l.startsWith('Z/RE/00006,'))).toMatch(/,2$/);
+    expect(res.text.split('\r\n').find((l) => l.startsWith('Z/RE/00006,'))).toMatch(/,2,0$/);
   });
 
   it('lists the receipts awaiting link on the PO screen, the reason in words', async () => {
@@ -414,16 +426,18 @@ describe('Store receipts awaiting link — the PO list, its export and the PO sc
 });
 
 describe('Store receipts awaiting link — the summary', () => {
-  it('splits the pending POs into two parts that add up to the pending list, the dashboard\'s figures', async () => {
+  it('splits the pending POs into parts that add up to the pending list, the dashboard\'s figures', async () => {
     const s = await summary();
     expect(s.asOf).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(s.runId).toMatch(/^[0-9a-f-]{36}$/);
     expect(s.pending.pos).toBe(11);
     expect(s.awaitingLink).toMatchObject({ pos: 8, receiptLines: 8 });
+    // No sync of the business sheet has run, so nothing is on the store sheet only.
+    expect(s.sheetOnly).toEqual({ pos: 0, value: '0', receiptLines: 0, asOf: null, jobId: null });
     expect(s.noneRecorded.pos).toBe(3);
     expect([cents(s.pending.value), cents(s.awaitingLink.value), cents(s.noneRecorded.value)]).toEqual([730000, 570000, 160000]);
-    expect(s.awaitingLink.pos + s.noneRecorded.pos).toBe(s.pending.pos);
-    expect(cents(s.awaitingLink.value) + cents(s.noneRecorded.value)).toBe(cents(s.pending.value));
+    expect(s.awaitingLink.pos + s.sheetOnly.pos + s.noneRecorded.pos).toBe(s.pending.pos);
+    expect(cents(s.awaitingLink.value) + cents(s.sheetOnly.value) + cents(s.noneRecorded.value)).toBe(cents(s.pending.value));
     expect(s.awaitingLink.byReason).toEqual({
       EXCLUDED: 0, NOT_ON_TAB: 0, NO_PO_NAMED: 0, SEVERAL_POS: 2, PO_NOT_IN_ERP: 0, PO_NOT_RECEIVABLE: 0, ITEM_NOT_ON_PO: 1,
       SEVERAL_PO_LINES: 1, SUPPLIER_MISMATCH: 1, PO_AFTER_RECEIPT: 1, OVER_RECEIPT: 1, GRN_PARTLY_HELD: 1, UNDONE: 0,
@@ -437,9 +451,9 @@ describe('Store receipts awaiting link — the summary', () => {
     expect(cents(s.pending.value)).toBe(cents(await kpi('po_pending_value')));
   });
 
-  it('applies the list\'s filters to all three', async () => {
+  it('applies the list\'s filters to the whole and its parts', async () => {
     const s = await summary({ supplierId: sup.S3! });
-    expect([s.pending.pos, s.awaitingLink.pos, s.noneRecorded.pos]).toEqual([2, 1, 1]);
+    expect([s.pending.pos, s.awaitingLink.pos, s.sheetOnly.pos, s.noneRecorded.pos]).toEqual([2, 1, 0, 1]);
     expect([cents(s.awaitingLink.value), cents(s.noneRecorded.value)]).toEqual([50000, 50000]);
     expect(s.awaitingLink.byReason.SEVERAL_POS).toBe(1);
   });
@@ -509,6 +523,145 @@ describe('Store receipts awaiting link — undo, a later apply, and receipts tha
   });
 });
 
+describe('Receipts on the store sheet only — GRN tab lines the sync keeps open as missing in the ERP', () => {
+  // The business-sheet sync's own run of the GRN tab (google-sync/engine.ts), with the
+  // tab handed to it: a GRN number the ERP lacks is kept open as a MISSING_IN_ERP
+  // conflict naming the PO, and a row without a GRN number is compared by PO and item.
+  const sheetSync = async (tab: string[][]) => (await import('../modules/google-sync/engine.js'))
+    .runSync({ trigger: 'SCHEDULED', sheets: ['GRN'], reader: async (sheet: string) => (sheet === 'GRN' ? tab : []) });
+  const firstRun = [
+    HEADER,
+    row('ZG/RE/0101', 'RE-B', '3', 'Z/RE/00002'), // row 2: Z/RE/00002, nothing else recorded
+    row('ZG/RE/0102', 'RE-L', '2', ' z/re/00008 '), // row 3: Z/RE/00008, named in lower case
+    row('', 'RE-L', '1', 'Z/RE/00008'), // row 4: no GRN number, compared by PO and item
+    row('ZG/RE/0103', 'RE-C', '1', 'Z/RE/00003'), // row 5: Z/RE/00003 also awaits a link: counted there
+    row('ZG/RE/0105', 'RE-S', '5', 'Z/RE/00014'), // row 6: an administrator resolves it
+    row('ZG/RE/0104', 'RE-K', '1', 'Z/RE/00007'), // row 7: off the tab by the next run
+  ];
+  const jobs: number[] = [];
+  type SheetRow = { po_no: string; store_sheet_receipts: number; store_receipts_awaiting_link: number };
+  const sheetCounts = async () => Object.fromEntries(((await list({})).data as unknown as SheetRow[])
+    .filter((r) => r.store_sheet_receipts > 0).map((r) => [r.po_no, r.store_sheet_receipts]));
+
+  it('counts the lines the latest finished run reports, also those an older run first recorded', async () => {
+    jobs.push((await sheetSync(firstRun)).jobId);
+    const second = await sheetSync(firstRun.slice(0, -1));
+    jobs.push(second.jobId);
+    expect(second.sheets[0]!.conflicts).toBe(5);
+    // The engine records a line once: the second run inserted none and closed the one it no longer saw.
+    const open = await query<{ job_id: number; business_key: string }>(
+      `SELECT job_id::int AS job_id, business_key FROM google_sync_errors
+        WHERE sheet_name = 'GRN' AND error_code = 'MISSING_IN_ERP' AND resolved_at IS NULL ORDER BY row_number`,
+    );
+    expect(open.map((o) => [o.job_id, o.business_key])).toEqual([
+      [jobs[0], 'ZG/RE/0101 / RE-B'], [jobs[0], 'ZG/RE/0102 / RE-L'], [jobs[0], 'Z/RE/00008 / RE-L'],
+      [jobs[0], 'ZG/RE/0103 / RE-C'], [jobs[0], 'ZG/RE/0105 / RE-S'],
+    ]);
+    expect(await sheetCounts()).toEqual({ 'Z/RE/00002': 1, 'Z/RE/00003': 1, 'Z/RE/00008': 2, 'Z/RE/00014': 1 });
+  });
+
+  it('ignores a line the latest run no longer reports, and one an administrator resolved', async () => {
+    const [gone] = await query<{ resolution: string }>(
+      `SELECT resolution FROM google_sync_errors WHERE sheet_name = 'GRN' AND business_key = 'ZG/RE/0104 / RE-K'`,
+    );
+    expect(gone!.resolution).toBe(`No longer reported by sync run #${jobs[1]}: the sheet row or the ERP record has changed.`);
+    const [issue] = await query<{ id: number }>(
+      `SELECT id FROM google_sync_errors WHERE sheet_name = 'GRN' AND business_key = 'ZG/RE/0105 / RE-S' AND resolved_at IS NULL`,
+    );
+    const resolved = await request(app).post(api(`/google-sync/issues/${issue!.id}/resolve`)).set(auth(adminToken))
+      .send({ resolution: 'Store says ZG/RE/0105 was entered on the wrong tab' });
+    expect(resolved.status).toBe(200);
+    expect(await sheetCounts()).toEqual({ 'Z/RE/00002': 1, 'Z/RE/00003': 1, 'Z/RE/00008': 2 });
+    expect(await listNos({ view: 'pending', receiptEvidence: 'none_recorded' })).toEqual(['Z/RE/00007', 'Z/RE/00014']);
+  });
+
+  it('puts a PO in one class only: awaiting link before store sheet only before none recorded', async () => {
+    const pending = await listNos({ view: 'pending' });
+    const awaiting = await listNos({ view: 'pending', receiptEvidence: 'awaiting_link' });
+    const sheet = await listNos({ view: 'pending', receiptEvidence: 'sheet_only' });
+    const none = await listNos({ view: 'pending', receiptEvidence: 'none_recorded' });
+    // Z/RE/00003 has a receipt awaiting link and one on the sheet only: it is counted once, as awaiting link.
+    expect(awaiting).toEqual(['Z/RE/00003', 'Z/RE/00004', 'Z/RE/00005', 'Z/RE/00006', 'Z/RE/00009', 'Z/RE/00011', 'Z/RE/00013']);
+    expect(sheet).toEqual(['Z/RE/00002', 'Z/RE/00008']);
+    expect(none).toEqual(['Z/RE/00007', 'Z/RE/00014']);
+    expect([...awaiting, ...sheet, ...none].sort()).toEqual(pending);
+    expect(new Set([...awaiting, ...sheet, ...none]).size).toBe(pending.length);
+    // With other filters: a supplier, and an item, which selects lines.
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only', supplierId: sup.S1! })).toEqual(['Z/RE/00002', 'Z/RE/00008']);
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only', itemId: items['RE-L']! })).toEqual(['Z/RE/00008']);
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only', supplierId: sup.S3! })).toEqual([]);
+    const t = (await list({ view: 'pending', receiptEvidence: 'sheet_only' })).meta.totals;
+    expect([Number(t.poCount), cents(t.pending)]).toEqual([2, 110000]);
+  });
+
+  it('adds the three classes up to the pending list exactly, as of the latest finished run', async () => {
+    const s = await summary();
+    expect(s.pending.pos).toBe(11);
+    expect(s.awaitingLink).toMatchObject({ pos: 7, receiptLines: 7 });
+    const [run] = await query<{ finished_at: Date }>('SELECT finished_at FROM google_sync_jobs WHERE id = $1', [jobs[1]]);
+    expect(s.sheetOnly).toEqual({ pos: 2, value: '1100.00', receiptLines: 3, asOf: new Date(run!.finished_at).toISOString(), jobId: jobs[1] });
+    expect(s.noneRecorded.pos).toBe(2);
+    expect([cents(s.pending.value), cents(s.awaitingLink.value), cents(s.sheetOnly.value), cents(s.noneRecorded.value)])
+      .toEqual([730000, 520000, 110000, 100000]);
+    expect(s.awaitingLink.pos + s.sheetOnly.pos + s.noneRecorded.pos).toBe(s.pending.pos);
+    expect(cents(s.awaitingLink.value) + cents(s.sheetOnly.value) + cents(s.noneRecorded.value)).toBe(cents(s.pending.value));
+    expect(s.pending.pos).toBe(Number(await kpi('po_pending_count')));
+    expect(cents(s.pending.value)).toBe(cents(await kpi('po_pending_value')));
+    const s1 = await summary({ supplierId: sup.S1! });
+    expect([s1.awaitingLink.pos, s1.sheetOnly.pos, s1.noneRecorded.pos]).toEqual([6, 2, 0]);
+    expect(cents(s1.awaitingLink.value) + cents(s1.sheetOnly.value) + cents(s1.noneRecorded.value)).toBe(cents(s1.pending.value));
+  });
+
+  it('exports exactly the rows the list shows, with the count of sheet lines', async () => {
+    for (const params of [
+      { view: 'pending', receiptEvidence: 'sheet_only' },
+      { view: 'pending', receiptEvidence: 'none_recorded' },
+      { receiptEvidence: 'sheet_only' },
+      { view: 'pending', receiptEvidence: 'sheet_only', itemId: items['RE-L']! },
+    ] as Array<Record<string, string | number>>) {
+      expect([params, await exportNos(params)]).toEqual([params, await listNos(params)]);
+    }
+    const res = await request(app).get(api('/io/export/purchase-orders')).query({ format: 'csv', view: 'pending', receiptEvidence: 'sheet_only' })
+      .set(auth(adminToken));
+    expect(res.text).toMatch(/View: pending {2}· {2}Receipt on store sheet only/);
+    expect(res.text.split('\r\n').find((l) => l.startsWith('Z/RE/00008,'))).toMatch(/,0,2$/);
+  });
+
+  it('lists the sheet lines on the PO screen, beside any receipt awaiting link', async () => {
+    const doc = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00008']!.id}`)).set(auth(adminToken));
+    expect(doc.status).toBe(200);
+    expect(doc.body.data.storeReceiptsAwaitingLink).toEqual([]);
+    expect(doc.body.data.storeSheetReceipts).toEqual([
+      { grnNo: 'ZG/RE/0102', itemCode: 'RE-L', grnQty: '2.0000', sheetRow: 3, reportedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) },
+      { grnNo: null, itemCode: 'RE-L', grnQty: '1.0000', sheetRow: 4, reportedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) },
+    ]);
+    const both = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00003']!.id}`)).set(auth(adminToken));
+    expect(both.body.data.storeReceiptsAwaitingLink).toMatchObject([{ grnNo: 'ZG/RE/0003', reason: 'SEVERAL_POS' }]);
+    expect(both.body.data.storeSheetReceipts).toMatchObject([{ grnNo: 'ZG/RE/0103', itemCode: 'RE-C', grnQty: '1.0000', sheetRow: 5 }]);
+    const plain = await request(app).get(api(`/purchase-orders/${pos['Z/RE/00014']!.id}`)).set(auth(adminToken));
+    expect(plain.body.data.storeSheetReceipts).toEqual([]);
+  });
+
+  it('waits for a run in progress to finish, and skips a failed one', async () => {
+    const [running] = await query<{ id: number }>(`INSERT INTO google_sync_jobs (status, trigger_source) VALUES ('RUNNING', 'SCHEDULED') RETURNING id::int AS id`);
+    await query(
+      `INSERT INTO google_sync_errors (job_id, sheet_name, row_number, column_name, business_key, severity, error_code, error_message, incoming_value)
+       VALUES ($1, 'GRN', 8, 'GRN No', 'ZG/RE/0106 / RE-S', 'CONFLICT', 'MISSING_IN_ERP', 'GRN ZG/RE/0106 line RE-S (5) is in the sheet but not in the ERP.',
+               '{"poNo": "Z/RE/00014", "grnNo": "ZG/RE/0106", "grnQty": 5, "itemCode": "RE-S"}'::jsonb)`,
+      [running!.id],
+    );
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only' })).toEqual(['Z/RE/00002', 'Z/RE/00008']);
+    expect((await summary()).sheetOnly).toMatchObject({ pos: 2, jobId: jobs[1] });
+    await query(`UPDATE google_sync_jobs SET status = 'PARTIAL', finished_at = now() WHERE id = $1`, [running!.id]);
+    await query(`INSERT INTO google_sync_jobs (status, trigger_source, finished_at) VALUES ('FAILED', 'SCHEDULED', now())`);
+    expect(await listNos({ view: 'pending', receiptEvidence: 'sheet_only' })).toEqual(['Z/RE/00002', 'Z/RE/00008', 'Z/RE/00014']);
+    const s = await summary();
+    expect(s.sheetOnly).toMatchObject({ pos: 3, receiptLines: 4, jobId: running!.id });
+    expect(s.noneRecorded.pos).toBe(1);
+    expect(cents(s.awaitingLink.value) + cents(s.sheetOnly.value) + cents(s.noneRecorded.value)).toBe(cents(s.pending.value));
+  });
+});
+
 describe('Store receipts awaiting link — the record itself', () => {
   it('accepts exactly the link run\'s reasons and UNDONE', async () => {
     const { HOLD_REASONS } = await import('../modules/admin/store-grn-links.js');
@@ -524,5 +677,20 @@ describe('Store receipts awaiting link — the record itself', () => {
     expect(BACKUP_TABLES).toContain('store_grn_link_holds');
     const { counts } = await collectBackupData((sql) => query(sql));
     expect(counts.store_grn_link_holds).toBe(await holdCount());
+  });
+
+  it('comes back whole from a restore, which clears and refills the GRN lines it refers to', async () => {
+    const { BACKUP_TABLES, collectBackupData, restoreFromPayload } = await import('../db/restore.js');
+    const at = (t: string) => (BACKUP_TABLES as readonly string[]).indexOf(t);
+    for (const parent of ['purchase_order_headers', 'purchase_order_lines', 'grn_headers', 'grn_lines']) {
+      expect([parent, at(parent) < at('store_grn_link_holds')]).toEqual([parent, true]);
+    }
+    const before = await holds();
+    const beforeSummary = await summary();
+    const { data } = await collectBackupData((sql) => query(sql));
+    const { withTransaction } = await import('../db/index.js');
+    await withTransaction((tx) => restoreFromPayload(tx, { data }));
+    expect(await holds()).toEqual(before);
+    expect(await summary()).toEqual(beforeSummary);
   });
 });
