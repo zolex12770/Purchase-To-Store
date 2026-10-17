@@ -33,6 +33,7 @@ import {
   STORE_GRN_TAB, planStoreGrnLinks, applyStoreGrnLinks, undoStoreGrnLinks, describeLinkPlan,
   summariseLinkPlan, runIn, type SheetReader,
 } from './store-grn-links.js';
+import { REASON_TEXT } from '../purchase-order/receipt-evidence.js';
 import { readSheet } from '../google-sync/engine.js';
 
 const router = Router();
@@ -1641,7 +1642,11 @@ router.post(
     if (dryRun) {
       // One read-only transaction, so every figure comes from the same moment.
       const plan = await withTransaction((tx) => planStoreGrnLinks(runIn(tx), grid, { excludeGrnLineIds, sameSupplierPairs }));
-      sendOk(res, { dryRun: true, ...describeLinkPlan(plan), message: `${summariseLinkPlan(plan)} Nothing was changed.` });
+      // reasonText: each reason in the words the PO screen uses, for the held list a
+      // purchase user works through (the screen's CSV download).
+      sendOk(res, {
+        dryRun: true, ...describeLinkPlan(plan), reasonText: REASON_TEXT, message: `${summariseLinkPlan(plan)} Nothing was changed.`,
+      });
       return;
     }
     const result = await withTransaction((tx) => applyStoreGrnLinks(tx, grid, {

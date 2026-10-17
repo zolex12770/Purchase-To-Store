@@ -252,10 +252,14 @@ afterAll(async () => {
 describe('Store receipts awaiting link — the record the link repair writes', () => {
   let firstRecord: HoldRow[] = [];
 
-  it('a dry run writes nothing', async () => {
+  it('a dry run writes nothing, and gives each reason in the PO screen\'s words for the held list', async () => {
     const d = await dryRun();
     expect(d.totals).toMatchObject({ linkable: 3, held: 12 });
     expect(await holdCount()).toBe(0);
+    const { REASON_TEXT } = await import('../modules/purchase-order/receipt-evidence.js');
+    expect(d.reasonText).toEqual(REASON_TEXT);
+    expect(d.reasonText.SEVERAL_PO_LINES).toBe('The PO has more than one line for this item and the GRN tab does not say which.');
+    expect(d.held.every((h: { reason: string }) => typeof d.reasonText[h.reason] === 'string')).toBe(true);
   });
 
   it('the apply records every held line, one row per PO the tab names', async () => {

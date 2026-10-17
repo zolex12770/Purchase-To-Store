@@ -318,7 +318,11 @@ export async function downloadFile(path: string, fallbackName: string): Promise<
   const match = /filename="?([^"]+)"?/.exec(disposition);
   const filename = match?.[1] ?? fallbackName;
 
-  const blob = await res.blob();
+  saveBlob(await res.blob(), filename);
+}
+
+/** Hands a file built in the browser (or fetched) to the browser's download. */
+export function saveBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

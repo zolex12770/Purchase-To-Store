@@ -17,7 +17,9 @@ import { DataTable, type Column } from '../../components/DataTable';
 import { Button, Tabs, StatusBadge, Badge, Card, CardBody } from '../../components/ui';
 import { DocumentQuickViewModal } from '../../components/DocumentQuickViewModal';
 import { StatTile, LineScopeNote } from '../../components/KpiCard';
+import { ReceiptEvidenceBadges, ReceiptEvidenceTiles } from '../../components/ReceiptEvidence';
 import { money, qty, formatDate, count, text } from '../../lib/format';
+import { isReceiptEvidence, type ReceiptEvidenceSummary } from '../../lib/receiptEvidence';
 
 interface PoRow {
   id: number;
@@ -44,6 +46,10 @@ interface PoRow {
   grn_count: number;
   created_by_name: string | null;
   remarks: string;
+  /** Store receipt lines the link repair held back that name this PO (receipt evidence). */
+  store_receipts_awaiting_link: number;
+  /** Receipt lines on the store's GRN sheet that no ERP GRN holds, naming this PO. */
+  store_sheet_receipts: number;
 }
 
 const STATUS_TABS = [
@@ -70,10 +76,14 @@ export default function PoList() {
       : 'all';
 
   const activeStatus = (filters.status as string[] | undefined)?.[0] ?? '';
+  // What the store has recorded against the order: a store receipt awaiting link, a
+  // receipt on the store sheet only, or none (backend receipt-evidence.ts). Applied on
+  // the pending view, where its tiles show it, so no other view filters out of sight.
+  const receiptEvidence = view === 'pending' && isReceiptEvidence(filters.receiptEvidence) ? filters.receiptEvidence : null;
 
-  const query = qs({
-    page: filters.page, pageSize: filters.pageSize, search: filters.search,
-    sortBy: filters.sortBy, sortDir: filters.sortDir,
+  // The list's filters without paging and sort: the receipt evidence summary counts by them too.
+  const listFilters = {
+    search: filters.search,
     status: filters.status, dateFrom: filters.dateFrom, dateTo: filters.dateTo,
     supplierId: filters.supplierId, poTypeId: filters.poTypeId, itemId: filters.itemId,
     userId: filters.userId, departmentId: filters.departmentId, costCentreId: filters.costCentreId,
@@ -81,6 +91,19 @@ export default function PoList() {
     hodId: filters.hodId, view, overdue: filters.overdue,
     // A KPI card's scope (Purchase Orders, Total PO Value …): every order but cancelled.
     excludeCancelled: filters.excludeCancelled,
+  };
+  const query = qs({
+    page: filters.page, pageSize: filters.pageSize, sortBy: filters.sortBy, sortDir: filters.sortDir,
+    ...listFilters, receiptEvidence: receiptEvidence ?? undefined,
+  });
+
+  // On the pending view, how the pending orders split by receipt evidence: each tile's
+  // POs and value under the same filters, adding up to the Pending Value tile.
+  const summaryQuery = qs(listFilters);
+  const evidence = useQuery({
+    queryKey: ['purchase-orders', 'receipt-evidence', 'summary', summaryQuery],
+    queryFn: () => api.get<ReceiptEvidenceSummary>(`/purchase-orders/receipt-evidence/summary${summaryQuery}`),
+    enabled: view === 'pending',
   });
 
   const list = useQuery({
@@ -166,7 +189,15 @@ export default function PoList() {
       render: (r) => <span className="num" style={{ color: Number(r.pending_amount) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>{money(r.pending_amount)}</span>,
     },
     { key: 'grns', header: 'GRNs', align: 'right', optional: true, render: (r) => <span className="num">{count(r.grn_count)}</span> },
-    { key: 'status', header: 'Status', sortKey: 'status', align: 'center', render: (r) => <StatusBadge status={r.status} /> },
+    {
+      key: 'status', header: 'Status', sortKey: 'status', align: 'center',
+      render: (r) => (
+        <div>
+          <StatusBadge status={r.status} />
+          <ReceiptEvidenceBadges awaiting={Number(r.store_receipts_awaiting_link ?? 0)} sheet={Number(r.store_sheet_receipts ?? 0)} />
+        </div>
+      ),
+    },
   ];
 
   const titles: Record<string, { title: string; subtitle: string; crumb: string }> = {
@@ -217,6 +248,16 @@ export default function PoList() {
       )}
       {totals?.lineScoped && <LineScopeNote document="order" />}
 
+      {view === 'pending' && (
+        <ReceiptEvidenceTiles
+          summary={evidence.data}
+          loading={evidence.isLoading}
+          error={evidence.error}
+          value={receiptEvidence}
+          onChange={(v) => setFilters({ receiptEvidence: v ?? undefined })}
+        />
+      )}
+
       {view === 'all' && (
         <div style={{ marginBottom: 'var(--sp-4)' }}>
           <Tabs
@@ -263,9 +304,12 @@ export default function PoList() {
         onRowClick={(r) => navigate(`/purchase-orders/${r.id}`)}
         onExport={can('po.export') ? (format) => void downloadFile(`/io/export/purchase-orders?format=${format}${query.replace('?', '&')}`, `purchase-orders.${format}`) : undefined}
         onPrint={() => window.print()}
-        emptyTitle={view === 'pending' ? 'Nothing pending' : view === 'complete' ? 'No completed orders yet' : 'No purchase orders found'}
+        emptyTitle={receiptEvidence ? 'No purchase orders in this group'
+          : view === 'pending' ? 'Nothing pending' : view === 'complete' ? 'No completed orders yet' : 'No purchase orders found'}
         emptyMessage={
-          view === 'pending'
+          receiptEvidence
+            ? 'No purchase order matches this receipt evidence under the current filters.'
+            : view === 'pending'
             ? 'Every issued purchase order has been fully received.'
             : activeCount > 0
               ? 'No purchase orders match the current filters.'

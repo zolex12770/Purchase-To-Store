@@ -1456,10 +1456,14 @@ export function ErrorState({
   );
 }
 
-/** Inline notice; danger when a background refetch failed but cached data stays on screen. */
+/**
+ * Inline notice; danger when a background refetch failed but cached data stays on screen.
+ * `attention` asks the reader to act on what it lists (a receipt awaiting its PO link),
+ * and lays its content out from the top, as it usually holds more than one line.
+ */
 export function Banner({
   tone = 'info', children, action,
-}: { tone?: 'info' | 'warning' | 'danger'; children: ReactNode; action?: ReactNode }) {
+}: { tone?: 'info' | 'warning' | 'attention' | 'danger'; children: ReactNode; action?: ReactNode }) {
   const Icon = tone === 'info' ? AlertCircle : AlertTriangle;
   return (
     <div className={`banner ${tone === 'info' ? '' : `banner-${tone}`}`} role={tone === 'danger' ? 'alert' : 'status'}>

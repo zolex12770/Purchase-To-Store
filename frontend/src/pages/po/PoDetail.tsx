@@ -20,7 +20,9 @@ import {
 } from '../../components/ui';
 import { StatTile } from '../../components/KpiCard';
 import { HelpStrip } from '../../components/simple';
+import { StoreReceiptBanners } from '../../components/ReceiptEvidence';
 import { money, qty, formatDate, formatDateTime, count, text, percent } from '../../lib/format';
+import type { StoreReceiptAwaitingLink, StoreSheetReceipt } from '../../lib/receiptEvidence';
 
 interface PoSource {
   source_id: number;
@@ -103,6 +105,10 @@ interface PoDoc {
   lines: PoLine[];
   grns: { id: number; grn_no: string; grn_date: string; status: string; challan_no: string; received_by_name: string | null; total_qty: string; total_amount: string }[];
   sourceIndents: { indentId: number; indentNo: string; indentDate: string }[];
+  /** Store receipts the link repair held back that name this PO (backend receipt-evidence.ts). */
+  storeReceiptsAwaitingLink?: StoreReceiptAwaitingLink[];
+  /** Receipts on the store's GRN sheet that no ERP GRN holds, naming this PO. */
+  storeSheetReceipts?: StoreSheetReceipt[];
 }
 
 type ActionKind = 'issue' | 'cancel' | 'short-close' | 'delete';
@@ -293,6 +299,18 @@ export default function PoDetail() {
           </span>
         </div>
       )}
+
+      {/* Receipts the store recorded that the ERP does not count against this order yet:
+          held back by the store GRN link repair, or on the store's GRN sheet only. */}
+      <StoreReceiptBanners
+        awaiting={data.storeReceiptsAwaitingLink ?? []}
+        sheet={data.storeSheetReceipts ?? []}
+        receiveAction={isReceivable && can('grn.create') ? (
+          <Button variant="secondary" size="sm" icon={<Truck size={13} />} onClick={() => navigate(`/grn/new?poId=${data.id}`)}>
+            Receive material
+          </Button>
+        ) : undefined}
+      />
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
         <StatTile label="PO quantity" value={qty(data.total_po_qty)} />
