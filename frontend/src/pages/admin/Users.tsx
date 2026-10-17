@@ -288,7 +288,7 @@ export default function Users() {
           <>
             {can('user.export') && (
               <Button variant="secondary" size="sm" icon={<Download size={13} />}
-                      onClick={() => void downloadFile('/io/export/users?format=xlsx', 'users.xlsx')}>
+                      onClick={() => void downloadFile(`/io/export/users?format=xlsx${query.replace('?', '&')}`, 'users.xlsx')}>
                 Export
               </Button>
             )}
@@ -329,7 +329,7 @@ export default function Users() {
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(u) => setDetailId(u.id)}
         selectedKey={detailId}
-        onExport={can('user.export') ? (format) => void downloadFile(`/io/export/users?format=${format}`, `users.${format}`) : undefined}
+        onExport={can('user.export') ? (format) => void downloadFile(`/io/export/users?format=${format}${query.replace('?', '&')}`, `users.${format}`) : undefined}
         emptyTitle="No users found"
         toolbar={
           <>

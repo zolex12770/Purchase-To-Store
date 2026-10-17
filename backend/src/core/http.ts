@@ -149,6 +149,16 @@ export function offsetOf(query: ListQuery): number {
   return (query.page - 1) * query.pageSize;
 }
 
+/** Exports are complete or refused: they used to stop silently (10,000 rows on the stock
+    and ledger CSVs, 50,000 on the audit log), while the stock ledger alone holds more
+    than 27,000. A query fetches EXPORT_ROW_CAP + 1 rows and refuses when it got them all. */
+export const EXPORT_ROW_CAP = 200_000;
+export function refuseTruncatedExport(rowCount: number): void {
+  if (rowCount > EXPORT_ROW_CAP) {
+    throw ValidationError(`This export would exceed ${EXPORT_ROW_CAP.toLocaleString('en-IN')} rows. Narrow the filters (dates, category or item) and export again.`);
+  }
+}
+
 /** Comma-separated query value → string array (e.g. `?status=OPEN,COMPLETED`). */
 export const csvArray = z
   .union([z.string(), z.array(z.string())])

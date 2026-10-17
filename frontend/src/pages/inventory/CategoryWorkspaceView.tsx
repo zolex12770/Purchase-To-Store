@@ -340,7 +340,9 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
   // Export Category CSV Handler
   const exportCategoryCsv = async () => {
     try {
-      await downloadFile(`/inventory/categories/${category}/export`, `inventory_${category.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.csv`);
+      // The list's own filters: the backend shares them since 2026-10-16, but the button sent none.
+      const q = qs({ ...stockParams, page: undefined, pageSize: undefined });
+      await downloadFile(`/inventory/categories/${category}/export${q}`, `inventory_${category.toLowerCase()}_${new Date().toISOString().slice(0, 10)}.csv`);
       toast.success(`${category} stock register exported successfully.`);
     } catch (err) {
       toast.fromError(err, 'Failed to export CSV');

@@ -34,7 +34,8 @@ const SORTABLE: Record<string, string> = {
   totalValue: 'b.total_estimated_value',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   indentTypeId: csvIdArray,
   departmentId: csvIdArray,
@@ -48,7 +49,7 @@ const listSchema = listQuerySchema.extend({
   pendingOnly: z.enum(['true', 'false']).optional(),
 });
 
-function buildIndentFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+export function buildIndentFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
   b.addIn('h.indent_type_id', q.indentTypeId);

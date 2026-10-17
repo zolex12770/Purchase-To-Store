@@ -53,7 +53,8 @@ const SORTABLE: Record<string, string> = {
   mainGroup: 'mg.name',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   isActive: z.enum(['true', 'false']).optional(),
   qcRequired: z.enum(['true', 'false']).optional(),
   itemTypeId: csvIdArray,
@@ -65,6 +66,33 @@ const listSchema = listQuerySchema.extend({
   hodId: csvIdArray,
 });
 
+/** The Item Master list's filter, shared with its export (the export searched fewer
+    columns and ignored every filter but department and cost centre). */
+export function buildItemFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+  const b = new SqlBuilder();
+  b.addRaw('i.deleted_at IS NULL');
+  if (q.isActive) b.addRaw(`i.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
+  if (q.qcRequired) b.addRaw(`i.qc_required = ${q.qcRequired === 'true' ? 'TRUE' : 'FALSE'}`);
+  b.addIn('i.item_type_id', q.itemTypeId);
+  b.addIn('i.department_id', q.departmentId);
+  b.addIn('i.cost_centre_id', q.costCentreId);
+  b.addIn('i.main_group_id', q.mainGroupId);
+  b.addIn('i.sub_main_group_id', q.subMainGroupId);
+  b.addIn('i.uom_id', q.uomId);
+  if (q.hodId && q.hodId.length > 0) {
+    const p = b.push(q.hodId);
+    b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+  }
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(
+      `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} ` +
+      `OR lower(i.hsn_code) LIKE ${p} OR lower(i.item_specification) LIKE ${p})`,
+    );
+  }
+  return b;
+}
+
 /* ── GET /items ─────────────────────────────────────────────────────────────── */
 
 router.get(
@@ -73,28 +101,7 @@ router.get(
   validateQuery(listSchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof listSchema>>(res);
-
-    const b = new SqlBuilder();
-    b.addRaw('i.deleted_at IS NULL');
-    if (q.isActive) b.addRaw(`i.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
-    if (q.qcRequired) b.addRaw(`i.qc_required = ${q.qcRequired === 'true' ? 'TRUE' : 'FALSE'}`);
-    b.addIn('i.item_type_id', q.itemTypeId);
-    b.addIn('i.department_id', q.departmentId);
-    b.addIn('i.cost_centre_id', q.costCentreId);
-    b.addIn('i.main_group_id', q.mainGroupId);
-    b.addIn('i.sub_main_group_id', q.subMainGroupId);
-    b.addIn('i.uom_id', q.uomId);
-    if (q.hodId && q.hodId.length > 0) {
-      const p = b.push(q.hodId);
-      b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-    }
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} ` +
-        `OR lower(i.hsn_code) LIKE ${p} OR lower(i.item_specification) LIKE ${p})`,
-      );
-    }
+    const b = buildItemFilter(q);
 
     // Counting needs no lookup joins: every filter above targets `items` itself,
     // and the joins only supply display labels for the page query.

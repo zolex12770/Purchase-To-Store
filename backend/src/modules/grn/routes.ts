@@ -77,7 +77,8 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'g.created_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   qcStatus: csvArray,
   supplierId: csvIdArray,
@@ -96,18 +97,19 @@ const listSchema = listQuerySchema.extend({
 // A GRN's PO reference is now nullable and possibly plural (multi-PO), so the
 // list join is LEFT — an INNER join would silently drop every Direct GRN and
 // every multi-PO GRN whose header `po_id` was left NULL.
-const GRN_FROM = `
+export const GRN_FROM = `
   FROM grn_headers g
   LEFT JOIN purchase_order_headers p ON p.id = g.po_id
   JOIN suppliers s ON s.id = g.supplier_id
   LEFT JOIN lookups gt ON gt.id = g.grn_type_id`;
 
-function buildGrnFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+export function buildGrnFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('g.status', q.status);
   b.addIn('g.qc_status', q.qcStatus);
   b.addIn('g.supplier_id', q.supplierId);
-  b.addIn('g.po_id', q.poId);
+  // poId is matched below through the header OR the lines: a plain header match here
+  // ANDed with it dropped every multi-PO GRN whose header po_id is NULL.
   b.addIn('g.received_by_user_id', q.userId);
   b.addIn('g.grn_type_id', q.grnTypeId);
   b.add('g.grn_date >= ?', q.dateFrom);

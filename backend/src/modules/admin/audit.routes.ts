@@ -13,7 +13,8 @@ import { requirePermission } from '../../auth/middleware.js';
 
 const router = Router();
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   action: csvArray,
   entity: csvArray,
   entityId: z.string().trim().max(60).optional(),
@@ -25,7 +26,7 @@ const listSchema = listQuerySchema.extend({
   dateTo: z.string().optional(),
 });
 
-function buildFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+export function buildFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('a.action', q.action);
   b.addIn('a.entity', q.entity);

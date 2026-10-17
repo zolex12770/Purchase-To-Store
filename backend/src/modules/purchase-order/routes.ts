@@ -47,7 +47,8 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'h.created_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   supplierId: csvIdArray,
   poTypeId: csvIdArray,
@@ -65,7 +66,7 @@ const listSchema = listQuerySchema.extend({
   overdue: z.enum(['true', 'false']).optional(),
 });
 
-function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+export function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
   b.addIn('h.supplier_id', q.supplierId);
@@ -119,7 +120,7 @@ function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   return b;
 }
 
-const PO_FROM = `
+export const PO_FROM = `
   FROM purchase_order_headers h
   JOIN v_po_header_balance b ON b.po_id = h.id
   JOIN suppliers s ON s.id = h.supplier_id`;

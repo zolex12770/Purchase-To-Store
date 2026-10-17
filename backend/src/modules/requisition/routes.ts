@@ -170,7 +170,8 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'h.created_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same, views included (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   /** User-facing, independent status columns (v_requisition_header_balance) — never merged with `status`. */
   hodStatus: csvArray,
@@ -188,13 +189,13 @@ const listSchema = listQuerySchema.extend({
   view: z.enum(['mine', 'hod-pending', 'store-queue']).optional(),
 });
 
-const LIST_FROM = `
+export const LIST_FROM = `
   FROM requisition_headers h
   JOIN v_requisition_header_balance b ON b.requisition_id = h.id
   LEFT JOIN users ru ON ru.id = h.requester_user_id
   LEFT JOIN lookups d ON d.id = h.department_id`;
 
-function buildFilter(q: z.infer<typeof listSchema>, userId: number): SqlBuilder {
+export function buildFilter(q: z.infer<typeof listSchema>, userId: number): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
   b.addIn('b.hod_status', q.hodStatus);
