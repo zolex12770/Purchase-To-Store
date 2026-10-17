@@ -1143,6 +1143,11 @@ h1, h2, h3, h4, h5, h6 {
 /* An evidence badge in a list row: focusable (the global ring), so its explanation shows on focus too. */
 .badge-tip { display: inline-flex; border-radius: var(--radius-full); }
 .evidence-badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; margin-top: 4px; }
+/* They wrap their words rather than widen the Status column past the table's edge. */
+.evidence-badges .badge {
+  height: auto; min-height: 20px; max-width: 164px; padding-block: 3px;
+  white-space: normal; line-height: 1.2; text-align: left; border-radius: var(--radius-md);
+}
 /* The Pending PO list's receipt evidence tiles and what they mean. */
 .evidence-tiles .filter-tiles { margin-bottom: var(--space-2); }
 .evidence-note { margin: 0 0 var(--space-4); font-size: var(--fs-12); color: var(--text-3); line-height: var(--lh-normal); }

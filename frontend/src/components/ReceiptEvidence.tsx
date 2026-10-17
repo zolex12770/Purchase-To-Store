@@ -129,7 +129,7 @@ export function StoreReceiptBanners({
               : `${count(awaiting.length)} store receipts name this purchase order but are not linked to it yet`}
           </div>
           <div className="banner-text">
-            The goods may already have come. Until a receipt is linked, this order still shows its full pending quantity and value.
+            The goods may already have come: until a receipt is linked, this order counts its quantity as still to be received.
           </div>
           <div className="banner-table">
             <table className="table table-compact">

@@ -188,6 +188,11 @@ export function LinkStoreGrnsPanel() {
   const plan = dry.data;
   // 409: the tab, the ERP or the review choices changed after the dry run; nothing was written.
   const changed = apply.error instanceof ApiError && apply.error.status === 409;
+  // What the plan would be now, from the refusal's details (store-grn-links.ts applyStoreGrnLinks).
+  const now = changed ? (apply.error as ApiError).details as { linkable?: number; held?: number } | undefined : undefined;
+  const nowPlan = now?.linkable !== undefined && now.held !== undefined
+    ? <span className="cell-muted"> It would now link {count(now.linkable)} line(s) and hold {count(now.held)}.</span>
+    : null;
 
   const download = () => {
     if (!plan) return;
@@ -281,7 +286,7 @@ export function LinkStoreGrnsPanel() {
                 ) : undefined}
               >
                 {changed
-                  ? <>The GRN tab or the ERP changed after this dry run, so nothing was linked. Run the dry run again and review it. <span className="cell-muted">{errorText(apply.error)}</span></>
+                  ? <>The GRN tab or the ERP changed after this dry run, so nothing was linked. Run the dry run again and review it.{nowPlan}</>
                   : <>Nothing was linked: {errorText(apply.error)}</>}
               </Banner>
             )}
