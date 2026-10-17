@@ -13,7 +13,7 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { Button, Tabs, StatusBadge } from '../../components/ui';
 import { DocumentQuickViewModal } from '../../components/DocumentQuickViewModal';
-import { StatTile } from '../../components/KpiCard';
+import { StatTile, LineScopeNote } from '../../components/KpiCard';
 import { money, qty, formatDate, count, text } from '../../lib/format';
 
 interface GrnRow {
@@ -80,6 +80,8 @@ export default function GrnList() {
         pendingQcCount: number;
         qcPassedCount: number;
         qcFailedCount: number;
+        /** An item-level filter narrowed the tiles to its lines. */
+        lineScoped?: boolean;
       };
     }>(`/grn${query}`),
   });
@@ -165,7 +167,7 @@ export default function GrnList() {
       />
 
       {totals && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: totals.lineScoped ? 'var(--sp-2)' : 'var(--sp-4)' }}>
           <StatTile label="Total GRNs" value={count(totals.grnCount)} sub={`${count(totals.lineCount)} line item(s)`} />
           <StatTile label="Total Received Qty" value={qty(totals.totalQty)} />
           <StatTile label="Total Value" value={money(totals.totalAmount)} />
@@ -176,6 +178,7 @@ export default function GrnList() {
           )}
         </div>
       )}
+      {totals?.lineScoped && <LineScopeNote document="receipt" />}
 
       <div style={{ marginBottom: 'var(--sp-4)' }}>
         <Tabs
