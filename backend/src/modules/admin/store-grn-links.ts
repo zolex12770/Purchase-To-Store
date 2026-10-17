@@ -151,9 +151,19 @@ const L = (s: string | null | undefined) => (s ?? '').toLowerCase();
  * engine uses for this tab (google_sheet_mappings), so both read the same columns.
  */
 function tabRowsOf(grid: string[][], columns: ColumnMap[]): { rows: TabRow[]; columns: Record<string, string> } {
+  const needed = ['grn_no', 'item_code', 'po_no'] as const;
+  const unmapped = needed.filter((f) => !columns.some((c) => c.field === f));
+  if (unmapped.length > 0) {
+    // The mapping is reconciled from seed.ts when the backend starts; a database
+    // restored from an older build carries the older mapping until then.
+    throw BusinessRuleError(
+      `The Google sync's mapping for the ${STORE_GRN_TAB} tab has no ${unmapped.join(', ')} field; restart the backend so it is `
+        + 'reconciled. Nothing was linked.',
+    );
+  }
   const header = (grid[0] ?? []).map((c) => String(c ?? '').trim());
   const index = resolveColumns(header, columns);
-  const missing = (['grn_no', 'item_code', 'po_no'] as const).filter((f) => !index.has(f));
+  const missing = needed.filter((f) => !index.has(f));
   if (missing.length > 0) {
     const names = missing.map((f) => columns.find((c) => c.field === f)?.headers[0] ?? f);
     throw BusinessRuleError(
