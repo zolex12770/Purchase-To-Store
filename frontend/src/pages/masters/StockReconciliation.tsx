@@ -26,7 +26,11 @@ interface ReconciliationRow {
   grn_reversal: string;
   requisition_issue: string;
   requisition_reversal: string;
-  /** Net of the one-time opening alignment rows (reference type OPENING_ALIGNMENT). */
+  direct_issue_net: string;
+  adjustment_net: string;
+  inventory_net: string;
+  sheet_sync_net: string;
+  /** Net of the one-time opening alignment rows (txn type STOCK_ALIGNMENT, undo rows included). */
   alignment_net: string;
   computed_balance: string;
   current_stock: string;
@@ -59,7 +63,7 @@ export default function StockReconciliation() {
     <>
       <PageHeader
         title="Stock Reconciliation"
-        subtitle="Opening + GRN Inward − Requisition Outward = Current Stock — reconciled straight from the stock ledger, never silently corrected"
+        subtitle="Every stock-ledger movement, by type: GRN inward − GRN reversal − requisition issue + the other columns = computed balance, against the current stock — never silently corrected"
         breadcrumbs={[{ label: 'Master', to: '/masters/items' }, { label: 'Stock Reconciliation' }]}
       />
 
@@ -112,6 +116,12 @@ export default function StockReconciliation() {
                     <th className="right">GRN Reversal</th>
                     <th className="right">Requisition Issue</th>
                     <th className="right">Requisition Reversal</th>
+                    {/* Every ledger entry type has a column, so the row adds up to the computed balance
+                        (direct issues, counts and sheet syncs were left off and nothing added up). */}
+                    <th className="right" title="Direct store issues less their reversals">Direct Issue (net)</th>
+                    <th className="right" title="Physical-count adjustments less their reversals">Adjustments (net)</th>
+                    <th className="right" title="Inventory-screen inward, outward and adjustments less their reversals">Inventory Movements (net)</th>
+                    <th className="right" title="Changes the inventory sheet sync posted">Sheet Sync (net)</th>
                     <th className="right" title="One-time opening alignment from sheet evidence (2026-10)">Opening Alignment</th>
                     <th className="right">Computed Balance</th>
                     <th className="right">Current Stock</th>
@@ -128,6 +138,10 @@ export default function StockReconciliation() {
                       <td className="right num cell-muted">{qty(r.grn_reversal)}</td>
                       <td className="right num" style={{ color: 'var(--danger-600)' }}>{qty(r.requisition_issue)}</td>
                       <td className="right num cell-muted">{qty(r.requisition_reversal)}</td>
+                      <td className="right num cell-muted">{qty(r.direct_issue_net)}</td>
+                      <td className="right num cell-muted">{qty(r.adjustment_net)}</td>
+                      <td className="right num cell-muted">{qty(r.inventory_net)}</td>
+                      <td className="right num cell-muted">{qty(r.sheet_sync_net)}</td>
                       <td className="right num cell-muted">{qty(r.alignment_net)}</td>
                       <td className="right num cell-strong">{qty(r.computed_balance)}</td>
                       <td className="right num cell-strong">{qty(r.current_stock)}</td>

@@ -1,26 +1,32 @@
 /**
- * Live Data Parity Verification Modal (Priority 1 & 2).
+ * Live data parity verification (Priority 1 & 2).
  *
- * Provides real-time field-by-field audit across:
+ * Field-by-field audit across:
  *  - Source Spreadsheet (1Dyj3Ws9gyR2zOe6p6RafQrKUFyLKIFN5h-3XDe9KD9I)
  *  - ERP Database (PGlite / PostgreSQL)
  *  - Reference Spreadsheet (1v-r7cdHsnWBPJhe7RgaNYgnl5T7kPhvAIIf58-q770g)
  *
- * Features:
- *  - Read-only verification by default.
- *  - Discrepancy Matrix and Formula Audit.
- *  - Authorized Dry-Run and Confirmed Reconciliation with automatic safety backup.
+ * Read-only by default: discrepancy matrix and formula audit. Authorised users
+ * can dry-run, then confirm, a master-data reconciliation that takes a safety
+ * backup first.
+ *
+ * States are explicit. On a server without Google credentials the verify
+ * call answered without an HTTP error and v2 showed "Parity Score: —" over an
+ * empty "Audit Matrix (0 Tabs)" with no reason (audit UI-002); an empty
+ * report now says why and where to fix it.
  */
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useNavigate } from 'react-router-dom';
 import {
-  RefreshCw, AlertTriangle, CheckCircle2,
-  Search, HardDriveDownload,
+  RefreshCw, AlertTriangle, CheckCircle2, Search, HardDriveDownload, FileSearch,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import { useToast } from './Toast';
 import { useAuth } from '../lib/auth';
-import { Modal, Button, Badge } from './ui';
+import {
+  Modal, Button, Badge, Banner, EmptyState, ErrorState, LoadingBlock, Segmented, StatusBadge, Tabs,
+} from './ui';
 
 export interface TabSummary {
   tabName: string;
@@ -67,6 +73,10 @@ export interface VerificationReport {
   };
 }
 
+const FILTER_TABS = ['ALL', 'Item Master', 'Supplier Master', 'Requisition'];
+const severityTone = (s: DiscrepancyItem['severity']) => (s === 'HIGH' ? 'danger' : s === 'MEDIUM' ? 'attention' : 'neutral');
+const show = (v: unknown) => (v !== null && v !== undefined && v !== '' ? String(v) : '—');
+
 export function LiveDataVerifyModal({
   open,
   onClose,
@@ -77,17 +87,20 @@ export function LiveDataVerifyModal({
   const toast = useToast();
   const { can } = useAuth();
   const qc = useQueryClient();
+  const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState<'matrix' | 'discrepancies' | 'formulas'>('matrix');
   const [filterTab, setFilterTab] = useState<string>('ALL');
   const [search, setSearch] = useState('');
   const [confirmReconcile, setConfirmReconcile] = useState(false);
 
-  const { data, isFetching, refetch } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['live-data-verify'],
     queryFn: () => api.get<VerificationReport>('/google-sync/verify'),
     enabled: open,
     staleTime: 60_000,
+    // A server without Google credentials answers "not configured"; asking again cannot change that.
+    retry: false,
   });
 
   const reconcileMutation = useMutation({
@@ -102,9 +115,9 @@ export function LiveDataVerifyModal({
       }>('/google-sync/reconcile', { dryRun, confirmBackup: true }),
     onSuccess: (res) => {
       if (res.dryRun) {
-        toast.info('Dry Run Completed', res.message);
+        toast.info('Dry run completed', res.message);
       } else {
-        toast.success('Reconciliation Completed', res.message);
+        toast.success('Reconciliation completed', res.message);
         setConfirmReconcile(false);
         void refetch();
         void qc.invalidateQueries({ queryKey: ['items'] });
@@ -114,8 +127,13 @@ export function LiveDataVerifyModal({
     onError: (err) => toast.fromError(err),
   });
 
-  const report = data;
-  const summaries = report ? Object.values(report.tabSummaries) : [];
+  // A report with no tabs (or no report at all) means nothing was compared.
+  const summaries = data ? Object.values(data.tabSummaries ?? {}) : [];
+  const report = data && (summaries.length > 0 || (data.stats?.totalChecked ?? 0) > 0)
+    ? { ...data, discrepancies: data.discrepancies ?? [], formulaAudit: data.formulaAudit ?? [] }
+    : null;
+  const emptyReport = !report;
+  const matched = report?.overallStatus === 'MATCHED';
 
   const filteredDiscrepancies = (report?.discrepancies || []).filter((d) => {
     if (filterTab !== 'ALL' && d.tab !== filterTab) return false;
@@ -136,315 +154,247 @@ export function LiveDataVerifyModal({
     <Modal
       open={open}
       onClose={onClose}
-      title="Live Data Parity Verification & Audit"
+      title="Live data verification"
+      subtitle="Source sheet, ERP database and reference sheet compared field by field. Read-only unless you reconcile."
       size="xl"
+      busy={reconcileMutation.isPending}
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-        {/* Top summary banner */}
-        <div
-          style={{
-            background: 'var(--bg-inset)',
-            padding: '14px 16px',
-            borderRadius: 'var(--radius)',
-            border: '1px solid var(--border)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            flexWrap: 'wrap',
-            gap: 12,
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: '50%',
-                background: report?.overallStatus === 'MATCHED' ? 'var(--success-50)' : 'var(--warning-50)',
-                color: report?.overallStatus === 'MATCHED' ? 'var(--success-600)' : 'var(--warning-600)',
-                display: 'grid',
-                placeItems: 'center',
-                flexShrink: 0,
-              }}
-            >
-              {report?.overallStatus === 'MATCHED' ? <CheckCircle2 size={24} /> : <AlertTriangle size={24} />}
-            </div>
-            <div>
-              <div style={{ fontSize: 'var(--text-base)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span>Parity Score: {report ? `${report.stats.parityPercentage}%` : '—'}</span>
-                {report && (
-                  <Badge tone={report.overallStatus === 'MATCHED' ? 'success' : 'warning'}>
-                    {report.overallStatus === 'MATCHED' ? 'Fully Synchronized' : `${report.stats.totalDiscrepancies} Discrepancies Audited`}
-                  </Badge>
-                )}
+        {isLoading ? (
+          <LoadingBlock label="Reading the sheets and the database…" />
+        ) : error ? (
+          <ErrorState error={error} onRetry={() => void refetch()} title="Could not run the verification" />
+        ) : emptyReport ? (
+          <EmptyState
+            icon={<FileSearch />}
+            title="No sheet data could be compared"
+            message="The verification read no tabs from Google Sheets, so there is nothing to score. This usually means the Google Sheets connection is not configured on this server."
+            secondaryAction={<Button variant="secondary" size="sm" icon={<RefreshCw size={14} />} onClick={() => void refetch()} disabled={isFetching}>Verify again</Button>}
+            action={<Button variant="primary" size="sm" onClick={() => { onClose(); navigate('/admin/sync'); }}>Open sync admin</Button>}
+          />
+        ) : report ? (
+          <>
+            {/* Summary */}
+            <div className="card" style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, boxShadow: 'none' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div
+                  aria-hidden
+                  style={{
+                    width: 40, height: 40, borderRadius: 'var(--radius-md)', display: 'grid', placeItems: 'center', flexShrink: 0,
+                    background: matched ? 'var(--tone-success-bg)' : 'var(--tone-attention-bg)',
+                    color: matched ? 'var(--tone-success-fg)' : 'var(--tone-attention-fg)',
+                  }}
+                >
+                  {matched ? <CheckCircle2 size={22} /> : <AlertTriangle size={22} />}
+                </div>
+                <div>
+                  <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 'var(--fs-16)', fontWeight: 600 }}>Parity {report.stats?.parityPercentage ?? '—'}%</span>
+                    <Badge tone={matched ? 'success' : 'attention'}>
+                      {matched ? 'Fully in step' : `${report.stats?.totalDiscrepancies ?? report.discrepancies.length} discrepancies`}
+                    </Badge>
+                  </div>
+                  <div style={{ fontSize: 'var(--fs-12)', color: 'var(--text-3)', marginTop: 2 }}>
+                    Source sheet <code className="mono">{report.sourceSheetId || '1Dyj3Ws9gyR2zOe6p6RafQrKUFyLKIFN5h-3XDe9KD9I'}</code> · system of record: SQL database
+                  </div>
+                </div>
               </div>
-              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)', marginTop: 2 }}>
-                Source Sheet: <code style={{ fontSize: '11px' }}>1Dyj3Ws9gyR2zOe6p6RafQrKUFyLKIFN5h-3XDe9KD9I</code> • System of Record: <strong>SQL Database</strong>
-              </div>
-            </div>
-          </div>
 
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <Button
-              variant="secondary"
-              size="sm"
-              icon={<RefreshCw size={14} className={isFetching ? 'zx-spin' : ''} />}
-              onClick={() => void refetch()}
-              disabled={isFetching}
-            >
-              Verify Live Data
-            </Button>
-            {can('sync.admin') && (
-              <>
+              <div className="row" style={{ gap: 8 }}>
                 <Button
                   variant="secondary"
                   size="sm"
-                  onClick={() => reconcileMutation.mutate(true)}
-                  disabled={reconcileMutation.isPending || isFetching}
+                  icon={<RefreshCw size={14} className={isFetching ? 'zx-spin' : ''} />}
+                  onClick={() => void refetch()}
+                  disabled={isFetching}
                 >
-                  Dry-Run Reconcile
+                  Verify again
                 </Button>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={() => setConfirmReconcile(true)}
-                  disabled={reconcileMutation.isPending || isFetching}
-                >
-                  Reconcile Master Data
-                </Button>
-              </>
-            )}
-          </div>
-        </div>
+                {can('sync.admin') && (
+                  <>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => reconcileMutation.mutate(true)}
+                      disabled={reconcileMutation.isPending || isFetching}
+                    >
+                      Dry-run reconcile
+                    </Button>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => setConfirmReconcile(true)}
+                      disabled={reconcileMutation.isPending || isFetching}
+                    >
+                      Reconcile master data
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
 
-        {/* Confirmation banner if requested */}
-        {confirmReconcile && (
-          <div
-            style={{
-              background: 'var(--warning-50)',
-              border: '1px solid var(--warning-200)',
-              padding: '12px 16px',
-              borderRadius: 'var(--radius)',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 8,
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, color: 'var(--warning-800)', fontSize: 'var(--text-sm)' }}>
-              <HardDriveDownload size={16} />
-              Confirmed Master Data Reconciliation
-            </div>
-            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--warning-900)', lineHeight: 1.5 }}>
-              This action will update Item Master and Supplier Master records from the Source Sheet.
-              <strong> An automatic verified backup snapshot will be saved first.</strong>
-              Approved transactional records (Indents, POs, GRNs, Requisitions) are strictly protected and will not be overwritten.
-              ERP-to-Sheets write-back remains disabled.
-            </div>
-            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={() => reconcileMutation.mutate(false)}
-                disabled={reconcileMutation.isPending}
+            {confirmReconcile && (
+              <Banner
+                tone="warning"
+                action={
+                  <div className="row" style={{ gap: 8 }}>
+                    <Button variant="secondary" size="sm" onClick={() => setConfirmReconcile(false)} disabled={reconcileMutation.isPending}>Cancel</Button>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      icon={<HardDriveDownload size={14} />}
+                      onClick={() => reconcileMutation.mutate(false)}
+                      loading={reconcileMutation.isPending}
+                    >
+                      Back up and reconcile
+                    </Button>
+                  </div>
+                }
               >
-                {reconcileMutation.isPending ? 'Backing up & Reconciling…' : 'Confirm Backup & Reconcile'}
-              </Button>
-              <Button variant="ghost" size="sm" onClick={() => setConfirmReconcile(false)}>
-                Cancel
-              </Button>
-            </div>
-          </div>
-        )}
+                <strong>Reconcile master data?</strong> Item Master and Supplier Master records are updated from the
+                source sheet after an automatic, verified backup. Approved indents, POs, GRNs and requisitions are never
+                overwritten, and ERP-to-sheet write-back stays off.
+              </Banner>
+            )}
 
-        {/* Tab switchers */}
-        <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', gap: 16 }}>
-          <button
-            onClick={() => setActiveTab('matrix')}
-            style={{
-              padding: '8px 12px',
-              borderBottom: activeTab === 'matrix' ? '2px solid var(--accent-600)' : '2px solid transparent',
-              fontWeight: activeTab === 'matrix' ? 600 : 400,
-              color: activeTab === 'matrix' ? 'var(--ink-900)' : 'var(--text-muted)',
-              fontSize: 'var(--text-sm)',
-            }}
-          >
-            Audit Matrix ({summaries.length} Tabs)
-          </button>
-          <button
-            onClick={() => setActiveTab('discrepancies')}
-            style={{
-              padding: '8px 12px',
-              borderBottom: activeTab === 'discrepancies' ? '2px solid var(--accent-600)' : '2px solid transparent',
-              fontWeight: activeTab === 'discrepancies' ? 600 : 400,
-              color: activeTab === 'discrepancies' ? 'var(--ink-900)' : 'var(--text-muted)',
-              fontSize: 'var(--text-sm)',
-            }}
-          >
-            Discrepancies ({report?.discrepancies.length ?? 0})
-          </button>
-          <button
-            onClick={() => setActiveTab('formulas')}
-            style={{
-              padding: '8px 12px',
-              borderBottom: activeTab === 'formulas' ? '2px solid var(--accent-600)' : '2px solid transparent',
-              fontWeight: activeTab === 'formulas' ? 600 : 400,
-              color: activeTab === 'formulas' ? 'var(--ink-900)' : 'var(--text-muted)',
-              fontSize: 'var(--text-sm)',
-            }}
-          >
-            Formula & Business Rules ({report?.formulaAudit.length ?? 0})
-          </button>
-        </div>
+            <Tabs
+              ariaLabel="Verification views"
+              active={activeTab}
+              onChange={(k) => setActiveTab(k as typeof activeTab)}
+              tabs={[
+                { key: 'matrix', label: 'Audit matrix', count: summaries.length },
+                { key: 'discrepancies', label: 'Discrepancies', count: report.discrepancies.length },
+                { key: 'formulas', label: 'Formulas and rules', count: report.formulaAudit.length },
+              ]}
+            />
 
-        {/* Tab Content: Matrix */}
-        {activeTab === 'matrix' && (
-          <div style={{ overflowX: 'auto' }}>
-            <table className="table" style={{ width: '100%', fontSize: 'var(--text-xs)' }}>
-              <thead>
-                <tr>
-                  <th>Tab Name</th>
-                  <th style={{ textAlign: 'right' }}>Source Sheet Rows</th>
-                  <th style={{ textAlign: 'right' }}>ERP Database Rows</th>
-                  <th style={{ textAlign: 'right' }}>Reference Replica</th>
-                  <th style={{ textAlign: 'center' }}>Audit Status</th>
-                  <th>Notes & Rules</th>
-                </tr>
-              </thead>
-              <tbody>
-                {summaries.map((s) => (
-                  <tr key={s.tabName}>
-                    <td style={{ fontWeight: 600 }}>{s.tabName}</td>
-                    <td style={{ textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{s.sourceRows.toLocaleString()}</td>
-                    <td style={{ textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{s.dbRows.toLocaleString()}</td>
-                    <td style={{ textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{s.refRows.toLocaleString()}</td>
-                    <td style={{ textAlign: 'center' }}>
-                      <Badge tone={s.status === 'MATCHED' ? 'success' : s.status === 'DISCREPANCY' ? 'warning' : 'neutral'}>
-                        {s.status === 'MATCHED' ? 'MATCHED' : s.status === 'DISCREPANCY' ? `${s.discrepanciesCount} DIFFS` : 'VERIFIED'}
-                      </Badge>
-                    </td>
-                    <td style={{ color: 'var(--text-muted)', fontSize: '11px' }}>{s.notes || '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {/* Tab Content: Discrepancies */}
-        {activeTab === 'discrepancies' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>Filter Tab:</span>
-                {['ALL', 'Item Master', 'Supplier Master', 'Requisition'].map((t) => (
-                  <button
-                    key={t}
-                    onClick={() => setFilterTab(t)}
-                    style={{
-                      padding: '3px 8px',
-                      fontSize: '11px',
-                      borderRadius: 'var(--radius-sm)',
-                      background: filterTab === t ? 'var(--accent-100)' : 'var(--bg-inset)',
-                      color: filterTab === t ? 'var(--accent-800)' : 'inherit',
-                      border: '1px solid var(--border)',
-                    }}
-                  >
-                    {t}
-                  </button>
-                ))}
-              </div>
-
-              <div style={{ position: 'relative', width: 220 }}>
-                <Search size={13} style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                <input
-                  className="input"
-                  style={{ paddingLeft: 26, height: 28, fontSize: '11px' }}
-                  placeholder="Search discrepancy…"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div style={{ overflowX: 'auto', maxHeight: 380 }}>
-              <table className="table" style={{ width: '100%', fontSize: 'var(--text-xs)' }}>
-                <thead>
-                  <tr>
-                    <th>Tab</th>
-                    <th>Record Key</th>
-                    <th>Field</th>
-                    <th>Source Sheet Value</th>
-                    <th>ERP Value</th>
-                    <th>Type</th>
-                    <th>Audit Recommendation</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredDiscrepancies.length === 0 ? (
+            {activeTab === 'matrix' && (
+              <div className="table-wrap" style={{ border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)' }}>
+                <table className="table">
+                  <thead>
                     <tr>
-                      <td colSpan={7} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
-                        No discrepancies found matching the current filter.
-                      </td>
+                      <th>Tab</th>
+                      <th className="right">Source sheet rows</th>
+                      <th className="right">ERP database rows</th>
+                      <th className="right">Reference replica rows</th>
+                      <th>Audit status</th>
+                      <th>Notes and rules</th>
                     </tr>
-                  ) : (
-                    filteredDiscrepancies.slice(0, 100).map((d, i) => (
-                      <tr key={i}>
-                        <td style={{ fontWeight: 600 }}>{d.tab}</td>
-                        <td style={{ fontFamily: 'var(--font-mono)' }}>{d.key}</td>
-                        <td>{d.field}</td>
-                        <td style={{ color: 'var(--danger-700)', fontWeight: 500 }}>
-                          {d.sourceValue !== null && d.sourceValue !== undefined ? String(d.sourceValue) : '—'}
-                        </td>
-                        <td style={{ color: 'var(--success-700)', fontWeight: 500 }}>
-                          {d.erpValue !== null && d.erpValue !== undefined ? String(d.erpValue) : '—'}
-                        </td>
+                  </thead>
+                  <tbody>
+                    {summaries.map((s) => (
+                      <tr key={s.tabName}>
+                        <td className="cell-strong">{s.tabName}</td>
+                        <td className="right num">{s.sourceRows.toLocaleString('en-IN')}</td>
+                        <td className="right num">{s.dbRows.toLocaleString('en-IN')}</td>
+                        <td className="right num">{s.refRows.toLocaleString('en-IN')}</td>
                         <td>
-                          <Badge tone={d.severity === 'HIGH' ? 'danger' : d.severity === 'MEDIUM' ? 'warning' : 'neutral'}>
-                            {d.type.replace(/_/g, ' ')}
-                          </Badge>
+                          <StatusBadge
+                            status={s.status}
+                            label={s.status === 'DISCREPANCY' ? `${s.discrepanciesCount} differences` : undefined}
+                          />
                         </td>
-                        <td style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{d.recommendation}</td>
+                        <td className="cell-muted">{s.notes || '—'}</td>
                       </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-            {filteredDiscrepancies.length > 100 && (
-              <div style={{ fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center' }}>
-                Showing first 100 of {filteredDiscrepancies.length} discrepancies. Use search to refine.
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
-          </div>
-        )}
 
-        {/* Tab Content: Formulas */}
-        {activeTab === 'formulas' && (
-          <div style={{ overflowX: 'auto' }}>
-            <table className="table" style={{ width: '100%', fontSize: 'var(--text-xs)' }}>
-              <thead>
-                <tr>
-                  <th>Entity / View</th>
-                  <th>Formula / Derived Field</th>
-                  <th style={{ textAlign: 'center' }}>Status</th>
-                  <th>Business Calculation Rule</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(report?.formulaAudit || []).map((f, i) => (
-                  <tr key={i}>
-                    <td style={{ fontWeight: 600 }}>{f.entity}</td>
-                    <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{f.formulaField}</td>
-                    <td style={{ textAlign: 'center' }}>
-                      <Badge tone="success">VERIFIED DERIVED</Badge>
-                    </td>
-                    <td style={{ color: 'var(--text-muted)', fontSize: '12px' }}>{f.rule}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+            {activeTab === 'discrepancies' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div className="row" style={{ gap: 8, justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                  <Segmented
+                    size="sm"
+                    ariaLabel="Show discrepancies for"
+                    value={filterTab}
+                    onChange={setFilterTab}
+                    options={FILTER_TABS.map((t) => ({ value: t, label: t === 'ALL' ? 'All tabs' : t }))}
+                  />
+                  <div style={{ position: 'relative', width: 240 }}>
+                    <Search size={14} aria-hidden style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-4)' }} />
+                    <input
+                      className="input input-sm"
+                      style={{ paddingLeft: 28 }}
+                      placeholder="Search discrepancies…"
+                      aria-label="Search discrepancies"
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="table-wrap" style={{ maxHeight: 380, border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)' }}>
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Tab</th>
+                        <th>Record key</th>
+                        <th>Field</th>
+                        <th>Source sheet value</th>
+                        <th>ERP value</th>
+                        <th>Type</th>
+                        <th>Recommendation</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredDiscrepancies.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} style={{ textAlign: 'center', padding: 24, color: 'var(--text-3)' }}>
+                            No discrepancies match the current filter.
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredDiscrepancies.slice(0, 100).map((d, i) => (
+                          <tr key={i}>
+                            <td className="cell-strong">{d.tab}</td>
+                            <td className="cell-code">{d.key}</td>
+                            <td>{d.field}</td>
+                            <td>{show(d.sourceValue)}</td>
+                            <td>{show(d.erpValue)}</td>
+                            <td><Badge tone={severityTone(d.severity)}>{d.type.replace(/_/g, ' ').toLowerCase().replace(/^\w/, (c) => c.toUpperCase())}</Badge></td>
+                            <td className="cell-muted">{d.recommendation}</td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                {filteredDiscrepancies.length > 100 && (
+                  <div style={{ fontSize: 'var(--fs-12)', color: 'var(--text-3)', textAlign: 'center' }}>
+                    Showing the first 100 of {filteredDiscrepancies.length} discrepancies. Search to narrow them down.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'formulas' && (
+              <div className="table-wrap" style={{ border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)' }}>
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Entity or view</th>
+                      <th>Derived field</th>
+                      <th>Status</th>
+                      <th>Business rule</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(report.formulaAudit || []).map((f, i) => (
+                      <tr key={i}>
+                        <td className="cell-strong">{f.entity}</td>
+                        <td className="cell-code">{f.formulaField}</td>
+                        <td><StatusBadge status="VERIFIED" label="Verified, derived" /></td>
+                        <td className="cell-muted">{f.rule}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        ) : null}
       </div>
     </Modal>
   );

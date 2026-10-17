@@ -8,9 +8,15 @@ import type { Express } from 'express';
 process.env.NODE_ENV = 'test';
 process.env.SEED_DEMO_DATA = 'false';
 process.env.LOG_LEVEL = 'silent';
+// Never Google from a test, whatever backend/.env holds: these verify tests read the live
+// business sheet through the old fixed key path (2026-10-16 audit, F02). Set before
+// config/env.js is first imported; dotenv leaves a variable that is already set alone.
+process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = '';
+process.env.GOOGLE_API_KEY = '';
 
 let app: Express;
 let closeDb: () => Promise<void>;
+let dbQuery: <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T[]>;
 let adminToken = '';
 let testItemId = 0;
 let testRecipientId = 0;
@@ -52,6 +58,7 @@ beforeAll(async () => {
 
   app = createApp();
   closeDb = closeDatabase;
+  dbQuery = query;
 
   adminToken = await signInAndRotate('10221', 'Admin@12345', 'Admin@Testing2026!');
 
@@ -98,34 +105,29 @@ afterAll(async () => {
 });
 
 describe('Priority 1 & 2 — Live Data Verify and Master Sync Controls', () => {
-  it('GET /api/v1/google-sync/verify returns live verification report', async () => {
+  // The report itself, read through a configured key, is covered without any network in
+  // google-isolation.test.ts; here the server has no key, as a staging copy has none.
+  it('GET /api/v1/google-sync/verify says plainly that Google is not configured, and reads nothing', async () => {
     const res = await request(app).get('/api/v1/google-sync/verify').set(auth(adminToken));
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-
-    const report = res.body.data;
-    expect(report).toBeDefined();
-    expect(report.sourceSheetId).toBeDefined();
-    expect(report.tabSummaries).toBeDefined();
-    expect(report.tabSummaries.itemMaster).toBeDefined();
-    expect(report.tabSummaries.supplierMaster).toBeDefined();
-    expect(report.tabSummaries.requisition).toBeDefined();
-    expect(report.formulaAudit).toBeInstanceOf(Array);
-    expect(report.stats).toBeDefined();
-    expect(typeof report.stats.parityPercentage).toBe('number');
+    expect(res.status).toBe(502);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('INTEGRATION_ERROR');
+    expect(res.body.error.message).toMatch(/not configured.*GOOGLE_SERVICE_ACCOUNT_KEY_FILE/);
+    expect(res.body.error.message).not.toMatch(/secure|\.json/i);
   });
 
-  it('POST /api/v1/google-sync/reconcile performs dry run reconciliation without altering transactions', async () => {
-    const res = await request(app)
-      .post('/api/v1/google-sync/reconcile')
-      .set(auth(adminToken))
-      .send({ dryRun: true });
-
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-    expect(res.body.data.dryRun).toBe(true);
-    expect(typeof res.body.data.itemsProcessed).toBe('number');
-    expect(res.body.data.message).toContain('Dry run complete');
+  it('POST /api/v1/google-sync/reconcile is refused before its safety backup when Google is not configured', async () => {
+    const before = await dbQuery<{ n: number }>('SELECT COUNT(*)::int AS n FROM backup_metadata');
+    for (const dryRun of [true, false]) {
+      const res = await request(app)
+        .post('/api/v1/google-sync/reconcile')
+        .set(auth(adminToken))
+        .send({ dryRun });
+      expect(res.status).toBe(502);
+      expect(res.body.error.message).toMatch(/not configured/);
+    }
+    const after = await dbQuery<{ n: number }>('SELECT COUNT(*)::int AS n FROM backup_metadata');
+    expect(after[0]!.n).toBe(before[0]!.n);
   });
 
   it('POST /api/v1/google-sync/toggle persists master sync toggle', async () => {

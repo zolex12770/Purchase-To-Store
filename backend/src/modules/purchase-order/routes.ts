@@ -16,16 +16,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { chromium } from 'playwright';
-import { query, queryOne, withTransaction, txQuery, txQueryOne } from '../../db/index.js';
+import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
 import { renderPoDocumentHtml, type PoDocumentData } from './po-document.js';
-import { poFilterSchema, buildPoFilter, poTotals, PO_FROM, type PoFilter } from './po-filter.js';
 import {
-  awaitingLinkCount, awaitingLinkLines, latestHoldRecord, receiptsNamingPosNotInErp,
-  storeReceiptsAwaitingLink as storeReceiptsAwaitingLinkOf, type ReceiptEvidence,
+  RECEIPT_EVIDENCE, receiptEvidenceCondition, awaitingLinkCount, awaitingLinkLines, latestHoldRecord,
+  receiptsNamingPosNotInErp, storeReceiptsAwaitingLink as storeReceiptsAwaitingLinkOf, type ReceiptEvidence,
 } from './receipt-evidence.js';
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery,
-  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, attachmentDisposition,
+  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray, attachmentDisposition,
 } from '../../core/http.js';
 import { NotFoundError, BusinessRuleError, ValidationError, AuthorizationError } from '../../core/errors.js';
 import { requirePermission, hasPermission } from '../../auth/middleware.js';
@@ -37,6 +36,7 @@ import {
 } from '../../domain/quantities.js';
 import { toQty, toRate, toNumeric, dec, lineAmount } from '../../domain/money.js';
 import { loadCompanySettings } from '../../domain/company.js';
+import { itemLineScope } from '../../domain/item-scope.js';
 
 const router = Router();
 
@@ -52,9 +52,153 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'h.created_at',
 };
 
-// The filter fields live in po-filter.ts, shared with the export and the receipt
-// evidence summary.
-const listSchema = listQuerySchema.merge(poFilterSchema);
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
+  status: csvArray,
+  supplierId: csvIdArray,
+  poTypeId: csvIdArray,
+  itemId: csvIdArray,
+  userId: csvIdArray,
+  departmentId: csvIdArray,
+  costCentreId: csvIdArray,
+  mainGroupId: csvIdArray,
+  subMainGroupId: csvIdArray,
+  itemTypeId: csvIdArray,
+  hodId: csvIdArray,
+  sourceMode: z.enum(['DIRECT', 'INDENT']).optional(),
+  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  /** `pending` and `complete` back the dedicated SRS §11.4 sub-tabs. */
+  view: z.enum(['all', 'pending', 'complete']).default('all'),
+  overdue: z.enum(['true', 'false']).optional(),
+  /** The orders the PO KPIs count (Total PO Value, Purchase Orders, …): every one but cancelled. */
+  excludeCancelled: z.enum(['true', 'false']).optional(),
+  /**
+   * awaiting_link: a store receipt the link repair held back names the PO
+   * (receipt-evidence.ts); none_recorded: none does.
+   */
+  receiptEvidence: z.enum(RECEIPT_EVIDENCE).optional(),
+});
+
+/**
+ * A PO line still to be received: on an issued, open order (a DRAFT was never sent to
+ * the supplier), not closed, with quantity outstanding. The Pending view, the overdue
+ * filter and the pending KPIs (analytics) share this one rule, so a pending KPI opens
+ * exactly the orders it counts. `alias` is a v_po_line_balance row.
+ */
+export const pendingLineSql = (alias: string): string =>
+  `${alias}.is_receivable AND ${alias}.po_status IN ('OPEN', 'PARTIALLY_RECEIVED')`;
+
+/** The list's filters (paging and sort aside): what the PO KPIs and charts count by, too. */
+export type PoListFilter = Omit<z.infer<typeof listSchema>, 'page' | 'pageSize' | 'sortBy' | 'sortDir'>;
+
+/**
+ * The order lines the list's item-level filters select (item, department, cost centre,
+ * groups, type, HOD), as a condition on `line`; '' when none is set (domain/item-scope.ts).
+ * The list, its total tiles, its lines export and the PO KPIs and charts all use it.
+ */
+export const poLineScope = (q: PoListFilter, b: SqlBuilder, line: string): string => itemLineScope(q, b, line);
+
+export function buildPoFilter(q: PoListFilter): SqlBuilder {
+  const b = new SqlBuilder();
+  b.addIn('h.status', q.status);
+  if (q.excludeCancelled === 'true') b.addRaw("h.status <> 'CANCELLED'");
+  b.addIn('h.supplier_id', q.supplierId);
+  b.addIn('h.po_type_id', q.poTypeId);
+  b.addIn('h.created_by', q.userId);
+  b.add('h.source_mode = ?', q.sourceMode);
+  b.add('h.po_date >= ?', q.dateFrom);
+  b.add('h.po_date <= ?', q.dateTo);
+
+  // An order is listed when one of its lines satisfies every item-level filter, and the
+  // Pending view and "overdue only" ask that of the pending line itself: with a separate
+  // "any line" test per filter, an order whose only pending line belonged to another
+  // department was listed as pending for this one (2026-10-17 review).
+  const scope = poLineScope(q, b, 'pl');
+  const inScope = scope ? ` AND ${scope}` : '';
+  if (scope) b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pl WHERE pl.po_id = h.id${inScope})`);
+
+  // "Pending" and "Complete" are defined by the authoritative balance, not by a
+  // status string a user could have set by hand (ADR-003). Pending is a line still to
+  // be received (pendingLineSql), the rule the pending KPIs count by.
+  if (q.view === 'pending') {
+    b.addRaw(`EXISTS (SELECT 1 FROM v_po_line_balance pl WHERE pl.po_id = h.id AND ${pendingLineSql('pl')}${inScope})`);
+  }
+  if (q.view === 'complete') b.addRaw("h.status IN ('COMPLETED','SHORT_CLOSED')");
+
+  if (q.overdue === 'true') {
+    b.addRaw(
+      `EXISTS (SELECT 1 FROM v_po_line_balance pl
+                WHERE pl.po_id = h.id AND ${pendingLineSql('pl')}
+                  AND pl.delivery_date IS NOT NULL AND pl.delivery_date < CURRENT_DATE${inScope})`,
+    );
+  }
+  // A PO with a store receipt still awaiting its link may have had its goods; one with
+  // none recorded is genuinely pending (receipt-evidence.ts). A property of the order,
+  // so the parts of a view add up to the view whatever else is filtered.
+  if (q.receiptEvidence) b.addRaw(receiptEvidenceCondition(q.receiptEvidence, 'h.id'));
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(
+      `(lower(h.po_no) LIKE ${p} OR lower(s.supplier_name) LIKE ${p} OR lower(h.remarks) LIKE ${p} ` +
+      `OR EXISTS (SELECT 1 FROM purchase_order_lines l WHERE l.po_id = h.id ` +
+      `AND (lower(l.item_code) LIKE ${p} OR lower(l.item_description) LIKE ${p})))`,
+    );
+  }
+  return b;
+}
+
+export const PO_FROM = `
+  FROM purchase_order_headers h
+  JOIN v_po_header_balance b ON b.po_id = h.id
+  JOIN suppliers s ON s.id = h.supplier_id`;
+
+export interface PoListTotals {
+  poCount: number;
+  lineCount: number;
+  totalPoQty: string;
+  totalReceivedQty: string;
+  totalPendingQty: string;
+  value: string;
+  pending: string;
+  received: string;
+  cancelledValue: string;
+  /** True when an item-level filter narrowed the sums to its lines (rows still show whole orders). */
+  lineScoped: boolean;
+}
+
+/**
+ * The list's total tiles, which the PO KPI cards read too (analytics), so a card shows
+ * exactly the tile of the list it opens. They add up the lines poLineScope selects: every
+ * line of the listed orders, or under an item-level filter only that filter's lines.
+ *
+ * `value` deliberately EXCLUDES cancelled orders so it means exactly what the
+ * `po_value_total` metric means (ADR-009 — one definition per KPI). Cancelled
+ * value is reported separately so nothing is hidden from the user.
+ */
+export async function poListTotals(q: PoListFilter): Promise<PoListTotals> {
+  const b = buildPoFilter(q);
+  const scope = poLineScope(q, b, 'tl');
+  const row = await queryOne<Omit<PoListTotals, 'lineScoped'>>(
+    `SELECT COUNT(DISTINCT h.id)::int AS "poCount",
+            (COUNT(tl.po_line_id) FILTER (WHERE h.status <> 'CANCELLED'))::int AS "lineCount",
+            COALESCE(SUM(tl.po_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPoQty",
+            COALESCE(SUM(tl.received_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalReceivedQty",
+            COALESCE(SUM(tl.pending_grn_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPendingQty",
+            COALESCE(SUM(tl.amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS value,
+            COALESCE(SUM(tl.pending_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS pending,
+            COALESCE(SUM(tl.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
+            COALESCE(SUM(tl.amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"
+       ${PO_FROM}
+       LEFT JOIN v_po_line_balance tl ON tl.po_id = h.id${scope ? ` AND ${scope}` : ''}
+       ${b.where()}`,
+    b.params,
+  );
+  return {
+    poCount: 0, lineCount: 0, totalPoQty: '0', totalReceivedQty: '0', totalPendingQty: '0',
+    value: '0', pending: '0', received: '0', cancelledValue: '0', ...row, lineScoped: Boolean(scope),
+  };
+}
 
 router.get(
   '/',
@@ -110,7 +254,7 @@ router.get(
       `SELECT h.status, COUNT(*) AS n ${PO_FROM} ${cb.where()} GROUP BY h.status`,
       cb.params,
     );
-    const totals = await poTotals(buildPoFilter(q));
+    const totals = await poListTotals(q);
 
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(counts.map((c) => [c.status, Number(c.n)])),
@@ -122,32 +266,31 @@ router.get(
 /* ── GET /purchase-orders/receipt-evidence/summary ──────────────────────────── */
 /* The pending POs split by their store receipts: those a receipt the link repair
    held back names (it may have come, though nothing is linked yet) and those with
-   none recorded (genuinely pending). Pending is the pending list itself: the same
-   builder and totals as GET /purchase-orders?view=pending under the same filters,
-   which is also the dashboard's Pending POs / Pending PO Value while no draft PO
-   holds lines, no line is closed with a balance and every status is the derived one
-   (all true on the 2026-10-17 copy). The two parts are the same list filtered by
-   receiptEvidence, so they add up to it exactly. */
+   none recorded (genuinely pending). Pending is the Pending PO list itself under the
+   same filters: buildPoFilter's pending view and its total tiles (poListTotals), which
+   are also the dashboard's Pending POs and Pending PO Value cards (analytics). The
+   parts are that list filtered by receiptEvidence, a property of the order, so they
+   add up to it exactly. */
 
 router.get(
   '/receipt-evidence/summary',
   requirePermission('po.view'),
-  validateQuery(poFilterSchema),
+  validateQuery(listSchema),
   asyncHandler(async (_req, res) => {
-    const q = parsedQuery<PoFilter>(res);
-    const pendingOf = (receiptEvidence?: ReceiptEvidence) => buildPoFilter({ ...q, view: 'pending', receiptEvidence });
-    const pending = await poTotals(pendingOf());
-    const awaiting = await poTotals(pendingOf('awaiting_link'));
-    const none = await poTotals(pendingOf('none_recorded'));
-    const awaitingSet = pendingOf('awaiting_link');
+    const q = parsedQuery<PoListFilter>(res);
+    const pendingOf = (receiptEvidence?: ReceiptEvidence): PoListFilter => ({ ...q, view: 'pending', receiptEvidence });
+    const pending = await poListTotals(pendingOf());
+    const awaiting = await poListTotals(pendingOf('awaiting_link'));
+    const none = await poListTotals(pendingOf('none_recorded'));
+    const awaitingSet = buildPoFilter(pendingOf('awaiting_link'));
     const lines = await awaitingLinkLines(`SELECT h.id ${PO_FROM} ${awaitingSet.where()}`, awaitingSet.params);
     const { asOf, runId } = await latestHoldRecord();
     sendOk(res, {
       asOf,
       runId,
-      pending: { pos: Number(pending.poCount), value: pending.pending },
-      awaitingLink: { pos: Number(awaiting.poCount), value: awaiting.pending, ...lines },
-      noneRecorded: { pos: Number(none.poCount), value: none.pending },
+      pending: { pos: pending.poCount, value: pending.pending },
+      awaitingLink: { pos: awaiting.poCount, value: awaiting.pending, ...lines },
+      noneRecorded: { pos: none.poCount, value: none.pending },
       notInErp: await receiptsNamingPosNotInErp(),
     });
   }),

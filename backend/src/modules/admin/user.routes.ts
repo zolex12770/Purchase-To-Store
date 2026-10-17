@@ -27,11 +27,29 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'u.created_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   isActive: z.enum(['true', 'false']).optional(),
   roleId: csvIdArray,
   departmentId: csvIdArray,
 });
+
+/** The User Master list's filter, shared with its export (which took only a search). */
+export function buildUserFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+  const b = new SqlBuilder();
+  b.addRaw('u.deleted_at IS NULL');
+  if (q.isActive) b.addRaw(`u.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
+  b.addIn('u.department_id', q.departmentId);
+  if (q.roleId?.length) {
+    const p = b.push(q.roleId);
+    b.addRaw(`EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role_id = ANY(${p}))`);
+  }
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(`(lower(u.employee_name) LIKE ${p} OR lower(u.employee_id) LIKE ${p} OR lower(u.designation) LIKE ${p} OR lower(COALESCE(u.email,'')) LIKE ${p})`);
+  }
+  return b;
+}
 
 const USER_SELECT = `
   SELECT u.id, u.employee_id, u.employee_name, u.designation, u.email, u.mobile_no,
@@ -52,19 +70,7 @@ router.get(
   validateQuery(listSchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof listSchema>>(res);
-
-    const b = new SqlBuilder();
-    b.addRaw('u.deleted_at IS NULL');
-    if (q.isActive) b.addRaw(`u.is_active = ${q.isActive === 'true' ? 'TRUE' : 'FALSE'}`);
-    b.addIn('u.department_id', q.departmentId);
-    if (q.roleId?.length) {
-      const p = b.push(q.roleId);
-      b.addRaw(`EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role_id = ANY(${p}))`);
-    }
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(`(lower(u.employee_name) LIKE ${p} OR lower(u.employee_id) LIKE ${p} OR lower(u.designation) LIKE ${p} OR lower(COALESCE(u.email,'')) LIKE ${p})`);
-    }
+    const b = buildUserFilter(q);
 
     const totalRow = await queryOne<{ n: string }>(`SELECT COUNT(*) AS n FROM users u ${b.where()}`, b.params);
 

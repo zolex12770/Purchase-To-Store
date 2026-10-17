@@ -1,14 +1,31 @@
 /**
  * Export dataset catalogue (SRS §22, §35).
  *
- * Each dataset declares its permission, its human-readable column headers, and a
- * filter-aware query. Exports therefore honour the SAME filters the on-screen list
- * used, and "export current view" and "export full dataset" are the same code path
- * with different filter arguments.
+ * Each dataset declares its permission, its human-readable column headers, and the
+ * list it exports: the export parses the request with that list's own query schema
+ * and selects its rows through that list's own filter builder, so a filtered export
+ * holds exactly the rows the list shows. "Export current view" and "export full
+ * dataset" are the same code path with different filter arguments.
+ *
+ * Until 2026-10-16 each dataset kept a smaller filter of its own, and ten filtered
+ * exports differed from their lists on staging (audit A7, F06): indents for one item
+ * showed 8 on screen and 1,814 in the file, GRNs pending QC 0 and 2,718, the "my
+ * requisitions" view 22 requisitions and all 1,256 in the file.
  */
-import { SqlBuilder } from '../../db/index.js';
-import { buildPoFilter, PO_FROM, type PoFilter } from '../purchase-order/po-filter.js';
+import type { z } from 'zod';
+import type { SqlBuilder } from '../../db/index.js';
+import { csvIdArray } from '../../core/http.js';
+import { listSchema as itemListSchema, buildItemFilter } from '../masters/item.routes.js';
+import { listSchema as supplierListSchema, buildSupplierFilter } from '../masters/supplier.routes.js';
+import { listSchema as indentListSchema, buildIndentFilter, indentLineScope } from '../indent/routes.js';
+import { listSchema as poListSchema, buildPoFilter, poLineScope, PO_FROM } from '../purchase-order/routes.js';
 import { awaitingLinkCount } from '../purchase-order/receipt-evidence.js';
+import { listSchema as grnListSchema, buildGrnFilter, grnLineScope, GRN_FROM } from '../grn/routes.js';
+import {
+  listSchema as requisitionListSchema, buildFilter as buildRequisitionFilter, LIST_FROM as REQUISITION_FROM,
+} from '../requisition/routes.js';
+import { listSchema as userListSchema, buildUserFilter } from '../admin/user.routes.js';
+import { listSchema as auditListSchema, buildFilter as buildAuditFilter } from '../admin/audit.routes.js';
 
 export interface ColumnDef {
   /** Column name as returned by the query. */
@@ -20,30 +37,9 @@ export interface ColumnDef {
   width?: number;
 }
 
-export interface DatasetFilters {
-  dateFrom?: string;
-  dateTo?: string;
-  status?: string[];
-  supplierId?: number[];
-  itemId?: number[];
-  departmentId?: number[];
-  costCentreId?: number[];
-  indentTypeId?: number[];
-  poTypeId?: number[];
-  machineId?: number[];
-  hodId?: number[];
-  userId?: number[];
-  requesterId?: number[];
-  hodStatus?: string[];
-  storeStatus?: string[];
-  search?: string;
-  ids?: number[];
-  /** The Purchase Order list's own filters (purchase-order/po-filter.ts). */
-  mainGroupId?: number[];
-  sourceMode?: PoFilter['sourceMode'];
-  view?: PoFilter['view'];
-  overdue?: PoFilter['overdue'];
-  receiptEvidence?: PoFilter['receiptEvidence'];
+export interface ExportContext {
+  /** The signed-in user: the requisition views "mine" and "hod-pending" are theirs, as on screen. */
+  userId: number;
 }
 
 export interface DatasetDef {
@@ -51,17 +47,34 @@ export interface DatasetDef {
   title: string;
   permission: string;
   columns: ColumnDef[];
-  build: (f: DatasetFilters) => { sql: string; params: unknown[] };
+  /** The exported list's query schema, plus `ids` to export chosen records only. */
+  schema: z.ZodTypeAny;
+  build(q: Record<string, unknown>, ctx: ExportContext): { sql: string; params: unknown[] };
 }
 
-const like = (b: SqlBuilder, term: string, columns: string[]): void => {
-  const p = b.push(`%${term.toLowerCase()}%`);
-  b.addRaw(`(${columns.map((c) => `lower(COALESCE(${c},'')) LIKE ${p}`).join(' OR ')})`);
-};
+function dataset<S extends z.ZodTypeAny>(def: Omit<DatasetDef, 'schema' | 'build'> & {
+  schema: S;
+  build: (q: z.infer<S>, ctx: ExportContext) => { sql: string; params: unknown[] };
+}): DatasetDef {
+  return def as DatasetDef;
+}
+
+/**
+ * `column IN (the list's own row query)`: the list counts its rows with exactly this
+ * FROM and WHERE, so the export can neither gain nor lose one.
+ */
+const inList = (column: string, listId: string, listFrom: string, b: SqlBuilder): string =>
+  `${column} IN (SELECT ${listId} ${listFrom} ${b.where()})`;
+
+const ITEM_FROM = 'FROM items i';
+const SUPPLIER_FROM = 'FROM suppliers s';
+const INDENT_FROM = 'FROM purchase_indent_headers h';
+const USER_FROM = 'FROM users u';
+const AUDIT_FROM = 'FROM audit_logs a';
 
 export const DATASETS: Record<string, DatasetDef> = {
   /* ── Masters ──────────────────────────────────────────────────────────────── */
-  items: {
+  items: dataset({
     key: 'items',
     title: 'Item Master',
     permission: 'item.export',
@@ -80,13 +93,10 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'standard_rate', header: 'Standard Rate', type: 'money', width: 14 },
       { key: 'is_active', header: 'Active', width: 8 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addRaw('i.deleted_at IS NULL');
-      b.addIn('i.id', f.ids);
-      b.addIn('i.department_id', f.departmentId);
-      b.addIn('i.cost_centre_id', f.costCentreId);
-      if (f.search) like(b, f.search, ['i.item_code', 'i.item_description', 'i.hsn_code']);
+    schema: itemListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildItemFilter(q);
+      b.addIn('i.id', q.ids);
       return {
         sql: `SELECT i.item_code, i.item_description, it.name AS item_type_name,
                      d.name AS department_name, cc.name AS cost_centre_name,
@@ -101,14 +111,14 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN lookups smg ON smg.id = i.sub_main_group_id
                 LEFT JOIN lookups ind ON ind.id = i.indent_type_id
                 LEFT JOIN lookups u   ON u.id   = i.uom_id
-                ${b.where()}
+               WHERE ${inList('i.id', 'i.id', ITEM_FROM, b)}
                ORDER BY i.item_code`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  suppliers: {
+  suppliers: dataset({
     key: 'suppliers',
     title: 'Supplier Master',
     permission: 'supplier.export',
@@ -127,23 +137,24 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'contact_person', header: 'Contact Person', width: 22 },
       { key: 'is_active', header: 'Active', width: 8 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addRaw('s.deleted_at IS NULL');
-      b.addIn('s.id', f.ids ?? f.supplierId);
-      if (f.search) like(b, f.search, ['s.supplier_name', 's.supplier_code', 's.city', 's.gst_no']);
+    schema: supplierListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildSupplierFilter(q);
+      b.addIn('s.id', q.ids);
       return {
         sql: `SELECT s.supplier_code, s.supplier_name, s.address, s.city, s.state, s.country,
                      s.mobile_no, s.email, s.gst_no, s.payment_terms, s.currency_code,
                      s.contact_person, s.is_active
-                FROM suppliers s ${b.where()} ORDER BY s.supplier_name`,
+                FROM suppliers s
+               WHERE ${inList('s.id', 's.id', SUPPLIER_FROM, b)}
+               ORDER BY s.supplier_name`,
         params: b.params,
       };
     },
-  },
+  }),
 
   /* ── Transactions ─────────────────────────────────────────────────────────── */
-  indents: {
+  indents: dataset({
     key: 'indents',
     title: 'Purchase Indents',
     permission: 'indent.export',
@@ -165,16 +176,10 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'rejection_reason', header: 'Rejection Reason', width: 34 },
       { key: 'remarks', header: 'Remarks', width: 30 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addIn('h.id', f.ids);
-      b.addIn('h.status', f.status);
-      b.addIn('h.indent_type_id', f.indentTypeId);
-      b.addIn('h.department_id', f.departmentId);
-      b.addIn('h.cost_centre_id', f.costCentreId);
-      b.add('h.indent_date >= ?', f.dateFrom);
-      b.add('h.indent_date <= ?', f.dateTo);
-      if (f.search) like(b, f.search, ['h.indent_no', 'h.remarks']);
+    schema: indentListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildIndentFilter(q);
+      b.addIn('h.id', q.ids);
       return {
         sql: `SELECT h.indent_no, h.indent_date, h.indent_time, it.name AS indent_type_name,
                      d.name AS department_name, cc.name AS cost_centre_name, h.status,
@@ -188,14 +193,16 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
                 LEFT JOIN users u  ON u.id  = h.requested_by_user_id
                 LEFT JOIN users ap ON ap.id = h.approved_by
-                ${b.where()}
+               WHERE ${inList('h.id', 'h.id', INDENT_FROM, b)}
                ORDER BY h.indent_date DESC, h.indent_no DESC`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  'indent-lines': {
+  // The lines the indent list's tiles add up: every line of the indents it shows, or under
+  // the item filter only that item's lines (indentLineScope).
+  'indent-lines': dataset({
     key: 'indent-lines',
     title: 'Purchase Indent Lines',
     permission: 'indent.export',
@@ -215,22 +222,11 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'cost_centre_name', header: 'Cost Centre', width: 22 },
       { key: 'line_status', header: 'Line Status', width: 18 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addIn('v.indent_id', f.ids);
-      b.addIn('v.indent_status', f.status);
-      b.addIn('v.item_id', f.itemId);
-      b.addIn('v.department_id', f.departmentId);
-      b.addIn('v.cost_centre_id', f.costCentreId);
-      b.addIn('v.indent_type_id', f.indentTypeId);
-      b.addIn('v.requested_by_user_id', f.userId || f.requesterId);
-      b.add('v.indent_date >= ?', f.dateFrom);
-      b.add('v.indent_date <= ?', f.dateTo);
-      if (f.hodId && f.hodId.length > 0) {
-        const p = b.push(f.hodId);
-        b.addRaw(`EXISTS (SELECT 1 FROM items i JOIN lookups d ON d.id = i.department_id WHERE i.id = v.item_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-      }
-      if (f.search) like(b, f.search, ['v.indent_no', 'v.item_code', 'v.item_description']);
+    schema: indentListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildIndentFilter(q);
+      b.addIn('h.id', q.ids);
+      const scope = indentLineScope(q, b, 'v');
       return {
         sql: `SELECT v.indent_no, v.indent_date, v.indent_status, v.line_no, v.item_code,
                      v.item_description, v.indent_qty, u.code AS uom_code, v.ordered_qty,
@@ -240,14 +236,14 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN lookups u  ON u.id  = v.uom_id
                 LEFT JOIN lookups d  ON d.id  = v.department_id
                 LEFT JOIN lookups cc ON cc.id = v.cost_centre_id
-                ${b.where()}
+               WHERE ${inList('v.indent_id', 'h.id', INDENT_FROM, b)}${scope ? ` AND ${scope}` : ''}
                ORDER BY v.indent_date DESC, v.indent_no DESC, v.line_no`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  'purchase-orders': {
+  'purchase-orders': dataset({
     key: 'purchase-orders',
     title: 'Purchase Orders',
     permission: 'po.export',
@@ -272,13 +268,12 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'remarks', header: 'Remarks', width: 30 },
       { key: 'store_receipts_awaiting_link', header: 'Store Receipts Awaiting Link', type: 'number', width: 16 },
     ],
-    build: (f) => {
-      // The list's own builder: the export of the pending view (overdue, receipt
-      // evidence, main group, search through the lines) holds exactly the rows the
-      // list shows. This export used to rebuild part of it and ignored the view, so
-      // "Export" on Pending PO wrote every PO.
-      const b = buildPoFilter(f);
-      b.addIn('h.id', f.ids);
+    // The Pending / Complete views, "overdue only" and the receipt evidence included: the
+    // file once held every PO.
+    schema: poListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildPoFilter(q);
+      b.addIn('h.id', q.ids);
       return {
         sql: `SELECT h.po_no, h.po_date, h.po_time, pt.name AS po_type_name, s.supplier_name,
                      h.status, h.source_mode,
@@ -288,16 +283,20 @@ export const DATASETS: Record<string, DatasetDef> = {
                      b.total_amount, b.received_amount, b.pending_amount,
                      h.payment_terms, h.delivery_date, h.remarks,
                      ${awaitingLinkCount('h.id')} AS store_receipts_awaiting_link
-                ${PO_FROM}
+                FROM purchase_order_headers h
+                JOIN v_po_header_balance b ON b.po_id = h.id
+                JOIN suppliers s ON s.id = h.supplier_id
                 LEFT JOIN lookups pt ON pt.id = h.po_type_id
-                ${b.where()}
+               WHERE ${inList('h.id', 'h.id', PO_FROM, b)}
                ORDER BY h.po_date DESC, h.po_no DESC`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  'po-lines': {
+  // The lines the PO list's tiles add up: every line of the orders it shows, or under an
+  // item-level filter only that filter's lines (poLineScope).
+  'po-lines': dataset({
     key: 'po-lines',
     title: 'Purchase Order Lines',
     permission: 'po.export',
@@ -321,16 +320,11 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'item_specification', header: 'Item Specification', width: 40 },
       { key: 'line_status', header: 'Line Status', width: 20 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addIn('v.po_id', f.ids);
-      b.addIn('v.po_status', f.status);
-      b.addIn('v.supplier_id', f.supplierId);
-      b.addIn('v.po_type_id', f.poTypeId);
-      b.addIn('v.item_id', f.itemId);
-      b.add('v.po_date >= ?', f.dateFrom);
-      b.add('v.po_date <= ?', f.dateTo);
-      if (f.search) like(b, f.search, ['v.po_no', 'v.item_code', 'v.item_description', 's.supplier_name']);
+    schema: poListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildPoFilter(q);
+      b.addIn('h.id', q.ids);
+      const scope = poLineScope(q, b, 'v');
       return {
         sql: `SELECT v.po_no, v.po_date, pt.name AS po_type_name, s.supplier_name,
                      (SELECT string_agg(DISTINCT src.indent_no, ', ')
@@ -342,14 +336,14 @@ export const DATASETS: Record<string, DatasetDef> = {
                 JOIN suppliers s ON s.id = v.supplier_id
                 LEFT JOIN lookups pt ON pt.id = v.po_type_id
                 LEFT JOIN lookups u  ON u.id  = v.uom_id
-                ${b.where()}
+               WHERE ${inList('v.po_id', 'h.id', PO_FROM, b)}${scope ? ` AND ${scope}` : ''}
                ORDER BY v.po_date DESC, v.po_no DESC, v.line_no`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  grn: {
+  grn: dataset({
     key: 'grn',
     title: 'Goods Receipt Notes',
     permission: 'grn.export',
@@ -368,31 +362,11 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'total_amount', header: 'Value', type: 'money', width: 16 },
       { key: 'remarks', header: 'Remarks', width: 30 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addIn('g.id', f.ids);
-      b.addIn('g.status', f.status);
-      b.addIn('g.supplier_id', f.supplierId);
-      b.addIn('g.received_by_user_id', f.userId);
-      b.add('g.grn_date >= ?', f.dateFrom);
-      b.add('g.grn_date <= ?', f.dateTo);
-      if (f.itemId && f.itemId.length > 0) {
-        const p = b.push(f.itemId);
-        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l WHERE l.grn_id = g.id AND l.item_id = ANY(${p}))`);
-      }
-      if (f.departmentId && f.departmentId.length > 0) {
-        const p = b.push(f.departmentId);
-        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id WHERE l.grn_id = g.id AND i.department_id = ANY(${p}))`);
-      }
-      if (f.costCentreId && f.costCentreId.length > 0) {
-        const p = b.push(f.costCentreId);
-        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id WHERE l.grn_id = g.id AND i.cost_centre_id = ANY(${p}))`);
-      }
-      if (f.hodId && f.hodId.length > 0) {
-        const p = b.push(f.hodId);
-        b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id JOIN lookups d ON d.id = i.department_id WHERE l.grn_id = g.id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-      }
-      if (f.search) like(b, f.search, ['g.grn_no', 'p.po_no', 's.supplier_name', 'g.challan_no']);
+    // QC status, PO, mode and GRN type included: the file once held every GRN.
+    schema: grnListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildGrnFilter(q);
+      b.addIn('g.id', q.ids);
       return {
         sql: `SELECT g.grn_no, g.grn_date, g.grn_time, p.po_no, pt.name AS po_type_name,
                      s.supplier_name, g.status, g.challan_no, u.employee_name AS received_by_name,
@@ -407,14 +381,16 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN (SELECT grn_id, COUNT(*)::int AS line_count,
                                   SUM(grn_qty) AS total_qty, SUM(amount) AS total_amount
                              FROM grn_lines GROUP BY grn_id) agg ON agg.grn_id = g.id
-                ${b.where()}
+               WHERE ${inList('g.id', 'g.id', GRN_FROM, b)}
                ORDER BY g.grn_date DESC, g.grn_no DESC`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  'grn-lines': {
+  // The lines the GRN list's tiles add up: every line of the receipts it shows, or under
+  // an item-level filter only that filter's lines (grnLineScope).
+  'grn-lines': dataset({
     key: 'grn-lines',
     title: 'GRN Lines',
     permission: 'grn.export',
@@ -434,28 +410,11 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'pending_grn_qty', header: 'Pending GRN Qty', type: 'number', width: 16 },
       { key: 'status', header: 'GRN Status', width: 12 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addIn('g.id', f.ids);
-      b.addIn('g.status', f.status);
-      b.addIn('g.supplier_id', f.supplierId);
-      b.addIn('gl.item_id', f.itemId);
-      b.addIn('g.received_by_user_id', f.userId);
-      b.add('g.grn_date >= ?', f.dateFrom);
-      b.add('g.grn_date <= ?', f.dateTo);
-      if (f.departmentId && f.departmentId.length > 0) {
-        const p = b.push(f.departmentId);
-        b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = gl.item_id AND i.department_id = ANY(${p}))`);
-      }
-      if (f.costCentreId && f.costCentreId.length > 0) {
-        const p = b.push(f.costCentreId);
-        b.addRaw(`EXISTS (SELECT 1 FROM items i WHERE i.id = gl.item_id AND i.cost_centre_id = ANY(${p}))`);
-      }
-      if (f.hodId && f.hodId.length > 0) {
-        const p = b.push(f.hodId);
-        b.addRaw(`EXISTS (SELECT 1 FROM items i JOIN lookups d ON d.id = i.department_id WHERE i.id = gl.item_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-      }
-      if (f.search) like(b, f.search, ['g.grn_no', 'p.po_no', 'gl.item_code', 'gl.item_description']);
+    schema: grnListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildGrnFilter(q);
+      b.addIn('g.id', q.ids);
+      const scope = grnLineScope(q, b, 'gl');
       return {
         // po_no is joined through the LINE's own po_line_id, not the header's
         // po_id — correct for a multi-PO GRN, and NULL for a Direct GRN line.
@@ -470,15 +429,15 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN lookups pt ON pt.id = p.po_type_id
                 LEFT JOIN lookups u  ON u.id  = gl.uom_id
                 LEFT JOIN v_po_line_balance bal ON bal.po_line_id = gl.po_line_id
-                ${b.where()}
+               WHERE ${inList('gl.grn_id', 'g.id', GRN_FROM, b)}${scope ? ` AND ${scope}` : ''}
                ORDER BY g.grn_date DESC, g.grn_no DESC, gl.line_no`,
         params: b.params,
       };
     },
-  },
+  }),
 
   /* ── Requisition (Purchase Module tab 4) ─────────────────────────────────── */
-  requisitions: {
+  requisitions: dataset({
     key: 'requisitions',
     title: 'Requisitions',
     permission: 'requisition.export',
@@ -499,20 +458,10 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'store_status', header: 'Store Status', width: 14 },
       { key: 'remarks', header: 'Remarks', width: 30 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addIn('h.id', f.ids);
-      b.addIn('h.status', f.status);
-      b.addIn('b.hod_status', f.hodStatus);
-      b.addIn('b.store_status', f.storeStatus);
-      b.addIn('h.department_id', f.departmentId);
-      b.addIn('h.cost_centre_id', f.costCentreId);
-      b.addIn('h.machine_id', f.machineId);
-      b.addIn('h.hod_user_id', f.hodId);
-      b.addIn('h.requester_user_id', f.userId || f.requesterId);
-      b.add('h.requisition_date >= ?', f.dateFrom);
-      b.add('h.requisition_date <= ?', f.dateTo);
-      if (f.search) like(b, f.search, ['h.requisition_no', 'h.employee_name', 'h.remarks']);
+    schema: requisitionListSchema.extend({ ids: csvIdArray }),
+    build: (q, ctx) => {
+      const b = buildRequisitionFilter(q, ctx.userId);
+      b.addIn('h.id', q.ids);
       return {
         sql: `SELECT h.requisition_no, h.requisition_date, h.employee_name, h.employee_code,
                      h.department_name, h.hod_name, m.name AS machine_name, cc.name AS cost_centre_name,
@@ -522,14 +471,16 @@ export const DATASETS: Record<string, DatasetDef> = {
                 JOIN v_requisition_header_balance b ON b.requisition_id = h.id
                 LEFT JOIN lookups m  ON m.id  = h.machine_id
                 LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
-                ${b.where()}
+               WHERE ${inList('h.id', 'h.id', REQUISITION_FROM, b)}
                ORDER BY h.requisition_date DESC, h.requisition_no DESC`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  'requisition-lines': {
+  // Every line of the requisitions the requisition list shows — its Mine, HOD and Store
+  // queue views included, which the file used to ignore.
+  'requisition-lines': dataset({
     key: 'requisition-lines',
     title: 'Requisition Lines',
     permission: 'requisition.export',
@@ -557,21 +508,10 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'issued_qty', header: 'Issued Qty', type: 'number', width: 12 },
       { key: 'remarks', header: 'Remarks', width: 30 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addIn('h.id', f.ids);
-      b.addIn('h.status', f.status);
-      b.addIn('bal.hod_status', f.hodStatus);
-      b.addIn('bal.store_status', f.storeStatus);
-      b.addIn('h.department_id', f.departmentId);
-      b.addIn('h.cost_centre_id', f.costCentreId);
-      b.addIn('h.machine_id', f.machineId);
-      b.addIn('h.hod_user_id', f.hodId);
-      b.addIn('h.requester_user_id', f.userId || f.requesterId);
-      b.addIn('l.item_id', f.itemId);
-      b.add('h.requisition_date >= ?', f.dateFrom);
-      b.add('h.requisition_date <= ?', f.dateTo);
-      if (f.search) like(b, f.search, ['h.requisition_no', 'l.item_code', 'l.item_description']);
+    schema: requisitionListSchema.extend({ ids: csvIdArray }),
+    build: (q, ctx) => {
+      const b = buildRequisitionFilter(q, ctx.userId);
+      b.addIn('h.id', q.ids);
       return {
         sql: `SELECT l.item_code, l.item_description, u.code AS uom_code, l.main_group_name,
                      h.employee_name, h.department_name, m.name AS machine_name, cc.name AS cost_centre_name,
@@ -588,14 +528,14 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN lookups u  ON u.id  = l.uom_id
                 LEFT JOIN lookups m  ON m.id  = h.machine_id
                 LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
-                ${b.where()}
+               WHERE ${inList('h.id', 'h.id', REQUISITION_FROM, b)}
                ORDER BY h.requisition_date DESC, h.requisition_no DESC, l.line_no`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  users: {
+  users: dataset({
     key: 'users',
     title: 'User Master',
     permission: 'user.export',
@@ -610,11 +550,10 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'is_active', header: 'Active', width: 8 },
       { key: 'last_login_at', header: 'Last Sign-in', type: 'datetime', width: 20 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.addRaw('u.deleted_at IS NULL');
-      b.addIn('u.id', f.ids);
-      if (f.search) like(b, f.search, ['u.employee_name', 'u.employee_id', 'u.designation']);
+    schema: userListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildUserFilter(q);
+      b.addIn('u.id', q.ids);
       return {
         sql: `SELECT u.employee_id, u.employee_name, u.designation, d.name AS department_name,
                      u.email, u.mobile_no,
@@ -624,14 +563,14 @@ export const DATASETS: Record<string, DatasetDef> = {
                      u.is_active, u.last_login_at
                 FROM users u
                 LEFT JOIN lookups d ON d.id = u.department_id
-                ${b.where()}
+               WHERE ${inList('u.id', 'u.id', USER_FROM, b)}
                ORDER BY u.employee_name`,
         params: b.params,
       };
     },
-  },
+  }),
 
-  audit: {
+  audit: dataset({
     key: 'audit',
     title: 'Audit Log',
     permission: 'audit.export',
@@ -647,20 +586,22 @@ export const DATASETS: Record<string, DatasetDef> = {
       { key: 'message', header: 'Message', width: 44 },
       { key: 'ip_address', header: 'IP Address', width: 16 },
     ],
-    build: (f) => {
-      const b = new SqlBuilder();
-      b.add('a.created_at >= ?', f.dateFrom);
-      if (f.dateTo) b.add("a.created_at < (?::date + interval '1 day')", f.dateTo);
-      if (f.search) like(b, f.search, ['a.entity_label', 'a.message', 'a.actor_name', 'a.action', 'a.entity']);
+    // Action, entity, record, user, source and result included (entity=grn: 44 on screen,
+    // 1,430 in the file); no silent 50,000-row cut either — the route refuses instead.
+    schema: auditListSchema.extend({ ids: csvIdArray }),
+    build: (q) => {
+      const b = buildAuditFilter(q);
+      b.addIn('a.id', q.ids);
       return {
         sql: `SELECT a.created_at, a.actor_employee_id, a.actor_name, a.action, a.entity,
                      a.entity_label, a.source, a.result, a.message, a.ip_address
-                FROM audit_logs a ${b.where()}
-               ORDER BY a.created_at DESC LIMIT 50000`,
+                FROM audit_logs a
+               WHERE ${inList('a.id', 'a.id', AUDIT_FROM, b)}
+               ORDER BY a.created_at DESC, a.id DESC`,
         params: b.params,
       };
     },
-  },
+  }),
 };
 
 export const DATASET_KEYS = Object.keys(DATASETS);

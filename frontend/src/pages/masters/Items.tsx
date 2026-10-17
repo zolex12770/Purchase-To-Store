@@ -230,7 +230,7 @@ export default function Items() {
         actions={
           <>
             {can('item.export') && (
-              <Button variant="secondary" size="sm" icon={<Download size={13} />} onClick={() => void downloadFile('/io/export/items?format=xlsx', 'items.xlsx')}>
+              <Button variant="secondary" size="sm" icon={<Download size={13} />} onClick={() => void downloadFile(`/io/export/items?format=xlsx${query.replace('?', '&')}`, 'items.xlsx')}>
                 Export
               </Button>
             )}
@@ -278,7 +278,7 @@ export default function Items() {
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(i) => setDetailId(i.id)}
         selectedKey={detailId}
-        onExport={can('item.export') ? (format) => void downloadFile(`/io/export/items?format=${format}`, `items.${format}`) : undefined}
+        onExport={can('item.export') ? (format) => void downloadFile(`/io/export/items?format=${format}${query.replace('?', '&')}`, `items.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle="No items yet"
         emptyMessage="Add your first item, or import the Item Master from Excel."

@@ -21,6 +21,12 @@ import { PO_AFTER_RECEIPT_DAYS, type HoldReason } from '../admin/store-grn-links
 export const RECEIPT_EVIDENCE = ['awaiting_link', 'none_recorded'] as const;
 export type ReceiptEvidence = (typeof RECEIPT_EVIDENCE)[number];
 
+/** Each option in the words the PO list shows, which an export's header repeats. */
+export const RECEIPT_EVIDENCE_LABEL: Record<ReceiptEvidence, string> = {
+  awaiting_link: 'Store receipt awaiting link',
+  none_recorded: 'No receipt recorded',
+};
+
 /** A hold row's reason: the link run's HOLD_REASONS, or a link an undo took back. */
 export type HoldRowReason = HoldReason | 'UNDONE';
 

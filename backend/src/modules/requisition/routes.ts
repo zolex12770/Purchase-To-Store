@@ -170,7 +170,8 @@ const SORTABLE: Record<string, string> = {
   createdAt: 'h.created_at',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same, views included (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   /** User-facing, independent status columns (v_requisition_header_balance) — never merged with `status`. */
   hodStatus: csvArray,
@@ -186,17 +187,20 @@ const listSchema = listQuerySchema.extend({
   dateTo: dateStr.optional(),
   /** `mine` | `hod-pending` | `store-queue` | omitted (everything the caller may view). */
   view: z.enum(['mine', 'hod-pending', 'store-queue']).optional(),
+  /** The requisitions the requisition KPIs count: every one but cancelled. */
+  excludeCancelled: z.enum(['true', 'false']).optional(),
 });
 
-const LIST_FROM = `
+export const LIST_FROM = `
   FROM requisition_headers h
   JOIN v_requisition_header_balance b ON b.requisition_id = h.id
   LEFT JOIN users ru ON ru.id = h.requester_user_id
   LEFT JOIN lookups d ON d.id = h.department_id`;
 
-function buildFilter(q: z.infer<typeof listSchema>, userId: number): SqlBuilder {
+export function buildFilter(q: z.infer<typeof listSchema>, userId: number): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
+  if (q.excludeCancelled === 'true') b.addRaw("h.status <> 'CANCELLED'");
   b.addIn('b.hod_status', q.hodStatus);
   b.addIn('b.store_status', q.storeStatus);
   b.addIn('h.department_id', q.departmentId);

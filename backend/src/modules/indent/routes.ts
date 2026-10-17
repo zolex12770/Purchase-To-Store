@@ -21,6 +21,7 @@ import {
   assertIndentTransition, assertIndentEditable, assertNotAlready, type IndentStatus,
 } from '../../domain/status.js';
 import { toQty, toRate } from '../../domain/money.js';
+import { itemLineScope } from '../../domain/item-scope.js';
 
 const router = Router();
 
@@ -34,7 +35,8 @@ const SORTABLE: Record<string, string> = {
   totalValue: 'b.total_estimated_value',
 };
 
-const listSchema = listQuerySchema.extend({
+/** The list's query; its Export accepts exactly the same (io/datasets.ts). */
+export const listSchema = listQuerySchema.extend({
   status: csvArray,
   indentTypeId: csvIdArray,
   departmentId: csvIdArray,
@@ -46,11 +48,37 @@ const listSchema = listQuerySchema.extend({
   dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   pendingOnly: z.enum(['true', 'false']).optional(),
+  /** Indents with quantity still awaiting a PO (the "Approved Qty Awaiting PO" KPI). The KPI
+      drilled here before this filter existed, and the list showed all 1,814 indents. */
+  eligibleOnly: z.enum(['true', 'false']).optional(),
+  /** The indents the "Total Indents" KPI counts: every one but cancelled. */
+  excludeCancelled: z.enum(['true', 'false']).optional(),
 });
 
-function buildIndentFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+/** The list's filters (paging and sort aside): what the indent KPIs count by, too. */
+export type IndentListFilter = Omit<z.infer<typeof listSchema>, 'page' | 'pageSize' | 'sortBy' | 'sortDir'>;
+
+/**
+ * The indent lines the list's item filter selects, as a condition on `line`; '' when none
+ * is set (domain/item-scope.ts). Department, cost centre and HOD stay the indent's own,
+ * as the list has always filtered them: a line copies its item's department (create,
+ * below), and the KPIs that filtered on that copy counted an indent of another department
+ * that the list they opened did not show (2026-10-17 review).
+ */
+export const indentLineScope = (q: IndentListFilter, b: SqlBuilder, line: string): string =>
+  itemLineScope({ itemId: q.itemId }, b, line);
+
+export function buildIndentFilter(q: IndentListFilter): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
+  if (q.excludeCancelled === 'true') b.addRaw("h.status <> 'CANCELLED'");
+  // "Awaiting purchase order" asks it of a line the item filter selects, so the indents
+  // listed are those holding the quantity the "Approved Qty Awaiting PO" card adds up.
+  const scope = indentLineScope(q, b, 'l');
+  const inScope = scope ? ` AND ${scope}` : '';
+  if (q.eligibleOnly === 'true') {
+    b.addRaw(`EXISTS (SELECT 1 FROM v_indent_line_balance l WHERE l.indent_id = h.id AND l.is_eligible_for_po${inScope})`);
+  }
   b.addIn('h.indent_type_id', q.indentTypeId);
   b.addIn('h.department_id', q.departmentId);
   b.addIn('h.cost_centre_id', q.costCentreId);
@@ -63,10 +91,7 @@ function buildIndentFilter(q: z.infer<typeof listSchema>): SqlBuilder {
     b.addRaw(`(h.approved_by = ANY(${p}) OR EXISTS (SELECT 1 FROM lookups d WHERE d.id = h.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p})))`);
   }
   if (q.pendingOnly === 'true') b.addRaw("h.status = 'PENDING_APPROVAL'");
-  if (q.itemId && q.itemId.length > 0) {
-    const p = b.push(q.itemId);
-    b.addRaw(`EXISTS (SELECT 1 FROM purchase_indent_lines l WHERE l.indent_id = h.id AND l.item_id = ANY(${p}))`);
-  }
+  if (scope) b.addRaw(`EXISTS (SELECT 1 FROM purchase_indent_lines l WHERE l.indent_id = h.id AND ${scope})`);
   if (q.search) {
     const p = b.push(`%${q.search.toLowerCase()}%`);
     b.addRaw(
@@ -76,6 +101,43 @@ function buildIndentFilter(q: z.infer<typeof listSchema>): SqlBuilder {
     );
   }
   return b;
+}
+
+export interface IndentListTotals {
+  indentCount: number;
+  lineCount: number;
+  totalIndentQty: string;
+  totalOrderedQty: string;
+  totalPendingQty: string;
+  totalEstimatedValue: string;
+  /** True when the item filter narrowed the sums to its lines (rows still show whole indents). */
+  lineScoped: boolean;
+}
+
+/**
+ * The list's total tiles, which the indent KPI cards read too (analytics), so a card shows
+ * exactly the tile of the list it opens. They add up the lines indentLineScope selects:
+ * every line of the listed indents, or under the item filter only that item's lines.
+ */
+export async function indentListTotals(q: IndentListFilter): Promise<IndentListTotals> {
+  const b = buildIndentFilter(q);
+  const scope = indentLineScope(q, b, 'tl');
+  const row = await queryOne<Omit<IndentListTotals, 'lineScoped'>>(
+    `SELECT COUNT(DISTINCT h.id)::int AS "indentCount",
+            COUNT(tl.indent_line_id)::int AS "lineCount",
+            COALESCE(SUM(tl.indent_qty), 0) AS "totalIndentQty",
+            COALESCE(SUM(tl.ordered_qty), 0) AS "totalOrderedQty",
+            COALESCE(SUM(tl.pending_qty), 0) AS "totalPendingQty",
+            COALESCE(SUM(tl.estimated_value), 0) AS "totalEstimatedValue"
+       FROM purchase_indent_headers h
+       LEFT JOIN v_indent_line_balance tl ON tl.indent_id = h.id${scope ? ` AND ${scope}` : ''}
+       ${b.where()}`,
+    b.params,
+  );
+  return {
+    indentCount: 0, lineCount: 0, totalIndentQty: '0', totalOrderedQty: '0', totalPendingQty: '0',
+    totalEstimatedValue: '0', ...row, lineScoped: Boolean(scope),
+  };
 }
 
 /* ── GET /indents ───────────────────────────────────────────────────────────── */
@@ -131,31 +193,7 @@ router.get(
       cb.params,
     );
 
-    // Dynamic totals across the active filter
-    const tb = buildIndentFilter(q);
-    const totals = await queryOne<{
-      indentCount: string;
-      lineCount: string;
-      totalIndentQty: string;
-      totalOrderedQty: string;
-      totalPendingQty: string;
-      totalEstimatedValue: string;
-    }>(
-      `SELECT COUNT(DISTINCT h.id)::int AS "indentCount",
-              COALESCE(SUM(b.line_count), 0)::int AS "lineCount",
-              COALESCE(SUM(b.total_indent_qty), 0) AS "totalIndentQty",
-              COALESCE(SUM(b.total_ordered_qty), 0) AS "totalOrderedQty",
-              COALESCE(SUM(b.total_pending_qty), 0) AS "totalPendingQty",
-              COALESCE(SUM(b.total_estimated_value), 0) AS "totalEstimatedValue"
-         FROM purchase_indent_headers h
-         JOIN v_indent_header_balance b ON b.indent_id = h.id
-         LEFT JOIN lookups it ON it.id = h.indent_type_id
-         LEFT JOIN lookups d  ON d.id  = h.department_id
-         LEFT JOIN lookups cc ON cc.id = h.cost_centre_id
-         LEFT JOIN suppliers s ON s.id = h.suggested_supplier_id
-         ${tb.where()}`,
-      tb.params,
-    );
+    const totals = await indentListTotals(q);
 
     sendPage(res, rows, total, q.page, q.pageSize, {
       statusCounts: Object.fromEntries(counts.map((c) => [c.status, Number(c.n)])),

@@ -143,7 +143,7 @@ export function ModuleAnalysis({
       ) : featured.length > 0 ? (
         <KpiGrid min={215}>
           {featured.map((m) => (
-            <KpiCard key={m.key} metric={m} onClick={() => navigate(drilldownLink(m.drilldown, {}, filters as FilterState))} />
+            <KpiCard key={m.key} metric={m} onClick={m.drilldown ? () => navigate(drilldownLink(m.drilldown, {}, filters as FilterState)) : undefined} />
           ))}
         </KpiGrid>
       ) : (
@@ -285,7 +285,7 @@ export function ModuleAnalysis({
           </div>
           <KpiGrid min={200}>
             {allMetrics.filter((m) => !metricKeys.includes(m.key)).map((m) => (
-              <KpiCard key={m.key} metric={m} compact onClick={() => navigate(drilldownLink(m.drilldown, {}, filters as FilterState))} />
+              <KpiCard key={m.key} metric={m} compact onClick={m.drilldown ? () => navigate(drilldownLink(m.drilldown, {}, filters as FilterState)) : undefined} />
             ))}
           </KpiGrid>
         </div>

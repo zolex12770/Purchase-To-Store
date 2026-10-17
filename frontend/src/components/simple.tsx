@@ -9,7 +9,8 @@
  */
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { ArrowRight, Check, Info, AlertTriangle, CircleCheck } from 'lucide-react';
-import { Badge } from './ui';
+import { Badge, Skeleton } from './ui';
+import { statusMeta } from '../lib/status';
 
 /** A value that only settles once typing pauses — keeps a search from firing per keystroke. */
 export function useDebounced<T>(value: T, ms = 300): T {
@@ -53,16 +54,20 @@ export function WorkCard({
   accent?: string;
   onClick: () => void;
 }) {
-  const shown = loading ? '…' : failed || count === null ? '!' : String(count);
+  // A skeleton while loading and "—" when it failed: never a number that is not real.
+  const unknown = failed || count === null;
   return (
     <button
       type="button" className="work-card" onClick={onClick}
       style={accent ? ({ '--work-accent': accent } as CSSProperties) : undefined}
+      aria-busy={loading || undefined}
     >
-      <span className={`work-card-count ${!loading && !failed && count === 0 ? 'is-zero' : ''}`}>{shown}</span>
+      <span className={`work-card-count ${!loading && !unknown && count === 0 ? 'is-zero' : ''}`}>
+        {loading ? <Skeleton w={56} h={28} /> : unknown ? '—' : String(count)}
+      </span>
       <span className="work-card-title">{title}</span>
-      <span className="work-card-hint">{failed ? 'Could not load this number. Tap to open the list.' : hint}</span>
-      <span className="work-card-action">{action} <ArrowRight size={16} /></span>
+      <span className="work-card-hint">{!loading && unknown ? 'Could not load this number. Open the list to see the work.' : hint}</span>
+      <span className="work-card-action">{action} <ArrowRight size={16} aria-hidden /></span>
     </button>
   );
 }
@@ -160,10 +165,14 @@ export function receiptStatusLabel(lineStatus: string): string {
   return lineStatus.replace(/_/g, ' ').toLowerCase();
 }
 
-/** A PO line's receipt state, in the same words on every screen that shows it. */
+/**
+ * A PO line's receipt state, in the same words on every screen that shows it.
+ * The tone comes from the shared status map, so "Nothing received yet" is the
+ * info tone of AWAITING_RECEIPT everywhere (v2 showed it neutral here, info
+ * elsewhere).
+ */
 export function ReceiptBadge({ status }: { status: string }) {
-  const tone = status === 'PARTIALLY_RECEIVED' ? 'progress' : status === 'COMPLETED' ? 'success' : 'neutral';
-  return <Badge tone={tone} plain>{receiptStatusLabel(status)}</Badge>;
+  return <Badge tone={statusMeta(status).tone} plain>{receiptStatusLabel(status)}</Badge>;
 }
 
 /* ── Review cells ────────────────────────────────────────────────────────── */

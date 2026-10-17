@@ -1,10 +1,15 @@
 /**
- * Toast notifications (SRS §36: provide success/error feedback).
+ * Toast notifications (SRS §36: success/error feedback; redesign spec §3.12).
  *
  * Errors from the API carry field issues; the toast shows the headline message
  * and leaves field-level detail to the form that raised it.
+ *
+ * Timing: success and info leave after 5 s, warnings after 8 s, and errors
+ * stay until dismissed — v2 dropped them after 8 s, often before anyone had
+ * read the reason. Hovering a toast pauses its timer. At most three show at
+ * once, newest on top.
  */
-import { createContext, useContext, useState, useCallback, useMemo, type ReactNode } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckCircle2, AlertCircle, AlertTriangle, Info, X } from 'lucide-react';
 import { ApiError } from '../lib/api';
@@ -16,6 +21,8 @@ interface ToastItem {
   kind: ToastKind;
   title: string;
   message?: string;
+  /** Server request id, shown (selectable) on errors so support can find the log line. */
+  requestId?: string;
 }
 
 interface ToastApi {
@@ -36,7 +43,56 @@ const ICONS: Record<ToastKind, ReactNode> = {
   info: <Info />,
 };
 
+/** null = stays until dismissed. */
+const TTL: Record<ToastKind, number | null> = { success: 5000, info: 5000, warning: 8000, error: null };
+const MAX_VISIBLE = 3;
+
 let nextId = 1;
+
+function ToastView({ t, onDismiss }: { t: ToastItem; onDismiss: (id: number) => void }) {
+  const ttl = TTL[t.kind];
+  const remaining = useRef(ttl ?? 0);
+  const started = useRef(0);
+  const timer = useRef<number | undefined>(undefined);
+
+  const start = useCallback(() => {
+    if (ttl === null) return;
+    started.current = Date.now();
+    timer.current = window.setTimeout(() => onDismiss(t.id), remaining.current);
+  }, [ttl, onDismiss, t.id]);
+
+  const pause = useCallback(() => {
+    if (ttl === null) return;
+    window.clearTimeout(timer.current);
+    remaining.current = Math.max(800, remaining.current - (Date.now() - started.current));
+  }, [ttl]);
+
+  useEffect(() => {
+    start();
+    return () => window.clearTimeout(timer.current);
+  }, [start]);
+
+  return (
+    <div
+      className={`toast toast-${t.kind}`}
+      role={t.kind === 'error' ? 'alert' : 'status'}
+      onMouseEnter={pause}
+      onMouseLeave={start}
+      onFocus={pause}
+      onBlur={start}
+    >
+      <span className="toast-icon" aria-hidden>{ICONS[t.kind]}</span>
+      <div className="toast-text">
+        <div className="toast-title">{t.title}</div>
+        {t.message && <div className="toast-message">{t.message}</div>}
+        {t.requestId && <div className="toast-request">Request {t.requestId}</div>}
+      </div>
+      <button type="button" className="toast-close" onClick={() => onDismiss(t.id)} aria-label="Dismiss notification">
+        <X size={14} />
+      </button>
+    </div>
+  );
+}
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
@@ -45,13 +101,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setItems((list) => list.filter((t) => t.id !== id));
   }, []);
 
-  const push = useCallback((kind: ToastKind, title: string, message?: string) => {
+  const push = useCallback((kind: ToastKind, title: string, message?: string, requestId?: string) => {
     const id = nextId++;
-    setItems((list) => [...list.slice(-4), { id, kind, title, message }]);
-    // Errors linger longer — they usually need reading.
-    const ttl = kind === 'error' ? 8000 : kind === 'warning' ? 6000 : 4200;
-    setTimeout(() => dismiss(id), ttl);
-  }, [dismiss]);
+    setItems((list) => [...list, { id, kind, title, message, requestId }].slice(-MAX_VISIBLE));
+  }, []);
 
   const api = useMemo<ToastApi>(() => ({
     success: (t, m) => push('success', t, m),
@@ -64,7 +117,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         const detail = err.issues.length > 0
           ? err.issues.map((i) => i.message).slice(0, 2).join(' ')
           : undefined;
-        push(err.status === 403 ? 'warning' : 'error', err.message, detail);
+        push(err.status === 403 ? 'warning' : 'error', err.message, detail, err.requestId);
         return;
       }
       push('error', fallback, err instanceof Error ? err.message : undefined);
@@ -75,23 +128,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <ToastContext.Provider value={api}>
       {children}
       {createPortal(
-        <div className="toast-region" role="region" aria-live="polite" aria-label="Notifications">
-          {items.map((t) => (
-            <div key={t.id} className={`toast toast-${t.kind}`}>
-              <span className="toast-icon" aria-hidden>{ICONS[t.kind]}</span>
-              <div className="grow">
-                <div className="toast-title">{t.title}</div>
-                {t.message && <div className="toast-text">{t.message}</div>}
-              </div>
-              <button
-                onClick={() => dismiss(t.id)}
-                aria-label="Dismiss"
-                style={{ color: 'var(--ink-400)', display: 'grid', placeItems: 'center', flexShrink: 0 }}
-              >
-                <X size={13} />
-              </button>
-            </div>
-          ))}
+        <div className="toast-region" role="region" aria-label="Notifications">
+          {items.map((t) => <ToastView key={t.id} t={t} onDismiss={dismiss} />)}
         </div>,
         document.body,
       )}

@@ -54,6 +54,9 @@ logs/
 *.db
 pgdata/
 scratch/
+# backend/scripts/compute-stock-alignment.mjs output (item codes, stock figures, sheet
+# evidence). It now defaults to the system temp folder; this catches the old default.
+stock-alignment-out/
 
 # ── Editors and OS ────────────────────────────────────────────────────────────
 .vscode/*

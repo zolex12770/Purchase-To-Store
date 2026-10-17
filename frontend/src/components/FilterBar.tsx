@@ -1,35 +1,32 @@
 /**
- * Universal filter bar (SRS §14).
+ * Universal filter bar (SRS §14; redesign spec §3.11).
  *
- * One reusable engine drives filtering on every list and analytical view. It
- * writes to the URL (see `useFilters`), so the applied filters travel with a
- * drill-down, survive a refresh, and are shareable as a link.
+ * One engine drives filtering on every list and analytical view. It writes to
+ * the URL (see `useFilters`), so applied filters travel with a drill-down,
+ * survive a refresh, and are shareable as a link.
  *
- * Each dimension is its OWN compact toolbar button — [Department ▾] — that
- * opens a small popover on click (Google Sheets / Power BI style), rather
- * than one "Filters (N)" button expanding every configured dimension into a
- * single full-width panel at once. The toolbar row never grows vertically:
- * if there are more pills than fit, the row scrolls horizontally instead.
+ * One compact row: the date range, two dimension pills, then "+ Filter" for
+ * the rest. A pill with a value shows it ("Supplier: Raj Pack Plast +2") and
+ * clears with its own ×, so no second row of chips is needed. v2 showed 8–10
+ * pills in a separate glass card (about 80 px for one row) and a chip row
+ * under it.
  *
- * Supports:
- * - Direct From Date and To Date calendar inputs + presets with validation
- * - Employee / User filtering
- * - HOD filtering
- * - QC Status filtering
- * - Item searching and filtering
- * - Department, Cost Centre, Supplier, PO Type, Indent Type, Machine, Status
+ * Dimensions: date range (presets, single date, custom range with
+ * validation), employee, HOD, supplier, item, QC status, document status and
+ * the lookup masters (department, cost centre, indent/PO type, main group,
+ * item type, machine).
  */
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, type ReactNode } from 'react';
-import { createPortal } from 'react-dom';
-import { ChevronDown, X, CalendarDays, AlertCircle } from 'lucide-react';
-import { Button, Chip } from './ui';
+import { useState, useRef, useEffect, useId, type ReactNode } from 'react';
+import { ChevronDown, X, CalendarDays, AlertCircle, Check, Plus, Search } from 'lucide-react';
+import { Button, MenuList, Popover, menuKeyNav, useMenuAutofocus } from './ui';
 import {
   useLookups, useSupplierSearch, useItemSearch, useUserOptions,
   CATEGORY_LABEL, type LookupCategory,
 } from '../lib/masters';
 import { useAuth } from '../lib/auth';
 import { useDebounced } from './simple';
-import { today, daysAgo, startOfMonth } from '../lib/format';
+import { today, daysAgo, startOfMonth, formatDate } from '../lib/format';
+import { statusMeta } from '../lib/status';
 import type { FilterState } from '../lib/useFilters';
 
 export type FilterKey =
@@ -75,19 +72,25 @@ const PARAM_FOR: Record<FilterKey, string> = {
 };
 
 const QC_STATUS_OPTIONS = [
-  { value: 'PENDING_QC', label: 'Pending QC' },
-  { value: 'QC_IN_PROGRESS', label: 'QC In Progress' },
-  { value: 'QC_PASSED', label: 'QC Passed' },
-  { value: 'QC_FAILED', label: 'QC Failed' },
-  { value: 'ACCEPTED_WITH_DEVIATION', label: 'Accepted with Deviation' },
-  { value: 'ON_HOLD', label: 'On Hold' },
-  { value: 'CANCELLED', label: 'QC Closed (GRN cancelled)' },
-  { value: 'NOT_APPLICABLE', label: 'Not Applicable' },
+  'PENDING_QC', 'QC_IN_PROGRESS', 'QC_PASSED', 'QC_FAILED', 'ACCEPTED_WITH_DEVIATION', 'ON_HOLD', 'CANCELLED', 'NOT_APPLICABLE',
+  // An inspection a GRN cancel closed (migration 029) is not a cancelled document, so it keeps its own words.
+].map((value) => ({ value, label: value === 'CANCELLED' ? 'QC closed (GRN cancelled)' : statusMeta(value).label }));
+
+/** Which dimensions get a pill of their own when a page does not say. */
+const PILL_PRIORITY: FilterKey[] = [
+  'supplier', 'status', 'qcStatus', 'department', 'item', 'machine', 'indentType', 'poType',
+  'mainGroup', 'itemType', 'costCentre', 'user', 'hod',
 ];
+
+const SCOPE_LABELS: Record<string, string> = {
+  excludeCancelled: 'Cancelled excluded',
+  eligibleOnly: 'Awaiting purchase order only',
+};
 
 export function FilterBar({
   filters, setFilters, clearFilters, activeCount,
   show = ['dateRange', 'supplier', 'department', 'costCentre'],
+  primary,
   statusOptions,
   extra,
   children,
@@ -97,6 +100,8 @@ export function FilterBar({
   clearFilters: (keep?: string[]) => void;
   activeCount: number;
   show?: FilterKey[];
+  /** The (up to two) dimensions that always get a pill; the rest go under "+ Filter". */
+  primary?: FilterKey[];
   statusOptions?: { value: string; label: string }[];
   extra?: ReactNode;
   children?: ReactNode;
@@ -119,7 +124,6 @@ export function FilterBar({
   for (const s of suppliers ?? []) supplierNames.current.set(String(s.id), s.supplier_name);
 
   /* ── Item search ────────────────────────────────────────────────────────── */
-  const itemFilter = show.includes('item');
   const [itemTerm, setItemTerm] = useState('');
   const { data: items } = useItemSearch(useDebounced(itemTerm.trim(), 250));
   const itemNames = useRef(new Map<string, string>());
@@ -127,18 +131,27 @@ export function FilterBar({
 
   const labelFor = (key: FilterKey, id: string): string => {
     if (key === 'supplier') return supplierNames.current.get(id) ?? `#${id}`;
-    if (key === 'user') return userNames.current.get(id) ?? `#${id}`;
-    if (key === 'hod') return userNames.current.get(id) ?? `#${id}`;
+    if (key === 'user' || key === 'hod') return userNames.current.get(id) ?? `#${id}`;
     if (key === 'item') return itemNames.current.get(id) ?? `#${id}`;
-    if (key === 'status') return id.replace(/_/g, ' ');
-    if (key === 'qcStatus') {
-      const match = QC_STATUS_OPTIONS.find((o) => o.value === id);
-      return match?.label ?? id.replace(/_/g, ' ');
-    }
+    if (key === 'status') return statusOptions?.find((o) => o.value === id)?.label ?? statusMeta(id).label;
+    if (key === 'qcStatus') return statusMeta(id).label;
     const category = CATEGORY_FOR[key];
     if (!category || !lookups) return `#${id}`;
     return lookups[category]?.find((o) => String(o.id) === id)?.name ?? `#${id}`;
   };
+
+  const dimLabel = (key: FilterKey): string => {
+    if (key === 'status') return 'Status';
+    if (key === 'qcStatus') return 'QC status';
+    if (key === 'user') return 'Employee';
+    if (key === 'hod') return 'HOD';
+    if (key === 'item') return 'Item';
+    if (key === 'supplier') return 'Supplier';
+    const c = CATEGORY_FOR[key];
+    return c ? CATEGORY_LABEL[c] : key;
+  };
+
+  const selectedOf = (key: FilterKey) => (filters[PARAM_FOR[key]] as string[] | undefined) ?? [];
 
   const toggleValue = (param: string, value: string) => {
     const current = (filters[param] as string[] | undefined) ?? [];
@@ -146,205 +159,168 @@ export function FilterBar({
     setFilters({ [param]: next });
   };
 
-  const activePreset = DATE_PRESETS.find(
-    (p) => p.from() === filters.dateFrom && p.to() === filters.dateTo,
-  );
+  /* ── Which dimensions show as pills ─────────────────────────────────────── */
+  const dims: FilterKey[] = show.filter((k) => k !== 'dateRange')
+    .filter((k) => (k === 'supplier' ? supplierFilter : k === 'status' ? Boolean(statusOptions) : true));
+  const defaults = (primary ?? [...dims].sort((a, b) => PILL_PRIORITY.indexOf(a) - PILL_PRIORITY.indexOf(b))).filter((k) => dims.includes(k)).slice(0, 2);
+  const [revealed, setRevealed] = useState<FilterKey[]>([]);
+  const [autoOpen, setAutoOpen] = useState<FilterKey | null>(null);
+  const pills = dims.filter((k) => defaults.includes(k) || revealed.includes(k) || selectedOf(k).length > 0);
+  const more = dims.filter((k) => !pills.includes(k));
 
-  /* ── Chips for everything currently applied ────────────────────────────── */
-  const chips: { label: string; onRemove: () => void }[] = [];
-
-  if (filters.dateFrom || filters.dateTo) {
-    chips.push({
-      label: activePreset
-        ? `Date: ${activePreset.label}`
-        : `Date: ${filters.dateFrom ?? 'Start'} → ${filters.dateTo ?? 'End'}`,
-      onRemove: () => setFilters({ dateFrom: undefined, dateTo: undefined }),
-    });
-  }
-
-  for (const key of show) {
-    if (key === 'dateRange') continue;
+  const pickerFor = (key: FilterKey): ReactNode => {
     const param = PARAM_FOR[key];
-    for (const id of ((filters[param] as string[] | undefined) ?? [])) {
-      let dimLabel = 'Filter';
-      if (key === 'status') dimLabel = 'Status';
-      else if (key === 'qcStatus') dimLabel = 'QC Status';
-      else if (key === 'user') dimLabel = 'User';
-      else if (key === 'hod') dimLabel = 'HOD';
-      else if (key === 'item') dimLabel = 'Item';
-      else if (key === 'supplier') dimLabel = 'Supplier';
-      else if (CATEGORY_FOR[key]) dimLabel = CATEGORY_LABEL[CATEGORY_FOR[key]!];
-
-      chips.push({
-        label: `${dimLabel}: ${labelFor(key, id)}`,
-        onRemove: () => toggleValue(param, id),
-      });
+    const selected = selectedOf(key);
+    const onToggle = (v: string) => toggleValue(param, v);
+    switch (key) {
+      case 'user':
+      case 'hod':
+        return (
+          <MultiPicker
+            label={dimLabel(key)}
+            options={(users ?? [])
+              .filter((u) => {
+                if (key === 'hod' && !u.isHod) return false;
+                const deptIds = (filters.departmentId as string[]) ?? [];
+                return deptIds.length === 0 || (u.departmentId != null && deptIds.includes(String(u.departmentId)));
+              })
+              .map((u) => ({
+                value: String(u.id),
+                label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}`,
+              }))}
+            selected={selected}
+            onToggle={onToggle}
+          />
+        );
+      case 'supplier':
+        return (
+          <MultiPicker
+            label="Supplier"
+            options={(suppliers ?? []).map((s) => ({ value: String(s.id), label: s.supplier_name }))}
+            selected={selected}
+            onToggle={onToggle}
+            onSearch={setSupplierTerm}
+          />
+        );
+      case 'item':
+        return (
+          <MultiPicker
+            label="Item"
+            options={(items ?? []).map((i) => ({ value: String(i.id), label: `${i.item_code} · ${i.item_description}` }))}
+            selected={selected}
+            onToggle={onToggle}
+            onSearch={setItemTerm}
+          />
+        );
+      case 'qcStatus':
+        return <MultiPicker label="QC status" options={QC_STATUS_OPTIONS} selected={selected} onToggle={onToggle} />;
+      case 'status':
+        return <MultiPicker label="Status" options={statusOptions ?? []} selected={selected} onToggle={onToggle} />;
+      default: {
+        const category = CATEGORY_FOR[key]!;
+        return (
+          <MultiPicker
+            label={CATEGORY_LABEL[category]}
+            options={(lookups?.[category] ?? []).map((o) => ({ value: String(o.id), label: o.name }))}
+            selected={selected}
+            onToggle={onToggle}
+          />
+        );
+      }
     }
-  }
+  };
+
+  // Scopes a KPI card drills in with (backend domain/metrics.ts), so the list says why it
+  // holds what the number counts, and the scope can be removed like any filter.
+  const scopes = Object.entries(SCOPE_LABELS).filter(([param]) => filters[param] === 'true');
 
   return (
-    <div className="card filter-bar" style={{ marginBottom: 'var(--sp-4)' }}>
-      <div
-        className="row"
-        style={{
-          gap: 'var(--sp-2)', padding: 'var(--sp-3) var(--sp-4)',
-          flexWrap: 'nowrap', overflowX: 'auto', overflowY: 'hidden',
-          scrollbarWidth: 'thin', WebkitOverflowScrolling: 'touch',
-          alignItems: 'center',
-        }}
-      >
-        {/* ── Date range picker ────────────────────────────────────────────── */}
-        {show.includes('dateRange') && (
-          <DateRangeFilter
-            dateFrom={filters.dateFrom as string | undefined}
-            dateTo={filters.dateTo as string | undefined}
-            onApply={(from, to) => setFilters({ dateFrom: from, dateTo: to })}
-          />
-        )}
+    <div className="filter-bar" style={{ marginBottom: 'var(--space-3)' }} role="group" aria-label="Filters">
+      {show.includes('dateRange') && (
+        <DateRangeFilter
+          dateFrom={filters.dateFrom as string | undefined}
+          dateTo={filters.dateTo as string | undefined}
+          onApply={(from, to) => setFilters({ dateFrom: from, dateTo: to })}
+        />
+      )}
 
-        {/* ── Employee / User filter ───────────────────────────────────────── */}
-        {show.includes('user') && (
-          <FilterPill label="Employee" count={((filters.userId as string[]) ?? []).length}>
-            <MultiPicker
-              label="Employee"
-              options={(users ?? [])
-                .filter((u) => {
-                  const deptIds = (filters.departmentId as string[]) ?? [];
-                  if (deptIds.length === 0) return true;
-                  return u.departmentId != null && deptIds.includes(String(u.departmentId));
-                })
-                .map((u) => ({
-                  value: String(u.id),
-                  label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}`,
-                }))}
-              selected={(filters.userId as string[]) ?? []}
-              onToggle={(v) => toggleValue('userId', v)}
-            />
-          </FilterPill>
-        )}
-
-        {/* ── HOD filter ───────────────────────────────────────────────────── */}
-        {show.includes('hod') && (
-          <FilterPill label="HOD" count={((filters.hodId as string[]) ?? []).length}>
-            <MultiPicker
-              label="HOD"
-              options={(users ?? [])
-                .filter((u) => {
-                  if (!u.isHod) return false;
-                  const deptIds = (filters.departmentId as string[]) ?? [];
-                  if (deptIds.length === 0) return true;
-                  return u.departmentId != null && deptIds.includes(String(u.departmentId));
-                })
-                .map((u) => ({
-                  value: String(u.id),
-                  label: `${u.employeeName} (${u.employeeId})${u.departmentName ? ' · ' + u.departmentName : ''}`,
-                }))}
-              selected={(filters.hodId as string[]) ?? []}
-              onToggle={(v) => toggleValue('hodId', v)}
-            />
-          </FilterPill>
-        )}
-
-        {/* ── Supplier filter ──────────────────────────────────────────────── */}
-        {supplierFilter && (
-          <FilterPill label="Supplier" count={((filters.supplierId as string[]) ?? []).length}>
-            <MultiPicker
-              label="Supplier"
-              options={(suppliers ?? []).map((s) => ({ value: String(s.id), label: s.supplier_name }))}
-              selected={(filters.supplierId as string[]) ?? []}
-              onToggle={(v) => toggleValue('supplierId', v)}
-              onSearch={setSupplierTerm}
-            />
-          </FilterPill>
-        )}
-
-        {/* ── Item filter ──────────────────────────────────────────────────── */}
-        {itemFilter && (
-          <FilterPill label="Item" count={((filters.itemId as string[]) ?? []).length}>
-            <MultiPicker
-              label="Item"
-              options={(items ?? []).map((i) => ({
-                value: String(i.id),
-                label: `${i.item_code} · ${i.item_description}`,
-              }))}
-              selected={(filters.itemId as string[]) ?? []}
-              onToggle={(v) => toggleValue('itemId', v)}
-              onSearch={setItemTerm}
-            />
-          </FilterPill>
-        )}
-
-        {/* ── QC Status filter ─────────────────────────────────────────────── */}
-        {show.includes('qcStatus') && (
-          <FilterPill label="QC Status" count={((filters.qcStatus as string[]) ?? []).length}>
-            <MultiPicker
-              label="QC Status"
-              options={QC_STATUS_OPTIONS}
-              selected={(filters.qcStatus as string[]) ?? []}
-              onToggle={(v) => toggleValue('qcStatus', v)}
-            />
-          </FilterPill>
-        )}
-
-        {/* ── Lookup-driven category filters ───────────────────────────────── */}
-        {show.filter((k) => CATEGORY_FOR[k]).map((key) => {
-          const category = CATEGORY_FOR[key]!;
-          const selected = (filters[PARAM_FOR[key]] as string[]) ?? [];
-          return (
-            <FilterPill key={key} label={CATEGORY_LABEL[category]} count={selected.length}>
-              <MultiPicker
-                label={CATEGORY_LABEL[category]}
-                options={(lookups?.[category] ?? []).map((o) => ({ value: String(o.id), label: o.name }))}
-                selected={selected}
-                onToggle={(v) => toggleValue(PARAM_FOR[key], v)}
-              />
-            </FilterPill>
-          );
-        })}
-
-        {/* ── Document Status filter ───────────────────────────────────────── */}
-        {show.includes('status') && statusOptions && (
-          <FilterPill label="Status" count={((filters.status as string[]) ?? []).length}>
-            <MultiPicker
-              label="Status"
-              options={statusOptions}
-              selected={(filters.status as string[]) ?? []}
-              onToggle={(v) => toggleValue('status', v)}
-            />
-          </FilterPill>
-        )}
-
-        {children}
-
-        <div className="spacer" style={{ flexShrink: 0 }} />
-
-        {extra}
-
-        {activeCount > 0 && (
-          <Button
-            variant="ghost" size="sm" icon={<X size={13} />}
-            onClick={() => clearFilters(['view', 'tab'])}
-            style={{ flexShrink: 0 }}
+      {pills.map((key) => {
+        const selected = selectedOf(key);
+        const first = selected[0];
+        return (
+          <FilterPill
+            key={key}
+            label={dimLabel(key)}
+            summary={first ? `${labelFor(key, first)}${selected.length > 1 ? ` +${selected.length - 1}` : ''}` : undefined}
+            onClear={() => setFilters({ [PARAM_FOR[key]]: undefined })}
+            defaultOpen={autoOpen === key}
           >
-            Clear{activeCount > 0 ? ` (${activeCount})` : ''}
-          </Button>
-        )}
-      </div>
+            {pickerFor(key)}
+          </FilterPill>
+        );
+      })}
 
-      {chips.length > 0 && (
-        <div
-          className="row"
-          style={{ gap: 6, padding: '0 var(--sp-4) var(--sp-3)', flexWrap: 'wrap' }}
+      {scopes.map(([param, label]) => (
+        <span key={param} className="chip chip-neutral" style={{ flexShrink: 0 }}>
+          {label}
+          <button type="button" aria-label={`Remove filter: ${label}`} onClick={() => setFilters({ [param]: undefined })}>
+            <X size={12} />
+          </button>
+        </span>
+      ))}
+
+      {more.length > 0 && (
+        <AddFilterMenu
+          options={more.map((k) => ({ key: k, label: dimLabel(k) }))}
+          onPick={(k) => { setRevealed((r) => [...r, k]); setAutoOpen(k); }}
+        />
+      )}
+
+      {children}
+
+      <div className="spacer" style={{ flexShrink: 0 }} />
+
+      {extra}
+
+      {activeCount > 0 && (
+        <Button
+          variant="ghost" size="sm" icon={<X size={14} />}
+          onClick={() => { setRevealed([]); clearFilters(['view', 'tab']); }}
+          style={{ flexShrink: 0 }}
         >
-          {chips.map((c, i) => <Chip key={i} onRemove={c.onRemove}>{c.label}</Chip>)}
-        </div>
+          Clear all ({activeCount})
+        </Button>
       )}
     </div>
   );
 }
 
+/** "+ Filter": the dimensions that have no pill yet. */
+function AddFilterMenu({ options, onPick }: { options: { key: FilterKey; label: string }[]; onPick: (k: FilterKey) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
+  useMenuAutofocus(open, menuId);
+  return (
+    <>
+      <Button ref={ref} variant="ghost" size="sm" icon={<Plus size={14} />} onClick={() => setOpen((v) => !v)} aria-haspopup="menu" aria-expanded={open}>
+        Filter
+      </Button>
+      <Popover anchorRef={ref} open={open} onClose={() => setOpen(false)}>
+        <div id={menuId} role="menu" aria-label="Add a filter" className="menu-list" onKeyDown={menuKeyNav}>
+          <MenuList
+            items={options.map((o) => ({ key: o.key, label: o.label }))}
+            onAction={(a) => { setOpen(false); onPick(a.key as FilterKey); }}
+          />
+        </div>
+      </Popover>
+    </>
+  );
+}
+
 /**
- * Dedicated date range filter popover supporting quick presets and manual calendar inputs.
+ * Date range: presets marked with a check (not a primary-coloured button),
+ * a single date, and a custom from/to with validation.
  */
 function DateRangeFilter({
   dateFrom, dateTo, onApply,
@@ -356,292 +332,153 @@ function DateRangeFilter({
   const [open, setOpen] = useState(false);
   const [fromVal, setFromVal] = useState(dateFrom ?? '');
   const [toVal, setToVal] = useState(dateTo ?? '');
-  const [rect, setRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setFromVal(dateFrom ?? '');
     setToVal(dateTo ?? '');
   }, [dateFrom, dateTo]);
 
-  const reposition = useCallback(() => {
-    const el = triggerRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    setRect({ top: r.bottom + 4, left: r.left, width: 310 });
-  }, []);
-
-  useLayoutEffect(() => {
-    if (!open) return;
-    reposition();
-    window.addEventListener('scroll', reposition, true);
-    window.addEventListener('resize', reposition);
-    return () => {
-      window.removeEventListener('scroll', reposition, true);
-      window.removeEventListener('resize', reposition);
-    };
-  }, [open, reposition]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocClick = (e: MouseEvent) => {
-      const t = e.target as Node;
-      if (triggerRef.current?.contains(t)) return;
-      if (panelRef.current?.contains(t)) return;
-      setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
-    document.addEventListener('mousedown', onDocClick);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDocClick);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
   const activePreset = DATE_PRESETS.find((p) => p.from() === dateFrom && p.to() === dateTo);
   const isInvalid = Boolean(fromVal && toVal && fromVal > toVal);
+  const applied = Boolean(dateFrom || dateTo);
 
   const displayLabel = activePreset
     ? activePreset.label
     : dateFrom && dateTo
-      ? `${dateFrom} → ${dateTo}`
+      ? dateFrom === dateTo ? formatDate(dateFrom) : `${formatDate(dateFrom)} – ${formatDate(dateTo)}`
       : dateFrom
-        ? `From ${dateFrom}`
+        ? `From ${formatDate(dateFrom)}`
         : dateTo
-          ? `Up to ${dateTo}`
-          : 'Date Range';
+          ? `Up to ${formatDate(dateTo)}`
+          : 'Date range';
+
+  const apply = (f?: string, t?: string) => { onApply(f, t); setOpen(false); triggerRef.current?.focus(); };
 
   return (
     <>
-      <button
-        ref={triggerRef}
-        type="button"
-        className={`btn btn-sm ${dateFrom || dateTo ? 'btn-primary' : 'btn-secondary'}`}
-        style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="true"
-        aria-expanded={open}
-      >
-        <CalendarDays size={13} style={{ opacity: 0.8 }} />
-        <span>{displayLabel}</span>
-        <ChevronDown size={12} style={{ opacity: 0.6, transform: open ? 'rotate(180deg)' : undefined }} />
-      </button>
-
-      {open && rect && createPortal(
-        <div
-          ref={panelRef}
-          style={{
-            position: 'fixed', top: rect.top, left: rect.left, width: rect.width,
-            background: 'var(--bg-surface)', border: '1px solid var(--border-strong)',
-            borderRadius: 'var(--radius)', boxShadow: 'var(--shadow-lg)', padding: 12,
-            zIndex: 'var(--z-dropdown)' as unknown as number,
-            animation: 'zx-scale-in var(--dur-fast) var(--ease-out)',
-          }}
+      <span className={`filter-pill ${applied ? 'is-applied' : ''}`}>
+        <button
+          ref={triggerRef}
+          type="button"
+          className="filter-pill-main"
+          onClick={() => setOpen((v) => !v)}
+          aria-haspopup="dialog"
+          aria-expanded={open}
         >
-          <div style={{ marginBottom: 10, paddingBottom: 8, borderBottom: '1px solid var(--border)' }}>
-            <div style={{ fontWeight: 600, fontSize: 'var(--text-xs)', marginBottom: 6, color: 'var(--text-muted)' }}>
-              EXACT SINGLE DATE
-            </div>
+          <CalendarDays size={14} aria-hidden />
+          <span>{applied ? `Date: ${displayLabel}` : 'Date range'}</span>
+          <ChevronDown size={13} aria-hidden style={{ opacity: 0.7 }} />
+        </button>
+        {applied && (
+          <button type="button" className="filter-pill-clear" onClick={() => onApply(undefined, undefined)} aria-label="Clear date range">
+            <X size={13} />
+          </button>
+        )}
+      </span>
+
+      <Popover anchorRef={triggerRef} open={open} onClose={() => setOpen(false)} role="dialog" label="Date range">
+        <div style={{ width: 300, padding: 'var(--space-2)' }}>
+          <div className="menu-label">Presets</div>
+          <div role="listbox" aria-label="Date presets" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+            {DATE_PRESETS.map((p) => {
+              const on = activePreset?.key === p.key;
+              return (
+                <button
+                  key={p.key}
+                  type="button"
+                  role="option"
+                  aria-selected={on}
+                  className="menu-item"
+                  style={{ minHeight: 30, fontWeight: on ? 600 : 400 }}
+                  onClick={() => { const f = p.from(); const t = p.to(); setFromVal(f); setToVal(t); apply(f, t); }}
+                >
+                  <span style={{ width: 16, display: 'grid', placeItems: 'center' }}>{on && <Check size={15} strokeWidth={2.5} style={{ color: 'var(--accent)' }} />}</span>
+                  {p.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="menu-sep" />
+          <div className="menu-label">Single date</div>
+          <div style={{ padding: '0 var(--space-2-5) var(--space-2)' }}>
             <input
               type="date"
               className="input input-sm"
-              style={{ width: '100%', height: 28 }}
-              value={fromVal === toVal ? fromVal : ''}
-              onChange={(e) => {
-                const val = e.target.value;
-                if (val) {
-                  setFromVal(val);
-                  setToVal(val);
-                  onApply(val, val);
-                  setOpen(false);
-                }
-              }}
+              aria-label="Single date"
+              value={fromVal && fromVal === toVal ? fromVal : ''}
+              onChange={(e) => { const v = e.target.value; if (v) { setFromVal(v); setToVal(v); apply(v, v); } }}
             />
           </div>
 
-          <div style={{ fontWeight: 600, fontSize: 'var(--text-xs)', marginBottom: 8, color: 'var(--text-muted)' }}>
-            QUICK PRESETS
+          <div className="menu-sep" />
+          <div className="menu-label">Custom range</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-2)', padding: '0 var(--space-2-5)' }}>
+            <label className="field">
+              <span className="field-label">From</span>
+              <input type="date" className="input input-sm" value={fromVal} onChange={(e) => setFromVal(e.target.value)} />
+            </label>
+            <label className="field">
+              <span className="field-label">To</span>
+              <input type="date" className="input input-sm" value={toVal} onChange={(e) => setToVal(e.target.value)} aria-invalid={isInvalid || undefined} />
+            </label>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 4, marginBottom: 12 }}>
-            {DATE_PRESETS.map((p) => (
-              <button
-                key={p.key}
-                type="button"
-                className={`btn btn-xs ${activePreset?.key === p.key ? 'btn-primary' : 'btn-ghost'}`}
-                style={{ justifyContent: 'flex-start', fontSize: 'var(--text-2xs)' }}
-                onClick={() => {
-                  const f = p.from();
-                  const t = p.to();
-                  setFromVal(f);
-                  setToVal(t);
-                  onApply(f, t);
-                  setOpen(false);
-                }}
-              >
-                {p.label}
-              </button>
-            ))}
-          </div>
-
-          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10, marginBottom: 8 }}>
-            <div style={{ fontWeight: 600, fontSize: 'var(--text-xs)', marginBottom: 8, color: 'var(--text-muted)' }}>
-              MANUAL CALENDAR
+          {isInvalid && (
+            <div className="field-error" style={{ padding: '6px var(--space-2-5) 0' }} role="alert">
+              <AlertCircle size={12} aria-hidden /> From date cannot be later than To date.
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div>
-                <label style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>
-                  From Date
-                </label>
-                <input
-                  type="date"
-                  className="input input-sm"
-                  style={{ width: '100%', height: 28 }}
-                  value={fromVal}
-                  onChange={(e) => setFromVal(e.target.value)}
-                />
-              </div>
-              <div>
-                <label style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)', display: 'block', marginBottom: 2 }}>
-                  To Date
-                </label>
-                <input
-                  type="date"
-                  className="input input-sm"
-                  style={{ width: '100%', height: 28 }}
-                  value={toVal}
-                  onChange={(e) => setToVal(e.target.value)}
-                />
-              </div>
-            </div>
+          )}
 
-            {isInvalid && (
-              <div
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 5,
-                  color: 'var(--danger-600)', fontSize: 'var(--text-2xs)',
-                  marginTop: 6,
-                }}
-              >
-                <AlertCircle size={12} />
-                <span>From Date cannot be later than To Date.</span>
-              </div>
-            )}
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, marginTop: 10 }}>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setFromVal('');
-                setToVal('');
-                onApply(undefined, undefined);
-                setOpen(false);
-              }}
-            >
+          <div className="row" style={{ justifyContent: 'flex-end', gap: 'var(--space-2)', padding: 'var(--space-3) var(--space-2-5) var(--space-1)' }}>
+            <Button variant="ghost" size="sm" onClick={() => { setFromVal(''); setToVal(''); apply(undefined, undefined); }}>
               Reset
             </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={isInvalid}
-              onClick={() => {
-                if (!isInvalid) {
-                  onApply(fromVal || undefined, toVal || undefined);
-                  setOpen(false);
-                }
-              }}
-            >
-              Apply Filter
+            <Button variant="primary" size="sm" disabled={isInvalid} onClick={() => { if (!isInvalid) apply(fromVal || undefined, toVal || undefined); }}>
+              Apply
             </Button>
           </div>
-        </div>,
-        document.body,
-      )}
+        </div>
+      </Popover>
     </>
   );
 }
 
 /**
- * One toolbar pill for a single filter dimension. Clicking it opens a small,
- * independently-positioned popover directly under the pill.
+ * One pill per filter dimension. With a value it shows the value and an ×;
+ * clicking opens a small searchable checklist under it.
  */
-function FilterPill({ label, count, children }: { label: string; count: number; children: ReactNode }) {
-  const [open, setOpen] = useState(false);
-  const [rect, setRect] = useState<{ top: number; left: number; width: number } | null>(null);
+function FilterPill({
+  label, summary, onClear, children, defaultOpen,
+}: { label: string; summary?: string; onClear: () => void; children: ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(Boolean(defaultOpen));
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  const reposition = useCallback(() => {
-    const el = triggerRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    setRect({ top: r.bottom + 4, left: r.left, width: Math.max(r.width, 240) });
-  }, []);
-
-  useLayoutEffect(() => {
-    if (!open) return;
-    reposition();
-    window.addEventListener('scroll', reposition, true);
-    window.addEventListener('resize', reposition);
-    return () => {
-      window.removeEventListener('scroll', reposition, true);
-      window.removeEventListener('resize', reposition);
-    };
-  }, [open, reposition]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocClick = (e: MouseEvent) => {
-      const t = e.target as Node;
-      if (triggerRef.current?.contains(t)) return;
-      if (panelRef.current?.contains(t)) return;
-      setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
-    document.addEventListener('mousedown', onDocClick);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDocClick);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
+  useEffect(() => { if (defaultOpen) setOpen(true); }, [defaultOpen]);
 
   return (
     <>
-      <button
-        ref={triggerRef}
-        type="button"
-        className={`btn btn-sm ${count > 0 ? 'btn-primary' : 'btn-secondary'}`}
-        style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="true"
-        aria-expanded={open}
-      >
-        <span>{label}</span>
-        {count > 0 && (
-          <span style={{ fontWeight: 700, fontSize: 'var(--text-2xs)' }}>({count})</span>
-        )}
-        <ChevronDown size={12} style={{ opacity: 0.6, transform: open ? 'rotate(180deg)' : undefined, transition: 'transform var(--dur-fast) var(--ease)' }} />
-      </button>
-
-      {open && rect && createPortal(
-        <div
-          ref={panelRef}
-          style={{
-            position: 'fixed', top: rect.top, left: rect.left, width: rect.width,
-            background: 'var(--bg-surface)', border: '1px solid var(--border-strong)',
-            borderRadius: 'var(--radius)', boxShadow: 'var(--shadow-lg)', padding: 8,
-            zIndex: 'var(--z-dropdown)' as unknown as number,
-            animation: 'zx-scale-in var(--dur-fast) var(--ease-out)',
-          }}
+      <span className={`filter-pill ${summary ? 'is-applied' : ''}`}>
+        <button
+          ref={triggerRef}
+          type="button"
+          className="filter-pill-main"
+          onClick={() => setOpen((v) => !v)}
+          aria-haspopup="dialog"
+          aria-expanded={open}
         >
-          {children}
-        </div>,
-        document.body,
-      )}
+          <span className="truncate" style={{ maxWidth: 240 }}>{summary ? `${label}: ${summary}` : label}</span>
+          <ChevronDown size={13} aria-hidden style={{ opacity: 0.7, transform: open ? 'rotate(180deg)' : undefined, transition: 'transform var(--dur-2) var(--ease-standard)' }} />
+        </button>
+        {summary && (
+          <button type="button" className="filter-pill-clear" onClick={onClear} aria-label={`Clear ${label} filter`}>
+            <X size={13} />
+          </button>
+        )}
+      </span>
+
+      <Popover anchorRef={triggerRef} open={open} onClose={() => setOpen(false)} minWidth={260} role="dialog" label={`${label} filter`}>
+        <div style={{ padding: 'var(--space-2)', width: 300, maxWidth: 'calc(100vw - 32px)' }}>{children}</div>
+      </Popover>
     </>
   );
 }
@@ -663,29 +500,29 @@ function MultiPicker({
     : options.filter((o) => o.label.toLowerCase().includes(term.toLowerCase()));
 
   return (
-    <div className="field" style={{ margin: 0 }}>
+    <div className="field" style={{ margin: 0, gap: 6 }}>
       {(onSearch || options.length > 6) && (
-        <input
-          className="input input-sm"
-          placeholder={`Search ${label.toLowerCase()}…`}
-          value={term}
-          onChange={(e) => { setTerm(e.target.value); onSearch?.(e.target.value); }}
-          style={{ marginBottom: 6 }}
-          autoFocus
-        />
+        <div style={{ position: 'relative' }}>
+          <Search size={14} aria-hidden style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-4)' }} />
+          <input
+            className="input input-sm"
+            placeholder={`Search ${label.toLowerCase()}…`}
+            aria-label={`Search ${label.toLowerCase()}`}
+            value={term}
+            onChange={(e) => { setTerm(e.target.value); onSearch?.(e.target.value); }}
+            style={{ paddingLeft: 28 }}
+            autoFocus
+          />
+        </div>
       )}
-      <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+      <div style={{ maxHeight: 260, overflowY: 'auto' }} role="group" aria-label={label}>
         {filtered.length === 0 && (
-          <div style={{ padding: 8, fontSize: 'var(--text-xs)', color: 'var(--text-faint)', textAlign: 'center' }}>
-            No options
+          <div style={{ padding: 8, fontSize: 'var(--fs-13)', color: 'var(--text-3)', textAlign: 'center' }}>
+            {onSearch && !term ? `Type to search ${label.toLowerCase()}` : 'No options'}
           </div>
         )}
         {filtered.map((o) => (
-          <label
-            key={o.value}
-            className="check-row"
-            style={{ padding: '4px 6px', borderRadius: 'var(--radius-xs)', fontSize: 'var(--text-xs)', cursor: 'pointer' }}
-          >
+          <label key={o.value} className="check-row" style={{ padding: '4px 6px', fontSize: 'var(--fs-13)' }}>
             <input
               type="checkbox" className="checkbox"
               checked={selected.includes(o.value)}

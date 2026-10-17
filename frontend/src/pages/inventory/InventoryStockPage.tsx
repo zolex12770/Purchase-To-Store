@@ -598,11 +598,8 @@ export default function InventoryStockPage() {
 
   const exportStockCsv = async () => {
     try {
-      const q = qs({
-        search: stockSearch || undefined,
-        category: stockCategory !== 'ALL' ? stockCategory : undefined,
-        stockStatus: stockStatusFilter !== 'ALL' ? stockStatusFilter : undefined,
-      });
+      // The list's own parameters: the file dropped its department, group, item and HOD filters.
+      const q = qs({ ...stockParams, page: undefined, pageSize: undefined });
       await downloadFile(`/inventory/stock/export${q}`, `inventory_stock_register_${stockCategory.toLowerCase()}.csv`);
       toast.success('Inventory stock register exported successfully.');
     } catch (err) {
@@ -612,11 +609,8 @@ export default function InventoryStockPage() {
 
   const exportLedgerCsv = async () => {
     try {
-      const q = qs({
-        search: ledgerSearch || undefined,
-        category: ledgerCategory !== 'ALL' ? ledgerCategory : undefined,
-        txnType: ledgerTxnType || undefined,
-      });
+      // The list's own parameters: the file dropped the date range (2026-10-16 audit, F06).
+      const q = qs({ ...ledgerParams, page: undefined, pageSize: undefined });
       await downloadFile(`/inventory/ledger/export${q}`, 'stock_movement_ledger.csv');
       toast.success('Movement ledger exported successfully.');
     } catch (err) {

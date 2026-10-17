@@ -14,17 +14,17 @@ import ExcelJS from 'exceljs';
 import { query, queryOne, withTransaction, txQuery, txQueryOne } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendCreated, validateBody, validateQuery, parsedQuery, idParam,
-  csvArray, csvIdArray,
+  EXPORT_ROW_CAP, refuseTruncatedExport,
 } from '../../core/http.js';
 import { NotFoundError, ValidationError, BusinessRuleError } from '../../core/errors.js';
 import { requirePermission } from '../../auth/middleware.js';
 import { audit, auditIn, actorFrom } from '../../core/audit.js';
-import { DATASETS, DATASET_KEYS, type DatasetFilters, type ColumnDef } from './datasets.js';
+import { DATASETS, DATASET_KEYS, type ColumnDef } from './datasets.js';
 import { env } from '../../config/env.js';
 import { parseNumericInput, toRate } from '../../domain/money.js';
 import { logger } from '../../core/logger.js';
 import { assertMayChangeUsers, superAdminsAmong } from '../admin/super-admin-guard.js';
-import { poFilterSchema } from '../purchase-order/po-filter.js';
+import { RECEIPT_EVIDENCE_LABEL } from '../purchase-order/receipt-evidence.js';
 
 const router = Router();
 
@@ -35,28 +35,9 @@ const upload = multer({
 
 /* ═══════════════════════════════ EXPORT ═══════════════════════════════════ */
 
-const exportQuerySchema = z.object({
+/** The file format only: the filters are the exported list's own (DatasetDef.schema). */
+const exportFormatSchema = z.object({
   format: z.enum(['xlsx', 'csv']).default('xlsx'),
-  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  status: csvArray,
-  supplierId: csvIdArray,
-  itemId: csvIdArray,
-  departmentId: csvIdArray,
-  costCentreId: csvIdArray,
-  indentTypeId: csvIdArray,
-  poTypeId: csvIdArray,
-  machineId: csvIdArray,
-  hodId: csvIdArray,
-  userId: csvIdArray,
-  requesterId: csvIdArray,
-  hodStatus: csvArray,
-  storeStatus: csvArray,
-  ids: csvIdArray,
-  search: z.string().trim().max(200).optional(),
-  // The Purchase Order list's own filters, parsed as the list parses them, so its
-  // export holds exactly the rows it shows (purchase-order/po-filter.ts).
-  ...poFilterSchema.pick({ mainGroupId: true, sourceMode: true, view: true, overdue: true, receiptEvidence: true }).partial().shape,
 });
 
 async function companyBranding(): Promise<{ name: string; brand: string }> {
@@ -70,19 +51,48 @@ async function companyBranding(): Promise<{ name: string; brand: string }> {
   };
 }
 
-/** Human-readable description of the filters actually applied (SRS §35). */
+const FILTER_LABELS: Record<string, string> = {
+  status: 'Status', qcStatus: 'QC status', hodStatus: 'HOD status', storeStatus: 'Store status',
+  supplierId: 'Suppliers', itemId: 'Items', departmentId: 'Departments', costCentreId: 'Cost centres',
+  indentTypeId: 'Indent types', poTypeId: 'PO types', grnTypeId: 'GRN types', mainGroupId: 'Main groups',
+  subMainGroupId: 'Sub main groups', itemTypeId: 'Item types', uomId: 'Units', machineId: 'Machines',
+  hodId: 'HODs', userId: 'Users', requesterId: 'Requesters', actorUserId: 'Users', roleId: 'Roles',
+  poId: 'Purchase orders', view: 'View', mode: 'Mode', sourceMode: 'Source', pendingOnly: 'Pending approval only',
+  overdue: 'Overdue only', isActive: 'Active', qcRequired: 'QC required', state: 'State', city: 'City',
+  action: 'Action', entity: 'Entity', entityId: 'Record', source: 'Source', result: 'Result',
+  excludeCancelled: 'Cancelled excluded', eligibleOnly: 'Awaiting purchase order only',
+};
+/** Paging, sorting and the file format are not filters. */
+const NOT_FILTERS = new Set(['format', 'page', 'pageSize', 'sortBy', 'sortDir', 'dateFrom', 'dateTo', 'search', 'ids']);
+/** Switches a list turns on with 'true'; 'false' is the same as leaving them off. */
+const SWITCHES = new Set(['overdue', 'pendingOnly', 'excludeCancelled', 'eligibleOnly']);
+/** Filters whose value is written in the words the list shows for it. */
+const VALUE_WORDS: Record<string, Record<string, string>> = { receiptEvidence: RECEIPT_EVIDENCE_LABEL };
+
+/** Human-readable description of the filters actually applied (SRS §35) — every one of the list's. */
 function describeFilters(f: Record<string, unknown>): string {
   const parts: string[] = [];
   if (f.dateFrom || f.dateTo) parts.push(`Period: ${f.dateFrom ?? 'start'} to ${f.dateTo ?? 'today'}`);
-  if (Array.isArray(f.status) && f.status.length) parts.push(`Status: ${f.status.join(', ')}`);
-  if (Array.isArray(f.supplierId) && f.supplierId.length) parts.push(`Suppliers: ${f.supplierId.length} selected`);
-  if (Array.isArray(f.itemId) && f.itemId.length) parts.push(`Items: ${f.itemId.length} selected`);
-  if (Array.isArray(f.departmentId) && f.departmentId.length) parts.push(`Departments: ${f.departmentId.length} selected`);
+  for (const [key, value] of Object.entries(f)) {
+    if (NOT_FILTERS.has(key) || value === undefined || value === null || value === '') continue;
+    if (key === 'view' && value === 'all') continue;
+    const label = FILTER_LABELS[key] ?? key;
+    const words = VALUE_WORDS[key]?.[String(value)];
+    if (words) {
+      parts.push(words);
+    } else if (SWITCHES.has(key)) {
+      if (value === 'true') parts.push(label);
+    } else if (Array.isArray(value)) {
+      if (value.length === 0) continue;
+      parts.push(typeof value[0] === 'number' ? `${label}: ${value.length} selected` : `${label}: ${value.join(', ')}`);
+    } else if (value === 'true' || value === 'false') {
+      // isActive=false is a real filter (inactive only), not an absent one.
+      parts.push(`${label}: ${value === 'true' ? 'Yes' : 'No'}`);
+    } else {
+      parts.push(`${label}: ${String(value)}`);
+    }
+  }
   if (Array.isArray(f.ids) && f.ids.length) parts.push(`Specific records: ${f.ids.length}`);
-  if (f.view === 'pending' || f.view === 'complete') parts.push(`View: ${f.view}`);
-  if (f.overdue === 'true') parts.push('Overdue only');
-  if (f.receiptEvidence === 'awaiting_link') parts.push('Store receipt awaiting link');
-  if (f.receiptEvidence === 'none_recorded') parts.push('No store receipt recorded');
   if (f.search) parts.push(`Search: "${String(f.search)}"`);
   return parts.length > 0 ? parts.join('  ·  ') : 'No filters applied — full authorised dataset';
 }
@@ -109,7 +119,7 @@ function formatCell(value: unknown, col: ColumnDef): unknown {
 
 router.get(
   '/export/:dataset',
-  validateQuery(exportQuerySchema),
+  validateQuery(exportFormatSchema),
   asyncHandler(async (req, res) => {
     const key = req.params.dataset ?? '';
     const dataset = DATASETS[key];
@@ -122,9 +132,13 @@ router.get(
       throw ValidationError(`You do not have permission to export ${dataset.title}.`);
     }
 
-    const f = parsedQuery<z.infer<typeof exportQuerySchema>>(res);
-    const { sql, params } = dataset.build(f as DatasetFilters);
-    const rows = await query<Record<string, unknown>>(sql, params);
+    const { format } = parsedQuery<z.infer<typeof exportFormatSchema>>(res);
+    // The exported list's own query schema: a value the list would refuse is refused here
+    // too (422), and every filter the list applies is applied to the file.
+    const f = dataset.schema.parse(req.query) as Record<string, unknown>;
+    const { sql, params } = dataset.build(f, { userId: req.user!.id });
+    const rows = await query<Record<string, unknown>>(`${sql} LIMIT ${EXPORT_ROW_CAP + 1}`, params);
+    refuseTruncatedExport(rows.length);
     const branding = await companyBranding();
     const stamp = new Date();
     const filterText = describeFilters(f);
@@ -133,10 +147,10 @@ router.get(
     await audit({
       actor: actorFrom(req), action: 'EXPORT', entity: dataset.key,
       entityLabel: dataset.title,
-      message: `Exported ${rows.length} row(s) as ${f.format.toUpperCase()}. ${filterText}`,
+      message: `Exported ${rows.length} row(s) as ${format.toUpperCase()}. ${filterText}`,
     });
 
-    if (f.format === 'csv') {
+    if (format === 'csv') {
       const lines: string[] = [];
       // Report context first so a CSV is as self-describing as the Excel file.
       lines.push(csvEscape(`${branding.brand} — ${branding.name}`));

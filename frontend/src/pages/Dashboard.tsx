@@ -178,7 +178,7 @@ export default function Dashboard() {
       ) : (
         <KpiGrid min={198}>
           {headline.map((m) => (
-            <KpiCard key={m.key} metric={m} onClick={() => navigate(drilldownLink(m.drilldown, {}, filters))} />
+            <KpiCard key={m.key} metric={m} onClick={m.drilldown ? () => navigate(drilldownLink(m.drilldown, {}, filters)) : undefined} />
           ))}
         </KpiGrid>
       )}
@@ -465,7 +465,7 @@ export default function Dashboard() {
           </div>
           <KpiGrid min={200}>
             {secondary.map((m) => (
-              <KpiCard key={m.key} metric={m} compact onClick={() => navigate(drilldownLink(m.drilldown, {}, filters))} />
+              <KpiCard key={m.key} metric={m} compact onClick={m.drilldown ? () => navigate(drilldownLink(m.drilldown, {}, filters)) : undefined} />
             ))}
           </KpiGrid>
         </div>

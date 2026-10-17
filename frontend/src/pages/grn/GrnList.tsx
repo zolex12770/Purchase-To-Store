@@ -13,7 +13,7 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { Button, Tabs, StatusBadge } from '../../components/ui';
 import { DocumentQuickViewModal } from '../../components/DocumentQuickViewModal';
-import { StatTile } from '../../components/KpiCard';
+import { StatTile, LineScopeNote } from '../../components/KpiCard';
 import { money, qty, formatDate, count, text } from '../../lib/format';
 
 interface GrnRow {
@@ -64,6 +64,8 @@ export default function GrnList() {
     status: filters.status, qcStatus: filters.qcStatus, dateFrom: filters.dateFrom, dateTo: filters.dateTo,
     supplierId: filters.supplierId, itemId: filters.itemId, poId: filters.poId,
     userId: filters.userId, departmentId: filters.departmentId, costCentreId: filters.costCentreId, hodId: filters.hodId,
+    // The item dimensions the dashboard's received-quantity KPIs drill with.
+    mainGroupId: filters.mainGroupId, subMainGroupId: filters.subMainGroupId, itemTypeId: filters.itemTypeId,
   });
 
   const list = useQuery({
@@ -79,6 +81,8 @@ export default function GrnList() {
         qcPassedCount: number;
         qcFailedCount: number;
         qcStatusCounts?: Record<string, number>;
+        /** An item-level filter narrowed the tiles to its lines. */
+        lineScoped?: boolean;
       };
     }>(`/grn${query}`),
   });
@@ -171,7 +175,7 @@ export default function GrnList() {
       />
 
       {totals && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 'var(--sp-3)', marginBottom: totals.lineScoped ? 'var(--sp-2)' : 'var(--sp-4)' }}>
           <StatTile label="Total GRNs" value={count(totals.grnCount)} sub={`${count(totals.lineCount)} line item(s)`} />
           <StatTile label="Total Received Qty" value={qty(totals.totalQty)} />
           <StatTile label="Total Value" value={money(totals.totalAmount)} />
@@ -187,6 +191,7 @@ export default function GrnList() {
           )}
         </div>
       )}
+      {totals?.lineScoped && <LineScopeNote document="receipt" />}
 
       <div style={{ marginBottom: 'var(--sp-4)' }}>
         <Tabs
@@ -198,7 +203,7 @@ export default function GrnList() {
 
       <FilterBar
         filters={filters} setFilters={setFilters} clearFilters={clearFilters} activeCount={activeCount}
-        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'qcStatus', 'item']}
+        show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'qcStatus', 'mainGroup', 'itemType', 'item']}
       />
 
       <DataTable

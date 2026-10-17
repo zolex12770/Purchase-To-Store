@@ -126,6 +126,8 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
     requesterId: filters.userId || filters.requesterId,
     hodId: filters.hodId,
     view: scope,
+    // A KPI card's scope (Total Requisitions, the quantity totals): every one but cancelled.
+    excludeCancelled: filters.excludeCancelled,
   });
 
   const summaryQuery = qs({

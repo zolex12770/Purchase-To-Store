@@ -32,7 +32,11 @@
  *                        items will not close against items.live_stock_qty.
  *   --sheets <file>      re-use reads saved earlier with --save-sheets: the same run again.
  *   --save-sheets <file> with --sheets live, also save the raw reads to <file>.
- *   --out <dir>          output folder (default ./stock-alignment-out).
+ *   --out <dir>          output folder (default: a new folder under the system temp
+ *                        folder, printed at the end). The files hold item codes, stock
+ *                        figures and sheet evidence: business data that is never kept in
+ *                        the repository, which the old default (./stock-alignment-out,
+ *                        inside backend/) put it in.
  *
  * Output:
  *   stock-alignment-entries.json  the request body for POST /api/v1/admin/data-management/
@@ -45,7 +49,8 @@
  * counts the item in another unit than the Item Master; correct items.uom_id, re-run,
  * and the item is then A. C: an owner decision or a correction is needed first
  * (ERP receipts or issues the sheets do not have, a sheet that does not add up, an
- * item already aligned). An ERP document taken back with its supported reversal
+ * item whose alignment is in place; once undone, an item is assessed again). An ERP
+ * document taken back with its supported reversal
  * (same document number, net 0) changed nothing and is left out of the comparison.
  *
  * Procedure: take a verified backup with no inventory sync running, right after a
@@ -65,6 +70,7 @@
  * (on an older Node: node --import tsx scripts/compute-stock-alignment.mjs …).
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -78,7 +84,7 @@ const RECEIPT_TYPE = { RM: 'GRN_INWARD', TRADING: 'PURCHASE_INWARD', GENERAL: 'G
 const ISSUE_TYPES = new Set(['REQUISITION_ISSUE', 'DIRECT_ISSUE']);
 /** An ERP issue is the same as a sheet issue row of the same quantity at most this many days apart. */
 const DATE_TOLERANCE_DAYS = 7;
-/** Rows the endpoint posts carry this reference type; an item that has one is never aligned again. */
+/** Rows the endpoint posts, and its undo rows, carry this reference type (an undo row's reference_id names the row it takes back). */
 const ALIGNMENT_REFERENCE_TYPE = 'OPENING_ALIGNMENT';
 /** The endpoint's limits on an entry's text (data-management.routes.ts). */
 const MAX_REFERENCE = 300;
@@ -102,7 +108,8 @@ function fail(message) {
 /* ── Arguments ──────────────────────────────────────────────────────────────── */
 
 function parseArgs(argv) {
-  const out = { sheets: 'backup', out: 'stock-alignment-out' };
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
+  const out = { sheets: 'backup', out: path.join(os.tmpdir(), 'zolex-stock-alignment', stamp) };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     const value = () => {
@@ -119,6 +126,10 @@ function parseArgs(argv) {
   }
   if (!out.backup) fail('--backup <file.json> is required.');
   if (out.saveSheets && out.sheets !== 'live') fail('--save-sheets only applies to --sheets live.');
+  const repo = path.resolve(here, '..', '..');
+  if (`${path.resolve(out.out)}${path.sep}`.toLowerCase().startsWith(`${repo}${path.sep}`.toLowerCase())) {
+    console.warn(`compute-stock-alignment: ${out.out} is inside the repository; its files are business data, never commit them.`);
+  }
   return out;
 }
 
@@ -126,10 +137,10 @@ const args = parseArgs(process.argv.slice(2));
 
 // The sync's own rules: one definition of the sheets and of "same unit" for the sync and this script.
 let sheetModel;
-let sameUnit;
+let countsTowardsStock;
 try {
   sheetModel = await import(pathToFileURL(path.join(here, '..', 'src', 'modules', 'inventory', 'sheet-model.ts')).href);
-  ({ sameUnit } = await import(pathToFileURL(path.join(here, '..', 'src', 'domain', 'uom.ts')).href));
+  ({ countsTowardsStock } = await import(pathToFileURL(path.join(here, '..', 'src', 'domain', 'uom.ts')).href));
 } catch (err) {
   fail(`could not load the sync's sheet rules from backend/src (${err instanceof Error ? err.message : String(err)}). ` +
     'This script needs Node 22.18 or later, which runs TypeScript files directly.');
@@ -391,7 +402,8 @@ function analyse(backup, sheets) {
     const code = it.item_code.toUpperCase();
     const itemUom = uomCode.get(String(it.uom_id)) ?? null;
     const all = sheets.stock.get(code) ?? [];
-    const inUnit = all.filter((r) => sameUnit(itemUom, r.uom));
+    const allUnits = all.map((r) => r.uom);
+    const inUnit = all.filter((r) => countsTowardsStock(itemUom, r.uom, allUnits));
     // The sync adds only the sheets that count the code in the Item Master's unit (SLR-4). With a
     // single sheet its rows are still used, so the evidence is shown; the unit then makes it Tier B.
     const listed = all.length > 1 && inUnit.length > 0 ? inUnit : all;
@@ -400,8 +412,12 @@ function analyse(backup, sheets) {
     const sheetSum = listed.reduce((a, r) => a + r.L, 0);
     const target = Math.max(0, sheetSum);
 
-    // Rows an earlier alignment posted: the item is not aligned twice.
-    const alignedRows = rows.filter((l) => l.reference_type === ALIGNMENT_REFERENCE_TYPE);
+    // Rows an earlier alignment posted that no undo has taken back: the item is not aligned
+    // twice. An undone alignment no longer counts (the endpoint's own rule, planAlignment).
+    const undoneIds = new Set(rows.filter((l) => l.reference_type === ALIGNMENT_REFERENCE_TYPE && l.reference_id != null)
+      .map((l) => String(l.reference_id)));
+    const alignedRows = rows.filter((l) => l.reference_type === ALIGNMENT_REFERENCE_TYPE && l.reference_id == null
+      && !undoneIds.has(String(l.id)));
     // An ERP document posted and then taken back with its supported reversal (the
     // reversal carries the same document number) changed nothing for this item, so it
     // needs no sheet counterpart — e.g. the 2026-10-14 test records once reversed.
@@ -468,7 +484,7 @@ function analyse(backup, sheets) {
     const warnings = [];
     const uomOnly = [];
     const unitText = listed.map((p) => `${p.category} ${p.uom}`).join(' + ');
-    if (listed.length === 1 && !sameUnit(itemUom, listed[0].uom)) {
+    if (listed.length === 1 && !countsTowardsStock(itemUom, listed[0].uom, allUnits)) {
       uomOnly.push(`unit: the Item Master says ${itemUom ?? '(none)'}, the ${listed[0].category} sheet counts ${listed[0].uom}; correct items.uom_id, then re-run`);
     }
     for (const r of leftOut) warnings.push(`${r.category} sheet counts it in ${r.uom}: not part of the Purchase stock (Item Master ${itemUom ?? '(none)'})`);
@@ -478,9 +494,8 @@ function analyse(backup, sheets) {
     // Reasons that need a person first (Tier C).
     const reasons = [];
     if (alignedRows.length) {
-      const undone = alignedRows.some((l) => l.reference_id !== null && l.reference_id !== undefined);
-      reasons.push(`already aligned on ${day(alignedRows[0].txn_date)} (${alignedRows.length} ${ALIGNMENT_REFERENCE_TYPE} ledger row(s)` +
-        `${undone ? ', since undone' : ''}); an item is aligned once only`);
+      reasons.push(`already aligned on ${day(alignedRows[0].txn_date)} (${alignedRows.length} ${ALIGNMENT_REFERENCE_TYPE} ledger row(s) in place); ` +
+        'undo that alignment before aligning the item again');
     }
     if (listed.length === 0) reasons.push('not listed in any inventory sheet');
     else if (sheetSum < 0) reasons.push(`the sheet shows negative stock ${q(sheetSum)}, held at zero`);

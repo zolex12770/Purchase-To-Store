@@ -17,6 +17,7 @@ import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } fro
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery, parsedQuery,
   listQuerySchema, offsetOf, idParam, csvIdArray, toKolkataStartOfDay, toKolkataEndOfDay,
+  EXPORT_ROW_CAP, refuseTruncatedExport,
 } from '../../core/http.js';
 import { NotFoundError, ValidationError, BusinessRuleError, ConflictError, AuthorizationError } from '../../core/errors.js';
 import { requirePermission, requireAnyPermission } from '../../auth/middleware.js';
@@ -211,14 +212,6 @@ router.get(
     the screen showed as NORMAL (2026-10-16). */
 const AVAILABLE_SQL = 'GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0))';
 
-/** Exports are complete or refused: they used to stop silently at 10,000 rows, while the
-    stock ledger alone holds more than 27,000. */
-const EXPORT_ROW_CAP = 200_000;
-function refuseTruncatedExport(rowCount: number): void {
-  if (rowCount > EXPORT_ROW_CAP) {
-    throw ValidationError(`This export would exceed ${EXPORT_ROW_CAP.toLocaleString('en-IN')} rows. Narrow the filters (dates, category or item) and export again.`);
-  }
-}
 const STOCK_STATUS_SQL = `CASE
                  WHEN ${AVAILABLE_SQL} < COALESCE(i.min_stock, 0)
                       OR (COALESCE(i.min_stock, 0) > 0 AND ${AVAILABLE_SQL} = 0)
@@ -246,35 +239,40 @@ const stockQuerySchema = listQuerySchema.extend({
   stockStatus: z.enum(['ALL', 'NORMAL', 'BELOW_REORDER', 'CRITICAL', 'EXCESS']).default('ALL'),
 });
 
+/** The register's item filter (all but the stock status, which the list applies around its
+    rows and the export in its WHERE), shared by the list and its export. */
+function stockItemFilter(q: z.infer<typeof stockQuerySchema>): SqlBuilder {
+  const b = new SqlBuilder();
+  b.addRaw('i.deleted_at IS NULL AND i.is_active = TRUE');
+  if (q.category && q.category !== 'ALL') {
+    b.add('i.inventory_category = ?', q.category);
+  }
+  b.addIn('i.department_id', q.departmentId);
+  b.addIn('i.cost_centre_id', q.costCentreId);
+  b.addIn('i.item_type_id', q.itemTypeId);
+  b.addIn('i.main_group_id', q.mainGroupId);
+  b.addIn('i.sub_main_group_id', q.subMainGroupId);
+  b.addIn('i.id', q.itemId);
+  if (q.hodId && q.hodId.length > 0) {
+    const p = b.push(q.hodId);
+    b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+  }
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(
+      `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(i.hsn_code) LIKE ${p})`,
+    );
+  }
+  return b;
+}
+
 router.get(
   '/stock',
   requireAnyPermission('inventory.view', 'auto_indent.view'),
   validateQuery(stockQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof stockQuerySchema>>(res);
-    const b = new SqlBuilder();
-
-    b.addRaw('i.deleted_at IS NULL AND i.is_active = TRUE');
-    if (q.category && q.category !== 'ALL') {
-      b.add('i.inventory_category = ?', q.category);
-    }
-    b.addIn('i.department_id', q.departmentId);
-    b.addIn('i.cost_centre_id', q.costCentreId);
-    b.addIn('i.item_type_id', q.itemTypeId);
-    b.addIn('i.main_group_id', q.mainGroupId);
-    b.addIn('i.sub_main_group_id', q.subMainGroupId);
-    b.addIn('i.id', q.itemId);
-    if (q.hodId && q.hodId.length > 0) {
-      const p = b.push(q.hodId);
-      b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-    }
-
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(i.hsn_code) LIKE ${p})`,
-      );
-    }
+    const b = stockItemFilter(q);
 
     const baseFrom = `
       FROM items i
@@ -482,32 +480,10 @@ router.get(
   validateQuery(stockQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof stockQuerySchema>>(res);
-    const b = new SqlBuilder();
-
-    b.addRaw('i.deleted_at IS NULL AND i.is_active = TRUE');
-    if (q.category && q.category !== 'ALL') {
-      b.add('i.inventory_category = ?', q.category);
-    }
-    b.addIn('i.department_id', q.departmentId);
-    b.addIn('i.cost_centre_id', q.costCentreId);
-    b.addIn('i.item_type_id', q.itemTypeId);
-    b.addIn('i.main_group_id', q.mainGroupId);
-    b.addIn('i.sub_main_group_id', q.subMainGroupId);
-    b.addIn('i.id', q.itemId);
-    // The same filters as the list it exports (the CSV ignored hodId and stockStatus).
-    if (q.hodId && q.hodId.length > 0) {
-      const p = b.push(q.hodId);
-      b.addRaw(`EXISTS (SELECT 1 FROM lookups d WHERE d.id = i.department_id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-    }
+    // The list's own filter (the CSV ignored hodId and stockStatus).
+    const b = stockItemFilter(q);
     if (q.stockStatus !== 'ALL') {
       b.addRaw(`(${STOCK_STATUS_SQL}) = ${b.push(q.stockStatus)}`);
-    }
-
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(i.hsn_code) LIKE ${p})`,
-      );
     }
 
     const selectSql = `
@@ -613,34 +589,38 @@ const ledgerQuerySchema = listQuerySchema.extend({
   toDate: dateStr.optional(),
 });
 
+/** The movement ledger's filter, shared by the list and its export. */
+function ledgerFilter(q: z.infer<typeof ledgerQuerySchema>): SqlBuilder {
+  const b = new SqlBuilder();
+  if (q.category && q.category !== 'ALL') {
+    b.add('i.inventory_category = ?', q.category);
+  }
+  b.addIn('sl.item_id', q.itemId);
+  if (q.txnType) {
+    b.add('sl.txn_type = ?', q.txnType);
+  }
+  if (q.fromDate) {
+    b.add('sl.txn_date >= ?', q.fromDate);
+  }
+  if (q.toDate) {
+    b.add('sl.txn_date <= ?', q.toDate);
+  }
+  if (q.search) {
+    const p = b.push(`%${q.search.toLowerCase()}%`);
+    b.addRaw(
+      `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(COALESCE(sl.reference_no, '')) LIKE ${p} OR lower(sl.txn_type) LIKE ${p})`,
+    );
+  }
+  return b;
+}
+
 router.get(
   '/ledger',
   requireAnyPermission('inventory.view', 'auto_indent.view'),
   validateQuery(ledgerQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof ledgerQuerySchema>>(res);
-    const b = new SqlBuilder();
-
-    if (q.category && q.category !== 'ALL') {
-      b.add('i.inventory_category = ?', q.category);
-    }
-    b.addIn('sl.item_id', q.itemId);
-    if (q.txnType) {
-      b.add('sl.txn_type = ?', q.txnType);
-    }
-    if (q.fromDate) {
-      b.add('sl.txn_date >= ?', q.fromDate);
-    }
-    if (q.toDate) {
-      b.add('sl.txn_date <= ?', q.toDate);
-    }
-
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(COALESCE(sl.reference_no, '')) LIKE ${p} OR lower(sl.txn_type) LIKE ${p})`,
-      );
-    }
+    const b = ledgerFilter(q);
 
     const baseFrom = `
       FROM stock_ledger sl
@@ -699,28 +679,7 @@ router.get(
   validateQuery(ledgerQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof ledgerQuerySchema>>(res);
-    const b = new SqlBuilder();
-
-    if (q.category && q.category !== 'ALL') {
-      b.add('i.inventory_category = ?', q.category);
-    }
-    b.addIn('sl.item_id', q.itemId);
-    if (q.txnType) {
-      b.add('sl.txn_type = ?', q.txnType);
-    }
-    if (q.fromDate) {
-      b.add('sl.txn_date >= ?', q.fromDate);
-    }
-    if (q.toDate) {
-      b.add('sl.txn_date <= ?', q.toDate);
-    }
-
-    if (q.search) {
-      const p = b.push(`%${q.search.toLowerCase()}%`);
-      b.addRaw(
-        `(lower(i.item_code) LIKE ${p} OR lower(i.item_description) LIKE ${p} OR lower(COALESCE(sl.reference_no, '')) LIKE ${p} OR lower(sl.txn_type) LIKE ${p})`,
-      );
-    }
+    const b = ledgerFilter(q);
 
     const selectSql = `
       SELECT sl.id, sl.item_id, i.item_code, i.item_description, i.inventory_category AS category,
