@@ -118,7 +118,7 @@ export interface LinkPlan {
   held: HeldLine[];
   headers: HeaderLink[];
   affectedPos: AffectedPo[];
-  /** Over-receipt figures per PO line held back. */
+  /** PO lines whose receipts were all held back as an over-receipt. */
   overReceivedPoLines: number;
   totals: {
     unlinkedLines: number;
@@ -145,6 +145,13 @@ export const runIn = (tx: Queryable): Run => (sql, params) => txQuery(tx, sql, p
 // The engine compares with upper()/lower() in SQL; the same, on values already read.
 const U = (s: string | null | undefined) => (s ?? '').toUpperCase();
 const L = (s: string | null | undefined) => (s ?? '').toLowerCase();
+
+/** Appends `value` to the list `map` holds under `key`. */
+function addTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const list = map.get(key);
+  if (list) list.push(value);
+  else map.set(key, [value]);
+}
 
 /**
  * The tab's rows that name a GRN and an item, read with the column mapping the sync
@@ -268,11 +275,7 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
   const resolved = (r: TabRow) => byCode.get(U(r.itemCode)) ?? byText.get(L(r.itemDescription || r.itemCode)) ?? null;
 
   const rowsByGrn = new Map<string, TabRow[]>();
-  for (const r of tab.rows) {
-    const list = rowsByGrn.get(U(r.grnNo)) ?? [];
-    list.push(r);
-    rowsByGrn.set(U(r.grnNo), list);
-  }
+  for (const r of tab.rows) addTo(rowsByGrn, U(r.grnNo), r);
   // The engine's GRN-tab match of a row to an ERP line of the same GRN number.
   const rowNamesLine = (r: TabRow, l: GrnLineRow) =>
     resolved(r) === Number(l.item_id) || U(l.item_code) === U(r.itemCode) || L(l.item_description) === L(r.itemCode)
@@ -323,7 +326,7 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
     [[...new Set(named.map((n) => n.poKey))]],
   );
   const posByKey = new Map<string, PoHeaderRow[]>();
-  for (const h of poHeaders) posByKey.set(h.key, [...(posByKey.get(h.key) ?? []), h]);
+  for (const h of poHeaders) addTo(posByKey, h.key, h);
   const poIds = poHeaders.map((h) => Number(h.id));
   if (opts.lock && poIds.length > 0) {
     await run('SELECT id FROM purchase_order_lines WHERE po_id = ANY($1::bigint[]) ORDER BY id FOR UPDATE', [poIds]);
@@ -335,7 +338,7 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
     [poIds],
   );
   const linesByPo = new Map<number, PoLineRow[]>();
-  for (const pl of poLines) linesByPo.set(Number(pl.po_id), [...(linesByPo.get(Number(pl.po_id)) ?? []), pl]);
+  for (const pl of poLines) addTo(linesByPo, Number(pl.po_id), pl);
 
   // 5. The PO line for each item, matched as the engine matches a PO row to stored lines:
   //    the resolved item, the code, or the description (or the code cell read as one).
@@ -379,10 +382,7 @@ export async function planStoreGrnLinks(run: Run, grid: string[][], opts: { lock
 
   // 6. Over-receipt, per PO line, over all the receipts the tab assigns to it at once.
   const byPoLine = new Map<number, typeof candidates>();
-  for (const c of candidates) {
-    const id = Number(c.poLine.po_line_id);
-    byPoLine.set(id, [...(byPoLine.get(id) ?? []), c]);
-  }
+  for (const c of candidates) addTo(byPoLine, Number(c.poLine.po_line_id), c);
   const links: PlannedLink[] = [];
   const checked: Array<[number, string, string]> = [];
   let overReceivedPoLines = 0;
@@ -558,7 +558,7 @@ export function summariseLinkPlan(plan: LinkPlan): string {
 /** Splits the links into audit batches of whole GRNs, at most AUDIT_BATCH_LINES lines each. */
 function batchesOf(plan: LinkPlan): Array<{ links: PlannedLink[]; headers: HeaderLink[] }> {
   const byGrn = new Map<number, PlannedLink[]>();
-  for (const l of plan.links) byGrn.set(l.grnId, [...(byGrn.get(l.grnId) ?? []), l]);
+  for (const l of plan.links) addTo(byGrn, l.grnId, l);
   const headerOf = new Map(plan.headers.map((h) => [h.grnId, h]));
   const batches: Array<{ links: PlannedLink[]; headers: HeaderLink[] }> = [];
   let current = { links: [] as PlannedLink[], headers: [] as HeaderLink[] };
