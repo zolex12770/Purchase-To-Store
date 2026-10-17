@@ -422,7 +422,37 @@ describe('controlled ledger-only void of the 2026-10-14 test chain', () => {
   });
 
   it('is for a Super Admin only', async () => {
+    // A system administrator passes data management's router guard (system.admin),
+    // so only requireSuperAdmin() on the void route stands in this user's way:
+    // without it, this is the test that fails. The Store User, refused by the
+    // router guard already, proved nothing about it.
+    const permissions = ((await request(app).get(api('/roles/permissions')).set(auth(adminToken))).body.data as
+      { permissions: { id: number; code: string }[] }[]).flatMap((g) => g.permissions);
+    const role = await request(app).post(api('/roles')).set(auth(adminToken)).send({
+      code: 'T_REV2_SYSADMIN', name: 'Reversal 2 system administrator',
+      permissionIds: [permissions.find((p) => p.code === 'system.admin')!.id],
+    });
+    expect(role.status).toBe(201);
+    const user = await request(app).post(api('/users')).set(auth(adminToken)).send({
+      employeeId: 'T-REV2-SYSADMIN', employeeName: 'Reversal2 system administrator', designation: 'test',
+      password: PASSWORD, mustChangePassword: false, roleIds: [role.body.data.id],
+    });
+    expect(user.status).toBe(201);
+    const sysAdminToken = (await request(app).post(api('/auth/login'))
+      .send({ employeeId: 'T-REV2-SYSADMIN', password: PASSWORD })).body.data.accessToken as string;
+    expect((await request(app).get(api('/admin/data-management/summary')).set(auth(sysAdminToken))).status).toBe(200);
+
+    const before = await ledgerCount();
+    const hash = (await send({})).body.data.selectionHash as string;
+    for (const body of [{}, { dryRun: false, confirm: 'VOID TEST DOCUMENTS', expectedHash: hash }]) {
+      const refused = await send(body, sysAdminToken);
+      expect(refused.status).toBe(403);
+      expect(refused.body.error.message).toMatch(/Super Admin/);
+    }
     expect((await send({}, storeToken)).status).toBe(403);
+    expect(await ledgerCount()).toBe(before);
+    expect(await statuses()).toEqual(UNTOUCHED);
+    expect(await stockOf(itemId)).toBe(3);
   });
 
   it('dry run: per-item figures, the rows it would write and a selection hash; nothing is written', async () => {
