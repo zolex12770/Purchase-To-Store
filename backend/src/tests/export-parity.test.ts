@@ -390,6 +390,13 @@ describe('Audit log and masters', () => {
     const { total } = await expectParity('users', 'users', { roleId: ids.role }, { list: 'employee_id', file: 'Employee ID' });
     expect(total).toBe(2);
   });
+
+  it('the file header names the filters applied, an inactive-only filter included', async () => {
+    const { file } = await expectParity('items', 'items', { isActive: 'false' }, { list: 'item_code', file: 'Item Code' });
+    expect(file.context[2]).toBe('Active: No');
+    const pending = await exportFile('purchase-orders', { view: 'pending', overdue: 'false', search: 'cable' });
+    expect(pending.context[2]).toBe('View: pending  ·  Search: "cable"');
+  });
 });
 
 describe('Exports are complete or refused', () => {

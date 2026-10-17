@@ -62,20 +62,25 @@ const FILTER_LABELS: Record<string, string> = {
 };
 /** Paging, sorting and the file format are not filters. */
 const NOT_FILTERS = new Set(['format', 'page', 'pageSize', 'sortBy', 'sortDir', 'dateFrom', 'dateTo', 'search', 'ids']);
+/** Switches a list turns on with 'true'; 'false' is the same as leaving them off. */
+const SWITCHES = new Set(['overdue', 'pendingOnly', 'excludeCancelled', 'eligibleOnly']);
 
 /** Human-readable description of the filters actually applied (SRS §35) — every one of the list's. */
 function describeFilters(f: Record<string, unknown>): string {
   const parts: string[] = [];
   if (f.dateFrom || f.dateTo) parts.push(`Period: ${f.dateFrom ?? 'start'} to ${f.dateTo ?? 'today'}`);
   for (const [key, value] of Object.entries(f)) {
-    if (NOT_FILTERS.has(key) || value === undefined || value === null || value === '' || value === 'false') continue;
+    if (NOT_FILTERS.has(key) || value === undefined || value === null || value === '') continue;
     if (key === 'view' && value === 'all') continue;
     const label = FILTER_LABELS[key] ?? key;
-    if (Array.isArray(value)) {
+    if (SWITCHES.has(key)) {
+      if (value === 'true') parts.push(label);
+    } else if (Array.isArray(value)) {
       if (value.length === 0) continue;
       parts.push(typeof value[0] === 'number' ? `${label}: ${value.length} selected` : `${label}: ${value.join(', ')}`);
-    } else if (value === 'true') {
-      parts.push(label);
+    } else if (value === 'true' || value === 'false') {
+      // isActive=false is a real filter (inactive only), not an absent one.
+      parts.push(`${label}: ${value === 'true' ? 'Yes' : 'No'}`);
     } else {
       parts.push(`${label}: ${String(value)}`);
     }
