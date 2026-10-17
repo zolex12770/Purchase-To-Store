@@ -47,11 +47,20 @@ export const listSchema = listQuerySchema.extend({
   dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   pendingOnly: z.enum(['true', 'false']).optional(),
+  /** Indents with quantity still awaiting a PO (the "Approved Qty Awaiting PO" KPI). The KPI
+      drilled here before this filter existed, and the list showed all 1,814 indents. */
+  eligibleOnly: z.enum(['true', 'false']).optional(),
+  /** The indents the "Total Indents" KPI counts: every one but cancelled. */
+  excludeCancelled: z.enum(['true', 'false']).optional(),
 });
 
-export function buildIndentFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+export function buildIndentFilter(q: Omit<z.infer<typeof listSchema>, 'page' | 'pageSize' | 'sortBy' | 'sortDir'>): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
+  if (q.excludeCancelled === 'true') b.addRaw("h.status <> 'CANCELLED'");
+  if (q.eligibleOnly === 'true') {
+    b.addRaw('EXISTS (SELECT 1 FROM v_indent_line_balance el WHERE el.indent_id = h.id AND el.is_eligible_for_po)');
+  }
   b.addIn('h.indent_type_id', q.indentTypeId);
   b.addIn('h.department_id', q.departmentId);
   b.addIn('h.cost_centre_id', q.costCentreId);

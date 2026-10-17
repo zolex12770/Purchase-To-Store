@@ -57,6 +57,8 @@ export const listSchema = listQuerySchema.extend({
   departmentId: csvIdArray,
   costCentreId: csvIdArray,
   mainGroupId: csvIdArray,
+  subMainGroupId: csvIdArray,
+  itemTypeId: csvIdArray,
   hodId: csvIdArray,
   sourceMode: z.enum(['DIRECT', 'INDENT']).optional(),
   dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -64,11 +66,23 @@ export const listSchema = listQuerySchema.extend({
   /** `pending` and `complete` back the dedicated SRS §11.4 sub-tabs. */
   view: z.enum(['all', 'pending', 'complete']).default('all'),
   overdue: z.enum(['true', 'false']).optional(),
+  /** The orders the PO KPIs count (Total PO Value, Purchase Orders, …): every one but cancelled. */
+  excludeCancelled: z.enum(['true', 'false']).optional(),
 });
 
-export function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+/**
+ * A PO line still to be received: on an issued, open order (a DRAFT was never sent to
+ * the supplier), not closed, with quantity outstanding. The Pending view, the overdue
+ * filter and the pending KPIs (analytics) share this one rule, so a pending KPI opens
+ * exactly the orders it counts. `alias` is a v_po_line_balance row.
+ */
+export const pendingLineSql = (alias: string): string =>
+  `${alias}.is_receivable AND ${alias}.po_status IN ('OPEN', 'PARTIALLY_RECEIVED')`;
+
+export function buildPoFilter(q: Omit<z.infer<typeof listSchema>, 'page' | 'pageSize' | 'sortBy' | 'sortDir'>): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
+  if (q.excludeCancelled === 'true') b.addRaw("h.status <> 'CANCELLED'");
   b.addIn('h.supplier_id', q.supplierId);
   b.addIn('h.po_type_id', q.poTypeId);
   b.addIn('h.created_by', q.userId);
@@ -84,9 +98,15 @@ export function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
     const p = b.push(q.costCentreId);
     b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.cost_centre_id = ANY(${p}))`);
   }
-  if (q.mainGroupId && q.mainGroupId.length > 0) {
-    const p = b.push(q.mainGroupId);
-    b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.main_group_id = ANY(${p}))`);
+  // Item-master dimensions as the dashboard and its breakdowns pass them, so a KPI or a
+  // bar drilled with an item type or sub-group opens the orders it counted.
+  for (const [column, ids] of [
+    ['main_group_id', q.mainGroupId], ['sub_main_group_id', q.subMainGroupId], ['item_type_id', q.itemTypeId],
+  ] as const) {
+    if (ids && ids.length > 0) {
+      const p = b.push(ids);
+      b.addRaw(`EXISTS (SELECT 1 FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id WHERE pol.po_id = h.id AND i.${column} = ANY(${p}))`);
+    }
   }
   if (q.hodId && q.hodId.length > 0) {
     const p = b.push(q.hodId);
@@ -94,14 +114,17 @@ export function buildPoFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   }
 
   // "Pending" and "Complete" are defined by the authoritative balance, not by a
-  // status string a user could have set by hand (ADR-003).
-  if (q.view === 'pending') b.addRaw('b.total_pending_qty > 0 AND h.status IN (\'OPEN\',\'PARTIALLY_RECEIVED\')');
+  // status string a user could have set by hand (ADR-003). Pending is a line still to
+  // be received (pendingLineSql), the rule the pending KPIs count by.
+  if (q.view === 'pending') {
+    b.addRaw(`EXISTS (SELECT 1 FROM v_po_line_balance pl WHERE pl.po_id = h.id AND ${pendingLineSql('pl')})`);
+  }
   if (q.view === 'complete') b.addRaw("h.status IN ('COMPLETED','SHORT_CLOSED')");
 
   if (q.overdue === 'true') {
     b.addRaw(
       `EXISTS (SELECT 1 FROM v_po_line_balance l
-                WHERE l.po_id = h.id AND l.is_receivable
+                WHERE l.po_id = h.id AND ${pendingLineSql('l')}
                   AND l.delivery_date IS NOT NULL AND l.delivery_date < CURRENT_DATE)`,
     );
   }

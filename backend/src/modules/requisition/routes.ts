@@ -187,6 +187,8 @@ export const listSchema = listQuerySchema.extend({
   dateTo: dateStr.optional(),
   /** `mine` | `hod-pending` | `store-queue` | omitted (everything the caller may view). */
   view: z.enum(['mine', 'hod-pending', 'store-queue']).optional(),
+  /** The requisitions the requisition KPIs count: every one but cancelled. */
+  excludeCancelled: z.enum(['true', 'false']).optional(),
 });
 
 export const LIST_FROM = `
@@ -198,6 +200,7 @@ export const LIST_FROM = `
 export function buildFilter(q: z.infer<typeof listSchema>, userId: number): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('h.status', q.status);
+  if (q.excludeCancelled === 'true') b.addRaw("h.status <> 'CANCELLED'");
   b.addIn('b.hod_status', q.hodStatus);
   b.addIn('b.store_status', q.storeStatus);
   b.addIn('h.department_id', q.departmentId);

@@ -87,12 +87,18 @@ export const listSchema = listQuerySchema.extend({
   userId: csvIdArray,
   departmentId: csvIdArray,
   costCentreId: csvIdArray,
+  mainGroupId: csvIdArray,
+  subMainGroupId: csvIdArray,
+  itemTypeId: csvIdArray,
   hodId: csvIdArray,
   mode: z.enum(['PO', 'DIRECT']).optional(),
   grnTypeId: csvIdArray,
   dateFrom: dateStr.optional(),
   dateTo: dateStr.optional(),
 });
+
+/** The list's filters (paging and sort aside): what the GRN KPIs count by, too. */
+export type GrnListFilter = Omit<z.infer<typeof listSchema>, 'page' | 'pageSize' | 'sortBy' | 'sortDir'>;
 
 // A GRN's PO reference is now nullable and possibly plural (multi-PO), so the
 // list join is LEFT — an INNER join would silently drop every Direct GRN and
@@ -103,7 +109,7 @@ export const GRN_FROM = `
   JOIN suppliers s ON s.id = g.supplier_id
   LEFT JOIN lookups gt ON gt.id = g.grn_type_id`;
 
-export function buildGrnFilter(q: z.infer<typeof listSchema>): SqlBuilder {
+export function buildGrnFilter(q: GrnListFilter): SqlBuilder {
   const b = new SqlBuilder();
   b.addIn('g.status', q.status);
   b.addIn('g.qc_status', q.qcStatus);
@@ -125,6 +131,16 @@ export function buildGrnFilter(q: z.infer<typeof listSchema>): SqlBuilder {
   if (q.hodId && q.hodId.length > 0) {
     const p = b.push(q.hodId);
     b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id JOIN lookups d ON d.id = i.department_id WHERE l.grn_id = g.id AND (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
+  }
+  // The item-master dimensions the dashboard and GRN Analysis filter by, so a received-
+  // quantity KPI drilled with a main group opens the receipts it counted.
+  for (const [column, ids] of [
+    ['main_group_id', q.mainGroupId], ['sub_main_group_id', q.subMainGroupId], ['item_type_id', q.itemTypeId],
+  ] as const) {
+    if (ids && ids.length > 0) {
+      const p = b.push(ids);
+      b.addRaw(`EXISTS (SELECT 1 FROM grn_lines l JOIN items i ON i.id = l.item_id WHERE l.grn_id = g.id AND i.${column} = ANY(${p}))`);
+    }
   }
   if (q.mode === 'DIRECT') {
     b.addRaw('NOT EXISTS (SELECT 1 FROM grn_lines l WHERE l.grn_id = g.id AND l.po_line_id IS NOT NULL)');

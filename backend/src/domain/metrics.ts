@@ -21,7 +21,14 @@ export interface MetricDef {
   unit: MetricUnit;
   /** Which balance view or table the number comes from. */
   source: string;
-  /** Route + filter the KPI card drills into (SRS §14). */
+  /**
+   * Route + filter the KPI card drills into (SRS §14): a list filtered to exactly what the
+   * number counts, under the same dashboard filters. Empty when no list shows that (a
+   * distinct-supplier count, an average across documents): the card is then not clickable.
+   * Several targets opened a list that did not hold the figure (2026-10-16 audit, F09):
+   * '/indents?eligibleOnly=true' was ignored by the list (50 vs 1,814 indents), and
+   * 'Active Suppliers' 88 opened all 1,403 suppliers.
+   */
   drilldown: string;
   /** `true` when a rising value is bad (pending, overdue, rejection). */
   inverse?: boolean;
@@ -38,7 +45,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ purchase_order_lines.amount WHERE po.status <> CANCELLED',
     unit: 'currency',
     source: 'v_po_line_balance',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     permission: 'po.view',
   },
   {
@@ -48,7 +55,7 @@ export const METRICS: MetricDef[] = [
     formula: 'COUNT(DISTINCT purchase_order_headers.id) WHERE status <> CANCELLED',
     unit: 'count',
     source: 'purchase_order_headers',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     permission: 'po.view',
   },
   {
@@ -58,7 +65,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ v_po_line_balance.po_qty',
     unit: 'quantity',
     source: 'v_po_line_balance',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     permission: 'po.view',
   },
   {
@@ -68,17 +75,19 @@ export const METRICS: MetricDef[] = [
     formula: 'po_value_total ÷ po_count',
     unit: 'currency',
     source: 'v_po_header_balance',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     permission: 'po.view',
   },
 
   /* ── Pending exposure ────────────────────────────────────────────────────── */
+  // "Pending" is a line still to be received on an issued, open order: the Pending PO
+  // list's own rule (purchase-order/routes.ts pendingLineSql). A DRAFT was never sent.
   {
     key: 'po_pending_value',
     label: 'Pending PO Value',
     description:
       'Committed value not yet received — the outstanding financial exposure to suppliers.',
-    formula: 'Σ (v_po_line_balance.pending_grn_qty × final_rate) WHERE is_receivable',
+    formula: "Σ (v_po_line_balance.pending_grn_qty × final_rate) WHERE is_receivable AND po_status IN ('OPEN','PARTIALLY_RECEIVED')",
     unit: 'currency',
     source: 'v_po_line_balance',
     drilldown: '/purchase-orders/pending',
@@ -88,8 +97,8 @@ export const METRICS: MetricDef[] = [
   {
     key: 'po_pending_count',
     label: 'Pending POs',
-    description: 'Purchase orders with at least one line still awaiting receipt.',
-    formula: 'COUNT(DISTINCT po_id) WHERE v_po_line_balance.is_receivable',
+    description: 'Issued purchase orders with at least one line still awaiting receipt.',
+    formula: "COUNT(DISTINCT po_id) WHERE v_po_line_balance.is_receivable AND po_status IN ('OPEN','PARTIALLY_RECEIVED')",
     unit: 'count',
     source: 'v_po_line_balance',
     drilldown: '/purchase-orders/pending',
@@ -103,7 +112,8 @@ export const METRICS: MetricDef[] = [
     formula: "COUNT(*) WHERE v_po_header_balance.derived_status = 'COMPLETED'",
     unit: 'count',
     source: 'v_po_header_balance',
-    drilldown: '/purchase-orders/complete',
+    // The Complete tab also holds short-closed orders, which this does not count.
+    drilldown: '/purchase-orders?status=COMPLETED',
     permission: 'po.view',
   },
 
@@ -115,7 +125,7 @@ export const METRICS: MetricDef[] = [
     formula: 'COUNT(*) FROM purchase_indent_headers WHERE status <> CANCELLED',
     unit: 'count',
     source: 'purchase_indent_headers',
-    drilldown: '/indents',
+    drilldown: '/indents?excludeCancelled=true',
     permission: 'indent.view',
   },
   {
@@ -148,6 +158,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ v_indent_line_balance.pending_qty WHERE is_eligible_for_po',
     unit: 'quantity',
     source: 'v_indent_line_balance',
+    // The indents holding that quantity; the list has filtered on eligibleOnly since 2026-10-17.
     drilldown: '/indents?eligibleOnly=true',
     inverse: true,
     permission: 'indent.view',
@@ -176,41 +187,45 @@ export const METRICS: MetricDef[] = [
   },
 
   /* ── GRN (SRS §13) ───────────────────────────────────────────────────────── */
+  // Posted receipts of every kind: 2,716 of the 2,718 GRNs are direct (store) receipts
+  // with no purchase order, and the received figures used to count PO receipts only
+  // (267 against the GRN list's 17,051,110.899; 2026-10-16 audit, F09). Counted through
+  // the GRN list's own filter, so they open '/grn?status=POSTED' showing what they count.
   {
     key: 'grn_count',
     label: 'Goods Receipts',
-    description: 'Posted GRNs in the selected period.',
+    description: 'Posted GRNs in the selected period, purchase-order and direct receipts alike.',
     formula: "COUNT(*) FROM grn_headers WHERE status = 'POSTED'",
     unit: 'count',
     source: 'grn_headers',
-    drilldown: '/grn',
+    drilldown: '/grn?status=POSTED',
     permission: 'grn.view',
   },
   {
     key: 'grn_qty_total',
     label: 'Received Quantity',
-    description: 'Total quantity received against purchase orders via posted GRNs.',
+    description: 'Total quantity received on posted GRNs, purchase-order and direct receipts alike.',
     formula: "Σ grn_lines.grn_qty WHERE grn.status = 'POSTED'",
     unit: 'quantity',
     source: 'grn_lines',
-    drilldown: '/grn',
+    drilldown: '/grn?status=POSTED',
     permission: 'grn.view',
   },
   {
     key: 'grn_value_total',
     label: 'Received Value',
-    description: 'Value of goods received, priced at the purchase order rate.',
-    formula: 'Σ v_po_line_balance.received_amount',
+    description: 'Value of goods received on posted GRNs: the purchase order rate for a PO receipt, the entered rate for a direct one.',
+    formula: "Σ grn_lines.amount (grn_qty × rate) WHERE grn.status = 'POSTED'",
     unit: 'currency',
-    source: 'v_po_line_balance',
-    drilldown: '/grn',
+    source: 'grn_lines',
+    drilldown: '/grn?status=POSTED',
     permission: 'grn.view',
   },
   {
     key: 'grn_pending_qty',
     label: 'Pending Receipt Qty',
-    description: 'Ordered quantity still to be delivered by suppliers.',
-    formula: 'Σ v_po_line_balance.pending_grn_qty WHERE is_receivable',
+    description: 'Ordered quantity still to be delivered by suppliers on issued purchase orders.',
+    formula: "Σ v_po_line_balance.pending_grn_qty WHERE is_receivable AND po_status IN ('OPEN','PARTIALLY_RECEIVED')",
     unit: 'quantity',
     source: 'v_po_line_balance',
     drilldown: '/purchase-orders/pending',
@@ -224,15 +239,16 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ received_qty ÷ Σ po_qty × 100',
     unit: 'percent',
     source: 'v_po_line_balance',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     permission: 'grn.analyze',
   },
   {
     key: 'po_overdue_count',
     label: 'Overdue Deliveries',
     description:
-      'Purchase order lines past their delivery date with quantity still outstanding.',
-    formula: 'COUNT(*) WHERE is_receivable AND delivery_date < CURRENT_DATE',
+      'Issued purchase orders with a line past its delivery date and quantity still outstanding.',
+    // Orders, not lines, so the number is the length of the list it opens.
+    formula: "COUNT(DISTINCT po_id) WHERE is_receivable AND po_status IN ('OPEN','PARTIALLY_RECEIVED') AND delivery_date < CURRENT_DATE",
     unit: 'count',
     source: 'v_po_line_balance',
     drilldown: '/purchase-orders/pending?overdue=true',
@@ -249,7 +265,9 @@ export const METRICS: MetricDef[] = [
     formula: 'AVG(first grn_date − indent submitted_at) over indent-sourced POs, in days',
     unit: 'days',
     source: 'v_po_line_sources + grn_headers',
-    drilldown: '/purchase-orders',
+    // An average over first receipts of indent-sourced orders, filtered by receipt date only:
+    // no list holds that set, so the card is not clickable.
+    drilldown: '',
     inverse: true,
     permission: 'dashboard.analyze',
   },
@@ -260,7 +278,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ (rate × qty − amount) ÷ Σ (rate × qty) × 100',
     unit: 'percent',
     source: 'v_po_line_balance',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     permission: 'po.analyze',
   },
   {
@@ -270,7 +288,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ (po_qty × rate) − Σ amount',
     unit: 'currency',
     source: 'v_po_line_balance',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     permission: 'po.analyze',
   },
   {
@@ -280,7 +298,8 @@ export const METRICS: MetricDef[] = [
     formula: 'COUNT(DISTINCT supplier_id)',
     unit: 'count',
     source: 'purchase_order_headers',
-    drilldown: '/masters/suppliers',
+    // The Supplier Master lists every supplier (1,403 against 88 counted): not clickable.
+    drilldown: '',
     permission: 'supplier.view',
   },
   {
@@ -291,7 +310,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ top-5 supplier value ÷ po_value_total × 100',
     unit: 'percent',
     source: 'v_po_line_balance',
-    drilldown: '/purchase-orders',
+    drilldown: '/purchase-orders?excludeCancelled=true',
     inverse: true,
     permission: 'dashboard.analyze',
   },
@@ -302,7 +321,8 @@ export const METRICS: MetricDef[] = [
     formula: 'COUNT(DISTINCT item_id) FROM v_po_line_balance',
     unit: 'count',
     source: 'v_po_line_balance',
-    drilldown: '/masters/items',
+    // The Item Master lists every item (4,748 against 531 counted): not clickable.
+    drilldown: '',
     permission: 'item.view',
   },
 
@@ -314,7 +334,7 @@ export const METRICS: MetricDef[] = [
     formula: "COUNT(*) FROM requisition_headers WHERE status <> 'CANCELLED'",
     unit: 'count',
     source: 'requisition_headers',
-    drilldown: '/requisitions',
+    drilldown: '/requisitions?excludeCancelled=true',
     permission: 'requisition.view',
   },
   {
@@ -335,7 +355,8 @@ export const METRICS: MetricDef[] = [
     formula: "COUNT(*) WHERE v_requisition_header_balance.hod_status = 'APPROVED'",
     unit: 'count',
     source: 'v_requisition_header_balance',
-    drilldown: '/requisitions?hodStatus=APPROVED',
+    // A requisition cancelled after approval keeps HOD status Approved; the KPI leaves it out.
+    drilldown: '/requisitions?hodStatus=APPROVED&excludeCancelled=true',
     permission: 'requisition.view',
   },
   {
@@ -345,7 +366,7 @@ export const METRICS: MetricDef[] = [
     formula: "COUNT(*) WHERE v_requisition_header_balance.hod_status = 'REJECTED'",
     unit: 'count',
     source: 'v_requisition_header_balance',
-    drilldown: '/requisitions?hodStatus=REJECTED',
+    drilldown: '/requisitions?hodStatus=REJECTED&excludeCancelled=true',
     inverse: true,
     permission: 'requisition.view',
   },
@@ -356,10 +377,14 @@ export const METRICS: MetricDef[] = [
     formula: "COUNT(*) WHERE status = 'APPROVED'",
     unit: 'count',
     source: 'requisition_headers',
-    drilldown: '/requisitions/store-queue',
+    // The Store queue also holds part-issued requisitions, which this does not count.
+    drilldown: '/requisitions?status=APPROVED',
     inverse: true,
     permission: 'requisition.view',
   },
+  // The quantity KPIs sum every requisition but cancelled ones; their drill-down lists exactly
+  // those, and the list's own totals show the same figure. (Issued Qty opened only the fully
+  // issued ones and Pending Qty only store-pending ones, which held part of each figure.)
   {
     key: 'requisition_requested_qty',
     label: 'Total Requested Qty',
@@ -367,7 +392,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ v_requisition_header_balance.total_requested_qty',
     unit: 'quantity',
     source: 'v_requisition_header_balance',
-    drilldown: '/requisitions',
+    drilldown: '/requisitions?excludeCancelled=true',
     permission: 'requisition.view',
   },
   {
@@ -377,7 +402,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ v_requisition_header_balance.total_issued_qty',
     unit: 'quantity',
     source: 'v_requisition_header_balance',
-    drilldown: '/requisitions?storeStatus=ISSUED',
+    drilldown: '/requisitions?excludeCancelled=true',
     permission: 'requisition.view',
   },
   {
@@ -387,7 +412,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ v_requisition_header_balance.total_pending_qty',
     unit: 'quantity',
     source: 'v_requisition_header_balance',
-    drilldown: '/requisitions?storeStatus=PENDING',
+    drilldown: '/requisitions?excludeCancelled=true',
     inverse: true,
     permission: 'requisition.view',
   },
@@ -398,7 +423,7 @@ export const METRICS: MetricDef[] = [
     formula: 'Σ v_requisition_header_balance.total_excess_qty',
     unit: 'quantity',
     source: 'v_requisition_header_balance',
-    drilldown: '/requisitions',
+    drilldown: '/requisitions?excludeCancelled=true',
     permission: 'requisition.analyze',
   },
   {
@@ -419,7 +444,9 @@ export const METRICS: MetricDef[] = [
     formula: "COUNT(*) FROM requisition_issues WHERE status = 'POSTED'",
     unit: 'count',
     source: 'requisition_issues',
-    drilldown: '/requisitions/store-queue',
+    // Issue slips by issue date: the Store queue lists requisitions still to be issued,
+    // and no screen lists slips, so the card is not clickable.
+    drilldown: '',
     permission: 'requisition.analyze',
   },
 ];
