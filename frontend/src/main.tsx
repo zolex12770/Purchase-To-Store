@@ -3,6 +3,10 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
+// The UI face, bundled into dist/assets so it is served over the LAN with no
+// internet. Its @font-face rules are split by unicode-range, so a browser only
+// fetches the latin (and, for ₹, latin-ext) files it actually needs.
+import '@fontsource-variable/inter';
 import './styles/tokens.css';
 import './styles/base.css';
 import './styles/simple.css';

@@ -1,20 +1,26 @@
 /**
- * KPI card (SRS §13, §14, §38).
+ * KPI and stat components (SRS §13, §14, §38; redesign spec §3.4).
  *
- * Three obligations the specification places on every KPI, all satisfied here:
- *   • it is CLICKABLE and drills into the transactions behind it (§14);
- *   • it exposes its authoritative DEFINITION and formula on hover (§38);
- *   • rising is not assumed to be good — `inverse` metrics invert the trend tone.
+ * Obligations every KPI keeps:
+ *   • it is CLICKABLE only when the click explains the number (§14);
+ *   • it exposes its DEFINITION and formula (§38) — now in a real tooltip that
+ *     keyboard users get on focus, instead of a multi-line native title;
+ *   • rising is not assumed to be good — `inverse` metrics invert the trend tone;
+ *   • it is HONEST while loading and on error: a skeleton, or "—" with the
+ *     reason, never a fake 0 (audit UI-002: failed overviews rendered ₹0).
  *
- * Visually the card is built from a gradient icon medallion, a count-up figure
- * and a tinted trend pill. Each metric family owns a colour, so a wall of KPIs
- * is scannable by hue rather than by reading every label.
+ * StatStrip replaces the rows of StatTiles that wrapped into orphan rows
+ * (PO list 8 → 7 + 1, requisitions 12 → 7 + 5); FilterTiles is the tile row
+ * that filters the current view, with a visible selected state.
  */
-import { TrendingUp, TrendingDown, Minus, Info, ArrowRight,
-         IndianRupee, Package, Hash, Clock, Percent } from 'lucide-react';
-import type { ReactNode } from 'react';
+import {
+  ArrowUpRight, ArrowDownRight, Minus, ChevronRight, AlertTriangle,
+  IndianRupee, Package, Hash, Clock, Percent,
+} from 'lucide-react';
+import { Children, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { moneyCompact, numberCompact, percent, count } from '../lib/format';
 import { useCountUp } from '../lib/useCountUp';
+import { Skeleton, Tooltip } from './ui';
 
 export interface MetricValue {
   key: string;
@@ -40,216 +46,295 @@ function formatValue(value: string | number, unit: MetricValue['unit']): string 
   }
 }
 
-/** Colour + gradient + icon per metric family. */
-const FAMILY: Record<MetricValue['unit'], { solid: string; grad: string; icon: ReactNode }> = {
-  currency: { solid: 'var(--accent-500)',   grad: 'var(--grad-accent)', icon: <IndianRupee size={15} /> },
-  quantity: { solid: 'var(--info-500)',     grad: 'var(--grad-sky)',    icon: <Package size={15} /> },
-  count:    { solid: 'var(--brand-500)',    grad: 'var(--grad-brand)',  icon: <Hash size={15} /> },
-  days:     { solid: 'var(--progress-500)', grad: 'var(--grad-violet)', icon: <Clock size={15} /> },
-  percent:  { solid: 'var(--success-500)',  grad: 'var(--grad-emerald)',icon: <Percent size={15} /> },
+/** Family rail + icon. An inverse metric (pending, overdue, rejection) takes the pending family. */
+const FAMILY: Record<MetricValue['unit'], { rail: string; icon: ReactNode }> = {
+  currency: { rail: 'var(--grad-neutral)', icon: <IndianRupee size={16} /> },
+  quantity: { rail: 'var(--grad-info)', icon: <Package size={16} /> },
+  count:    { rail: 'var(--grad-neutral)', icon: <Hash size={16} /> },
+  days:     { rail: 'var(--grad-info)', icon: <Clock size={16} /> },
+  percent:  { rail: 'var(--grad-positive)', icon: <Percent size={16} /> },
 };
 
+function MetricTooltip({ metric }: { metric: MetricValue }) {
+  return (
+    <span className="tooltip-lines">
+      <span>{metric.description}</span>
+      {metric.formula && <span><span className="tl-k">Formula · </span>{metric.formula}</span>}
+      {metric.source && <span><span className="tl-k">Source · </span>{metric.source}</span>}
+    </span>
+  );
+}
+
 export function KpiCard({
-  metric, onClick, accent, compact,
+  metric, onClick, accent, compact, loading, error,
 }: {
   metric: MetricValue;
   onClick?: () => void;
+  /** Override the family rail (a CSS colour or gradient). */
   accent?: string;
   compact?: boolean;
+  /** Show a skeleton instead of the value. */
+  loading?: boolean;
+  /** The value could not be computed: show "—" and why. */
+  error?: unknown;
 }) {
   const change = metric.changePct;
-  const hasTrend = change !== null && change !== undefined && Number.isFinite(change);
+  const hasTrend = !loading && !error && change !== null && change !== undefined && Number.isFinite(change);
 
   // For an inverse metric (pending value, overdue count, rejection rate) a rise is bad.
   const good = hasTrend ? (metric.inverse ? change < 0 : change > 0) : false;
   const flat = hasTrend && Math.abs(change) < 0.05;
-
-  const trend = !hasTrend || flat
-    ? { fg: 'var(--text-muted)', bg: 'var(--ink-100)' }
-    : good
-      ? { fg: 'var(--success-700)', bg: 'var(--success-50)' }
-      : { fg: 'var(--danger-700)', bg: 'var(--danger-50)' };
+  const trendTone = !hasTrend || flat ? 'neutral' : good ? 'success' : 'danger';
 
   const family = FAMILY[metric.unit] ?? FAMILY.count;
-  const stripe = accent ?? family.solid;
+  const rail = accent ?? (metric.inverse ? 'var(--grad-pending)' : family.rail);
 
   // Animate the figure itself, then re-format so units/compaction stay correct.
   const numeric = Number(metric.value);
-  const animated = useCountUp(numeric, Number.isFinite(numeric));
+  const animated = useCountUp(numeric, Number.isFinite(numeric) && !loading && !error);
   const shown = Number.isFinite(numeric)
     ? formatValue(animated, metric.unit)
     : formatValue(metric.value, metric.unit);
 
-  return (
+  const card = (
     <div
-      className={`card ${onClick ? 'card-clickable' : ''}`}
+      className={`card kpi-card ${onClick ? 'card-clickable' : ''} ${compact ? 'is-compact' : ''}`}
       onClick={onClick}
-      onKeyDown={onClick ? (e) => { if (e.key === 'Enter') onClick(); } : undefined}
+      onKeyDown={onClick ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } } : undefined}
       role={onClick ? 'button' : undefined}
       tabIndex={onClick ? 0 : undefined}
       data-accent
-      style={{
-        position: 'relative',
-        overflow: 'hidden',
-        // Drives the shared `.card::before` top hairline from base.css.
-        ['--card-accent' as string]: accent ?? family.grad,
-      }}
-      title={`${metric.description}\n\nFormula: ${metric.formula}\nSource: ${metric.source}`}
+      style={{ ['--card-accent' as string]: rail } as CSSProperties}
+      aria-busy={loading || undefined}
     >
-      {/* A soft wash of the family colour, so the card is tinted rather than flat. */}
-      <div
-        aria-hidden
-        style={{
-          position: 'absolute', top: -34, right: -34, width: 118, height: 118,
-          borderRadius: '50%', background: stripe, opacity: 0.07, pointerEvents: 'none',
-        }}
-      />
-
-      <div style={{ padding: compact ? 'var(--sp-3) var(--sp-4)' : 'var(--sp-4)', position: 'relative' }}>
-        {/* Label leads and is allowed two lines. A KPI whose name is cut off
-            ("TOTAL PO V…") is worse than no decoration at all, so the icon sits
-            to the right where it costs the label the least width. */}
-        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: compact ? 6 : 9 }}>
-          <span
-            style={{
-              flex: '1 1 auto', minWidth: 0,
-              fontSize: 'var(--text-2xs)', fontWeight: 700, letterSpacing: '0.045em',
-              textTransform: 'uppercase', color: 'var(--text-muted)',
-              lineHeight: 1.3,
-              display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
-              overflow: 'hidden',
-              // Reserve both lines so cards in a row align on the value.
-              minHeight: 'calc(2 * 1.3em)',
-            }}
-          >
-            {metric.label}
-          </span>
-          <span
-            aria-hidden
-            style={{
-              width: compact ? 24 : 28, height: compact ? 24 : 28, flexShrink: 0,
-              borderRadius: 'var(--radius-sm)', background: family.grad, color: '#fff',
-              display: 'grid', placeItems: 'center',
-              boxShadow: `0 3px 10px color-mix(in srgb, ${stripe} 40%, transparent)`,
-            }}
-          >
-            {family.icon}
-          </span>
-        </div>
-
-        <div
-          className="num truncate"
-          style={{
-            fontFamily: 'var(--font-display)',
-            fontSize: compact ? 'var(--text-xl)' : 'var(--text-2xl)',
-            fontWeight: 800, color: 'var(--ink-900)', lineHeight: 1.1, letterSpacing: '-0.03em',
-          }}
-        >
-          {shown}
-        </div>
-
-        <div className="row" style={{ gap: 5, marginTop: 8, minHeight: 20 }}>
-          {hasTrend && (
-            <span
-              className="row num"
-              style={{
-                gap: 3, padding: '2px 6px', borderRadius: 'var(--radius-full)',
-                background: trend.bg, color: trend.fg,
-                fontSize: 'var(--text-2xs)', fontWeight: 700, flexShrink: 0,
-              }}
-              title="Change against the previous period of the same length"
-            >
-              {flat ? <Minus size={10} /> : good ? <TrendingUp size={10} /> : <TrendingDown size={10} />}
-              {change > 0 ? '+' : ''}{change.toFixed(1)}%
-            </span>
-          )}
-          <span className="spacer" />
-          <Info size={11} style={{ color: 'var(--ink-400)', flexShrink: 0 }} aria-hidden />
-          {onClick && <ArrowRight size={12} style={{ color: 'var(--ink-400)', flexShrink: 0 }} aria-hidden />}
-        </div>
+      <div className="kpi-head">
+        {/* The label leads and may take two lines; a KPI whose name is cut
+            off is worse than no decoration at all. */}
+        <span className="kpi-label">{metric.label}</span>
+        <span className="kpi-icon" aria-hidden>{family.icon}</span>
       </div>
+
+      <div className="kpi-value">
+        {loading ? <Skeleton w="62%" h={compact ? 22 : 28} /> : error ? (
+          <span className="row" style={{ gap: 6, color: 'var(--text-4)' }}>
+            —<AlertTriangle size={16} style={{ color: 'var(--tone-danger-fg)' }} aria-label="Could not be computed" />
+          </span>
+        ) : shown}
+      </div>
+
+      <div className="kpi-foot">
+        {hasTrend && (
+          <span className={`kpi-delta tone-${trendTone}`} title="Change against the previous period of the same length">
+            {flat ? <Minus size={12} aria-hidden /> : change > 0 ? <ArrowUpRight size={12} aria-hidden /> : <ArrowDownRight size={12} aria-hidden />}
+            {change > 0 ? '+' : ''}{change.toFixed(1)}%
+          </span>
+        )}
+        {error ? <span className="kpi-error">{error instanceof Error ? error.message : 'Could not load'}</span> : null}
+        <span className="spacer" />
+        {onClick && <ChevronRight size={16} className="kpi-chevron" aria-hidden />}
+      </div>
+    </div>
+  );
+
+  return <Tooltip content={<MetricTooltip metric={metric} />} block>{card}</Tooltip>;
+}
+
+/**
+ * Responsive KPI grid that never leaves an orphan: with N cards it uses the
+ * fewest rows that fit, then spreads the cards evenly across them — six cards
+ * where five fit become 3 + 3, not 5 + 1 (audit UI-020).
+ */
+export const KpiGrid = ({ children, min = 210, gap = 12 }: { children: ReactNode; min?: number; gap?: number }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const n = Children.toArray(children).length;
+  const [cols, setCols] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => {
+      const width = el.clientWidth;
+      const fit = Math.max(1, Math.floor((width + gap) / (min + gap)));
+      const rows = Math.max(1, Math.ceil(n / fit));
+      setCols(Math.max(1, Math.ceil(n / rows)));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [n, min, gap]);
+
+  return (
+    <div
+      ref={ref}
+      style={{
+        display: 'grid',
+        gridTemplateColumns: cols ? `repeat(${cols}, minmax(0, 1fr))` : `repeat(auto-fit, minmax(min(${min}px, 100%), 1fr))`,
+        gap,
+      }}
+    >
+      {children}
+    </div>
+  );
+};
+
+type StatTone = 'default' | 'success' | 'warning' | 'danger' | 'info';
+
+const RAIL: Record<StatTone, string> = {
+  default: 'transparent',
+  success: 'var(--tone-success-solid)',
+  warning: 'var(--tone-pending-solid)',
+  danger: 'var(--tone-danger-solid)',
+  info: 'var(--tone-info-solid)',
+};
+
+/** The value, or a skeleton while loading, or "—" with the reason on error. */
+function StatValue({ value, tone, loading, error }: { value: ReactNode; tone: StatTone; loading?: boolean; error?: unknown }) {
+  if (loading) return <div className="stat-value"><Skeleton w={72} h={18} /></div>;
+  if (error) {
+    const why = error instanceof Error ? error.message : 'Could not load this figure';
+    return (
+      <div className="stat-value is-error">
+        <Tooltip content={why}>
+          <span className="row" style={{ gap: 5 }}>
+            —<AlertTriangle size={14} style={{ color: 'var(--tone-danger-fg)' }} role="img" aria-label={`Not available: ${why}`} />
+          </span>
+        </Tooltip>
+      </div>
+    );
+  }
+  return <div className={`stat-value ${tone === 'default' ? '' : `tone-${tone}`}`}>{value}</div>;
+}
+
+/**
+ * Small stat used in detail panels, drawers and list headers. Quiet by
+ * default; a tile looks clickable only when it has an action, and a tile that
+ * filters the view shows when it is the active filter (`selected`).
+ */
+export function StatTile({
+  label, value, tone = 'default', sub, onClick, loading, error, selected,
+}: {
+  label: string;
+  value: string;
+  tone?: StatTone;
+  sub?: string;
+  onClick?: () => void;
+  loading?: boolean;
+  error?: unknown;
+  /** This tile is the filter currently applied. */
+  selected?: boolean;
+}) {
+  const body = (
+    <>
+      <div className="stat-label">{label}</div>
+      <StatValue value={value} tone={tone} loading={loading} error={error} />
+      {sub && <div className="stat-sub">{sub}</div>}
+    </>
+  );
+  const style = { ['--tile-rail' as string]: RAIL[tone] } as CSSProperties;
+  if (!onClick) return <div className="stat-tile" style={style}>{body}</div>;
+  return (
+    <button
+      type="button"
+      className={`stat-tile is-clickable ${selected ? 'is-selected' : ''}`}
+      style={style}
+      onClick={onClick}
+      aria-pressed={selected === undefined ? undefined : selected}
+    >
+      {body}
+    </button>
+  );
+}
+
+export interface StatItem {
+  label: string;
+  value: ReactNode;
+  sub?: ReactNode;
+  tone?: StatTone;
+  loading?: boolean;
+  error?: unknown;
+  /** Definition shown on hover/focus. */
+  title?: string;
+}
+
+/**
+ * One card of up to six figures divided by hairlines; it scrolls sideways
+ * rather than wrapping into an orphan row. Not clickable — filtering belongs
+ * to FilterTiles or the toolbar.
+ */
+export function StatStrip({ items, label }: { items: StatItem[]; label?: string }) {
+  return (
+    <div className="stat-strip" role="group" aria-label={label}>
+      {items.map((s) => {
+        const cell = (
+          <div key={s.label} className="stat-cell">
+            <div className="stat-label">{s.label}</div>
+            <StatValue value={s.value} tone={s.tone ?? 'default'} loading={s.loading} error={s.error} />
+            {s.sub && <div className="stat-sub">{s.sub}</div>}
+          </div>
+        );
+        // The tooltip anchor, when there is one, becomes the strip's flex child.
+        return s.title ? <Tooltip key={s.label} content={s.title} block>{cell}</Tooltip> : cell;
+      })}
     </div>
   );
 }
 
-/** Responsive KPI grid. */
-export const KpiGrid = ({ children, min = 210 }: { children: React.ReactNode; min?: number }) => (
-  <div
-    style={{
-      display: 'grid',
-      // min() keeps a single card from overflowing a viewport narrower than `min`.
-      gridTemplateColumns: `repeat(auto-fit, minmax(min(${min}px, 100%), 1fr))`,
-      gap: 'var(--sp-3)',
-    }}
-  >
-    {children}
-  </div>
-);
+export interface FilterTileOption {
+  value: string;
+  label: string;
+  count: ReactNode;
+  sub?: string;
+  tone?: StatTone;
+  loading?: boolean;
+  error?: unknown;
+}
 
 /**
- * Small stat used inside detail panels and drawers.
- * Not a KPI — deliberately visually quieter so it never competes with the
- * dashboard tiles.
+ * Tiles that filter the current view, as a radiogroup with an explicit
+ * selected state (iris tint + 2 px underline). v2 StatTiles had no selected
+ * state, so a click applied a filter nobody could see (audit UI-016).
+ * Clicking the selected tile again clears the filter when `allowClear` is set.
  */
-export function StatTile({
-  label, value, tone = 'default', sub, onClick,
+export function FilterTiles({
+  options, value, onChange, ariaLabel, allowClear = true,
 }: {
-  label: string;
-  value: string;
-  tone?: 'default' | 'success' | 'warning' | 'danger' | 'info';
-  sub?: string;
-  onClick?: () => void;
+  options: FilterTileOption[];
+  value: string | null;
+  onChange: (value: string | null) => void;
+  ariaLabel: string;
+  allowClear?: boolean;
 }) {
-  const colors: Record<string, string> = {
-    default: 'var(--ink-900)',
-    success: 'var(--success-600)',
-    warning: 'var(--warning-600)',
-    danger: 'var(--danger-600)',
-    info: 'var(--info-600)',
-  };
-  const rails: Record<string, string> = {
-    default: 'var(--brand-400)',
-    success: 'var(--success-500)',
-    warning: 'var(--warning-500)',
-    danger: 'var(--danger-500)',
-    info: 'var(--info-500)',
+  const focusValue = options.some((o) => o.value === value) ? value : options[0]?.value;
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    const tiles = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'));
+    const i = tiles.indexOf(document.activeElement as HTMLElement);
+    const step = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : -1;
+    e.preventDefault();
+    tiles[(i + step + tiles.length) % tiles.length]?.focus();
   };
   return (
-    <div
-      onClick={onClick}
-      role={onClick ? 'button' : undefined}
-      tabIndex={onClick ? 0 : undefined}
-      onKeyDown={onClick ? (e) => { if (e.key === 'Enter') onClick(); } : undefined}
-      style={{
-        position: 'relative',
-        padding: 'var(--sp-3)',
-        paddingLeft: 'calc(var(--sp-3) + 3px)',
-        background: 'var(--bg-inset)',
-        border: '1px solid var(--border-subtle)',
-        borderRadius: 'var(--radius-sm)',
-        boxShadow: `inset 3px 0 0 ${rails[tone]}`,
-        cursor: onClick ? 'pointer' : undefined,
-        transition: 'border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease)',
-      }}
-      onMouseEnter={onClick ? (e) => {
-        e.currentTarget.style.borderColor = 'var(--brand-300)';
-        e.currentTarget.style.transform = 'translateY(-1px)';
-      } : undefined}
-      onMouseLeave={onClick ? (e) => {
-        e.currentTarget.style.borderColor = 'var(--border-subtle)';
-        e.currentTarget.style.transform = 'none';
-      } : undefined}
-    >
-      <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-        {label}
-      </div>
-      <div
-        className="num"
-        style={{ fontFamily: 'var(--font-display)', fontSize: 'var(--text-lg)', fontWeight: 700, color: colors[tone], marginTop: 3, letterSpacing: '-0.02em' }}
-      >
-        {value}
-      </div>
-      {sub && <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-faint)', marginTop: 2 }}>{sub}</div>}
+    <div className="filter-tiles" role="radiogroup" aria-label={ariaLabel} onKeyDown={onKeyDown}>
+      {options.map((o) => {
+        const on = o.value === value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            role="radio"
+            aria-checked={on}
+            tabIndex={o.value === focusValue ? 0 : -1}
+            className={`stat-tile is-clickable ${on ? 'is-selected' : ''}`}
+            style={{ ['--tile-rail' as string]: RAIL[o.tone ?? 'default'] } as CSSProperties}
+            onClick={() => onChange(on && allowClear ? null : o.value)}
+          >
+            <div className="stat-label">{o.label}</div>
+            <StatValue value={o.count} tone={o.tone ?? 'default'} loading={o.loading} error={o.error} />
+            {o.sub && <div className="stat-sub">{o.sub}</div>}
+          </button>
+        );
+      })}
     </div>
   );
 }

@@ -1,20 +1,20 @@
 /**
- * Item History modal (Purchase Module pin-point, Point 2/3).
+ * Item history (Purchase Module pin-point, Point 2/3; spec §3.9).
  *
- * A quick-access popup from Indent/PO/GRN — "when did this item last come in,
- * on which indent/PO/supplier, how much GRN, how much requisitioned/issued" —
- * without leaving the document being worked on. Reuses `GET /items/:id`
- * verbatim (the same call the Item Master detail page already makes) rather
- * than inventing a second traceability model; only the `historyLimit` query
- * param and two extra sections (indentHistory, grnHistory with line-level
- * multi-PO attribution) were added there for this modal.
+ * A quick look from Indent/PO/GRN — "when did this item last come in, on
+ * which indent/PO/supplier, how much GRN, how much requisitioned/issued" —
+ * without leaving the document being worked on: it opens as a side drawer.
+ * Reuses `GET /items/:id` verbatim (the call the Item Master detail page
+ * already makes) rather than inventing a second traceability model; only the
+ * `historyLimit` query param and two extra sections (indentHistory,
+ * grnHistory with line-level multi-PO attribution) were added there for this.
  */
 import { useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { History } from 'lucide-react';
 import { api, qs } from '../lib/api';
-import { Modal, Select, LoadingBlock, ErrorState, EmptyState } from './ui';
-import { StatTile } from './KpiCard';
+import { Drawer, Select, LoadingBlock, ErrorState, EmptyState, StatusBadge } from './ui';
+import { StatStrip } from './KpiCard';
 import { qty, money, formatDate, text } from '../lib/format';
 
 interface ItemHistoryData {
@@ -57,23 +57,24 @@ const LIMIT_OPTIONS = [
   { value: 500, label: 'All' },
 ];
 
+/** Pending quantities read amber; zero reads quiet, never coloured. */
+const pendingStyle = (v: string | number) => ({ color: Number(v) > 0 ? 'var(--value-pending)' : 'var(--value-zero)' });
+
 function Section({ title, count: n, children }: { title: string; count: number; children: ReactNode }) {
   return (
-    <div style={{ marginBottom: 'var(--sp-5)' }}>
+    <section style={{ marginBottom: 'var(--space-5)' }}>
       <div className="row" style={{ justifyContent: 'space-between', marginBottom: 6 }}>
-        <div style={{ fontSize: 'var(--text-xs)', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-          {title}
-        </div>
-        <span className="cell-muted" style={{ fontSize: 'var(--text-2xs)' }}>{n} record(s)</span>
+        <h3 style={{ fontSize: 'var(--fs-14)', fontWeight: 600, color: 'var(--text-1)', letterSpacing: 0 }}>{title}</h3>
+        <span className="cell-muted">{n} record{n === 1 ? '' : 's'}</span>
       </div>
       {n === 0 ? (
-        <div className="cell-muted" style={{ fontSize: 'var(--text-xs)', padding: 'var(--sp-2) 0' }}>None.</div>
+        <div className="cell-muted" style={{ padding: 'var(--space-2) 0' }}>None.</div>
       ) : (
-        <div className="table-wrap" style={{ border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
+        <div className="table-wrap" style={{ border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)' }}>
           <table className="table table-compact">{children}</table>
         </div>
       )}
-    </div>
+    </section>
   );
 }
 
@@ -89,14 +90,14 @@ export function ItemHistoryModal({ itemId, onClose }: { itemId: number | null; o
   const d = detail.data;
 
   return (
-    <Modal
+    <Drawer
       open={itemId !== null}
       onClose={onClose}
-      size="xl"
+      wide
       title={
-        <span className="row" style={{ gap: 6 }}>
-          <History size={16} />
-          {d ? `${d.item_code} — Item History` : 'Item History'}
+        <span className="row" style={{ gap: 8 }}>
+          <History size={18} aria-hidden style={{ color: 'var(--text-3)' }} />
+          {d ? `${d.item_code} — item history` : 'Item history'}
         </span>
       }
       subtitle={d ? d.item_description : undefined}
@@ -104,18 +105,21 @@ export function ItemHistoryModal({ itemId, onClose }: { itemId: number | null; o
       {detail.isLoading ? (
         <LoadingBlock label="Loading item history…" />
       ) : detail.error ? (
-        <ErrorState error={detail.error} onRetry={() => void detail.refetch()} />
+        <ErrorState error={detail.error} onRetry={() => void detail.refetch()} title="Could not load this item's history" />
       ) : !d ? null : (
         <>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 'var(--sp-3)', marginBottom: 'var(--sp-4)' }}>
-            <StatTile label="Live stock" value={qty(d.live_stock_qty)} tone="info" />
-            <StatTile label="Total PO qty" value={qty(d.summary.total_ordered_qty)} />
-            <StatTile label="Total GRN qty" value={qty(d.summary.total_received_qty)} tone="success" />
-            <StatTile label="Pending GRN qty" value={qty(d.summary.pending_qty)} tone={Number(d.summary.pending_qty) > 0 ? 'warning' : 'default'} />
-          </div>
+          <StatStrip
+            label="Item summary"
+            items={[
+              { label: 'Live stock', value: qty(d.live_stock_qty), tone: Number(d.live_stock_qty) < 0 ? 'danger' : 'default' },
+              { label: 'Total PO qty', value: qty(d.summary.total_ordered_qty) },
+              { label: 'Total GRN qty', value: qty(d.summary.total_received_qty) },
+              { label: 'Pending GRN qty', value: qty(d.summary.pending_qty), tone: Number(d.summary.pending_qty) > 0 ? 'warning' : 'default' },
+            ]}
+          />
 
-          <div className="row" style={{ justifyContent: 'space-between', marginBottom: 'var(--sp-4)', flexWrap: 'wrap', gap: 8 }}>
-            <span className="cell-muted" style={{ fontSize: 'var(--text-xs)' }}>
+          <div className="row" style={{ justifyContent: 'space-between', marginBottom: 'var(--space-4)', flexWrap: 'wrap', gap: 8 }}>
+            <span className="cell-muted">
               Showing {LIMIT_OPTIONS.find((o) => o.value === historyLimit)?.label.toLowerCase() ?? `latest ${historyLimit}`} of each record type
             </span>
             <Select
@@ -129,81 +133,81 @@ export function ItemHistoryModal({ itemId, onClose }: { itemId: number | null; o
           </div>
 
           <Section title="Indent history" count={d.indentHistory.length}>
-            <thead><tr><th>Date</th><th>Indent No</th><th className="right">Qty</th><th className="right">Ordered</th><th className="right">Pending</th><th>Status</th></tr></thead>
+            <thead><tr><th>Date</th><th>Indent no</th><th className="right">Qty</th><th className="right">Ordered</th><th className="right">Pending</th><th>Status</th></tr></thead>
             <tbody>
               {d.indentHistory.map((r) => (
                 <tr key={r.indent_line_id}>
-                  <td className="cell-muted">{formatDate(r.indent_date)}</td>
+                  <td>{formatDate(r.indent_date)}</td>
                   <td className="cell-code">{r.indent_no}</td>
                   <td className="right num">{qty(r.indent_qty)}</td>
-                  <td className="right num cell-muted">{qty(r.ordered_qty)}</td>
-                  <td className="right num" style={{ color: Number(r.pending_qty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>{qty(r.pending_qty)}</td>
-                  <td className="cell-muted">{text(r.indent_status)}</td>
+                  <td className="right num">{qty(r.ordered_qty)}</td>
+                  <td className="right num" style={pendingStyle(r.pending_qty)}>{qty(r.pending_qty)}</td>
+                  <td><StatusBadge status={r.indent_status} plain /></td>
                 </tr>
               ))}
             </tbody>
           </Section>
 
           <Section title="Purchase order history" count={d.rateHistory.length}>
-            <thead><tr><th>Date</th><th>PO No</th><th className="cell-wrap">Supplier</th><th className="right">PO Qty</th><th className="right">Rate</th><th className="right">Received</th><th>Status</th></tr></thead>
+            <thead><tr><th>Date</th><th>PO no</th><th>Supplier</th><th className="right">PO qty</th><th className="right">Rate</th><th className="right">Received</th><th>Status</th></tr></thead>
             <tbody>
               {d.rateHistory.map((r) => (
                 <tr key={r.po_id}>
-                  <td className="cell-muted">{formatDate(r.po_date)}</td>
+                  <td>{formatDate(r.po_date)}</td>
                   <td className="cell-code">{r.po_no}</td>
-                  <td className="cell-wrap" style={{ maxWidth: 180 }}>{r.supplier_name}</td>
+                  <td className="cell-wrap" style={{ minWidth: 160, maxWidth: 240 }}>{r.supplier_name}</td>
                   <td className="right num">{qty(r.po_qty)}</td>
-                  <td className="right num cell-muted">{money(r.final_rate)}</td>
+                  <td className="right num">{money(r.final_rate)}</td>
                   <td className="right num cell-strong">{qty(r.received_qty)}</td>
-                  <td className="cell-muted">{text(r.po_status)}</td>
+                  <td><StatusBadge status={r.po_status} plain /></td>
                 </tr>
               ))}
             </tbody>
           </Section>
 
           <Section title="GRN history (line-level PO attribution)" count={d.grnHistory.length}>
-            <thead><tr><th>Date</th><th>GRN No</th><th>PO No</th><th className="cell-wrap">Supplier</th><th className="right">GRN Qty</th><th>Status</th></tr></thead>
+            <thead><tr><th>Date</th><th>GRN no</th><th>PO no</th><th>Supplier</th><th className="right">GRN qty</th><th>Status</th></tr></thead>
             <tbody>
               {d.grnHistory.map((r) => (
                 <tr key={r.grn_line_id}>
-                  <td className="cell-muted">{formatDate(r.grn_date)}</td>
+                  <td>{formatDate(r.grn_date)}</td>
                   <td className="cell-code">{r.grn_no}</td>
                   <td className="cell-code">{r.po_no}</td>
-                  <td className="cell-wrap" style={{ maxWidth: 180 }}>{r.supplier_name}</td>
+                  <td className="cell-wrap" style={{ minWidth: 160, maxWidth: 240 }}>{r.supplier_name}</td>
                   <td className="right num cell-strong">{qty(r.grn_qty)}</td>
-                  <td className="cell-muted">{text(r.grn_status)}</td>
+                  <td><StatusBadge status={r.grn_status} plain /></td>
                 </tr>
               ))}
             </tbody>
           </Section>
 
           <Section title="Requisition history" count={d.requisitions.length}>
-            <thead><tr><th>Date</th><th>Requisition No</th><th className="right">Requested</th><th className="right">Issued</th><th className="right">Pending</th><th>HOD</th><th>Store</th></tr></thead>
+            <thead><tr><th>Date</th><th>Requisition no</th><th className="right">Requested</th><th className="right">Issued</th><th className="right">Pending</th><th>HOD</th><th>Store</th></tr></thead>
             <tbody>
               {d.requisitions.map((r) => (
                 <tr key={r.requisition_line_id}>
-                  <td className="cell-muted">{formatDate(r.requisition_date)}</td>
+                  <td>{formatDate(r.requisition_date)}</td>
                   <td className="cell-code">{r.requisition_no}</td>
                   <td className="right num">{qty(r.requested_qty)}</td>
                   <td className="right num cell-strong">{qty(r.issued_qty)}</td>
-                  <td className="right num" style={{ color: Number(r.pending_qty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>{qty(r.pending_qty)}</td>
-                  <td className="cell-muted">{text(r.hod_status)}</td>
-                  <td className="cell-muted">{text(r.store_status)}</td>
+                  <td className="right num" style={pendingStyle(r.pending_qty)}>{qty(r.pending_qty)}</td>
+                  <td><StatusBadge status={r.hod_status} plain /></td>
+                  <td><StatusBadge status={r.store_status} plain /></td>
                 </tr>
               ))}
             </tbody>
           </Section>
 
           <Section title="Issue history" count={d.issueHistory.length}>
-            <thead><tr><th>Date</th><th>Issue Slip</th><th>Requisition No</th><th className="right">Issued Qty</th><th>Issued by</th></tr></thead>
+            <thead><tr><th>Date</th><th>Issue slip</th><th>Requisition no</th><th className="right">Issued qty</th><th>Issued by</th></tr></thead>
             <tbody>
               {d.issueHistory.map((r) => (
                 <tr key={r.id}>
-                  <td className="cell-muted">{formatDate(r.issue_date)}</td>
+                  <td>{formatDate(r.issue_date)}</td>
                   <td className="cell-code">{r.issue_slip_no}</td>
                   <td className="cell-code">{r.requisition_no}</td>
                   <td className="right num cell-strong">{qty(r.issue_qty)}</td>
-                  <td className="cell-muted">{text(r.store_user_name)}</td>
+                  <td>{text(r.store_user_name)}</td>
                 </tr>
               ))}
             </tbody>
@@ -215,6 +219,6 @@ export function ItemHistoryModal({ itemId, onClose }: { itemId: number | null; o
           )}
         </>
       )}
-    </Modal>
+    </Drawer>
   );
 }
