@@ -304,13 +304,24 @@ describe('cancelling a GRN', () => {
     expect(queue.body.data.some((i: { id: number }) => Number(i.id) === closedInspection)).toBe(false);
   });
 
-  it('says so when none of the receipt had entered stock', async () => {
+  it('says so when none of the receipt had entered stock, and keeps the GRN with its inspection', async () => {
     const qcItem = await mkItem('TGRNQC-F3', true);
     const grn = await receive([{ itemId: qcItem, qty: '3' }]);
     const r = await cancel(grn.id);
     expect(r.status).toBe(200);
     expect(r.body.data.message).toMatch(/None of its material had entered stock, so stock is unchanged/);
     expect(await grnLedger(grn.id)).toEqual([]);
+
+    // No ledger entry, but the closed inspection refers to its line: hard delete
+    // is refused in words instead of failing on the foreign key.
+    const inspect = await request(app).get(api(`/admin/data-management/inspect/grn/${grn.id}`)).set(auth(adminToken));
+    expect(inspect.status).toBe(200);
+    expect(inspect.body.data.canHardDelete).toBe(false);
+    expect(inspect.body.data.blockingReasons.join(' ')).toMatch(/1 quality inspection record/);
+    const del = await request(app).post(api('/admin/data-management/hard-delete')).set(auth(adminToken))
+      .send({ entity: 'grn', id: grn.id, confirm: 'DELETE' });
+    expect(del.status).toBe(422);
+    expect((await query('SELECT 1 FROM grn_headers WHERE id = $1', [grn.id])).length).toBe(1);
   });
 
   it('gives back what QC accepted on a passed line, and nothing for a failed one', async () => {

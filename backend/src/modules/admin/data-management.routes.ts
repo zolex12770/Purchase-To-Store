@@ -785,6 +785,14 @@ async function inspectDependencies(entity: string, id: number): Promise<{
     if (Number(stockRefs?.n ?? 0) > 0) {
       blockingReasons.push(`GRN has ${stockRefs?.n} stock movements in the ledger. Cannot hard-delete posted inventory — cancel it instead.`);
     }
+    // A GRN whose material was all held for inspection has no ledger entry,
+    // but its inspections (kept, closed, when it is cancelled) refer to its
+    // lines: the delete then failed on their foreign key as a bare 409.
+    const qcRefs = await queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM qc_inspections WHERE grn_id = $1', [id]);
+    dependencies.push({ table: 'qc_inspections', label: 'Quality inspections', count: Number(qcRefs?.n ?? 0) });
+    if (Number(qcRefs?.n ?? 0) > 0) {
+      blockingReasons.push(`GRN has ${qcRefs?.n} quality inspection record(s), which stay with it. Cannot hard-delete — cancel it instead.`);
+    }
   } else if (entity === 'requisitions') {
     const [issueRefs, stockRefs] = await Promise.all([
       queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM requisition_issues WHERE requisition_id = $1', [id]),
