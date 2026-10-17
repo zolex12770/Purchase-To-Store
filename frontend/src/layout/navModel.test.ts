@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { NAV, findActive, isGroup, matchScore, navAllowed } from './navModel';
+import { NAV, findActive, isGroup, matchScore, navAllowed, type NavItem } from './navModel';
 
-const entries = NAV.flatMap((n) => (isGroup(n) ? n.items.map((i) => ({ ...i, group: n.base })) : [{ ...n, group: null }]));
+type Entry = NavItem & { group: string | null };
+const entries: Entry[] = NAV.flatMap((n): Entry[] => (isGroup(n) ? n.items.map((i) => ({ ...i, group: n.base })) : [{ ...n, group: null }]));
 const at = (url: string) => {
   const [pathname = '', search = ''] = url.split('?');
   return findActive(NAV, pathname, search ? `?${search}` : '');
