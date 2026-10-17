@@ -20,9 +20,13 @@ import { requirePermission, requireAnyPermission } from '../../auth/middleware.j
 import { METRICS, METRIC_BY_KEY, AGEING_BUCKETS, ageingCase } from '../../domain/metrics.js';
 import { dec, shareOf, pctChange } from '../../domain/money.js';
 import { ValidationError } from '../../core/errors.js';
-import { pendingLineSql } from '../purchase-order/routes.js';
-import { buildGrnFilter, GRN_FROM } from '../grn/routes.js';
-import { buildIndentFilter } from '../indent/routes.js';
+import {
+  buildPoFilter, poLineScope, poListTotals, pendingLineSql, PO_FROM, type PoListFilter,
+} from '../purchase-order/routes.js';
+import { buildGrnFilter, grnLineScope, grnListTotals, GRN_FROM, type GrnListFilter } from '../grn/routes.js';
+import {
+  buildIndentFilter, indentLineScope, indentListTotals, type IndentListFilter,
+} from '../indent/routes.js';
 
 const router = Router();
 
@@ -30,65 +34,54 @@ const router = Router();
 const PENDING = pendingLineSql('v');
 
 /* ── Filter plumbing ────────────────────────────────────────────────────────── */
+// Every figure is counted through the filter of the list it drills into, with the drill
+// target's own parameters on top, as the screen merges them (frontend drilldownLink): the
+// list ignores a dashboard filter it does not offer, and so does the figure. Item-level
+// filters (item, department, cost centre, groups, type, HOD) select lines, so a figure and
+// its list's tiles add up the same lines (domain/item-scope.ts).
 
-/** Applies the universal filter to a PO-line query (alias `v` = v_po_line_balance). */
-function poLineFilter(f: UniversalFilter, opts: { excludeCancelled?: boolean } = {}): SqlBuilder {
+/** The PO list's query for the dashboard filter `f` and a drill target's own parameters. */
+const poQuery = (f: UniversalFilter, own: Partial<PoListFilter> = {}): PoListFilter => ({ ...f, view: 'all', ...own });
+const grnQuery = (f: UniversalFilter, own: Partial<GrnListFilter> = {}): GrnListFilter => ({ ...f, ...own });
+const indentQuery = (f: UniversalFilter, own: Partial<IndentListFilter> = {}): IndentListFilter => ({ ...f, ...own });
+
+/**
+ * Lines of the documents a list shows (`member(where)`: the line's document IN the list's
+ * row query) that its line scope selects, as one builder carrying the list's parameters,
+ * for the queries that group or rank lines.
+ */
+function linesOf(list: SqlBuilder, member: (where: string) => string, scopeOf: (b: SqlBuilder) => string): SqlBuilder {
   const b = new SqlBuilder();
-  if (opts.excludeCancelled !== false) b.addRaw("v.po_status <> 'CANCELLED'");
-  b.add('v.po_date >= ?', f.dateFrom);
-  b.add('v.po_date <= ?', f.dateTo);
-  b.addIn('v.supplier_id', f.supplierId);
-  b.addIn('v.item_id', f.itemId);
-  b.addIn('v.po_type_id', f.poTypeId);
-  b.addIn('v.po_status', f.status);
-  if (f.userId && f.userId.length > 0) {
-    const p = b.push(f.userId);
-    b.addRaw(`v.po_id IN (SELECT id FROM purchase_order_headers WHERE created_by = ANY(${p}))`);
-  }
-  if (f.hodId && f.hodId.length > 0) {
-    const p = b.push(f.hodId);
-    b.addRaw(`v.po_id IN (SELECT pol.po_id FROM purchase_order_lines pol JOIN items i ON i.id = pol.item_id JOIN lookups d ON d.id = i.department_id WHERE (d.extra->>'hodUserId')::bigint = ANY(${p}))`);
-  }
-  // Item-master dimensions require a join to `items`; declared by the caller.
-  if (f.departmentId?.length || f.costCentreId?.length || f.mainGroupId?.length ||
-      f.subMainGroupId?.length || f.itemTypeId?.length) {
-    const parts: string[] = [];
-    if (f.departmentId?.length) parts.push(`i.department_id = ANY(${b.push(f.departmentId)})`);
-    if (f.costCentreId?.length) parts.push(`i.cost_centre_id = ANY(${b.push(f.costCentreId)})`);
-    if (f.mainGroupId?.length) parts.push(`i.main_group_id = ANY(${b.push(f.mainGroupId)})`);
-    if (f.subMainGroupId?.length) parts.push(`i.sub_main_group_id = ANY(${b.push(f.subMainGroupId)})`);
-    if (f.itemTypeId?.length) parts.push(`i.item_type_id = ANY(${b.push(f.itemTypeId)})`);
-    b.addRaw(`(${parts.join(' AND ')})`);
-  }
+  b.params.push(...list.params);
+  b.addRaw(member(list.where()));
+  const scope = scopeOf(b);
+  if (scope) b.addRaw(scope);
   return b;
 }
 
-/** `TRUE` when the PO-line query needs the items join for a master dimension. */
-const needsItemJoin = (f: UniversalFilter): boolean =>
-  Boolean(f.departmentId?.length || f.costCentreId?.length || f.mainGroupId?.length ||
-    f.subMainGroupId?.length || f.itemTypeId?.length);
+/**
+ * PO lines (alias `v` = v_po_line_balance) the dashboard's PO charts and line figures count:
+ * on the orders the PO list shows under the same filter, cancelled ones left out, the lines
+ * its item-level filters select — the lines the list's total tiles add up (poListTotals).
+ * This filter kept a copy of its own that counted an order's HOD on any of its lines.
+ */
+function poLineFilter(f: UniversalFilter): SqlBuilder {
+  const q = poQuery(f, { excludeCancelled: 'true' });
+  return linesOf(buildPoFilter(q), (where) => `v.po_id IN (SELECT h.id ${PO_FROM} ${where})`, (b) => poLineScope(q, b, 'v'));
+}
 
-const PO_LINE_FROM = (f: UniversalFilter) =>
-  `FROM v_po_line_balance v${needsItemJoin(f) ? ' JOIN items i ON i.id = v.item_id' : ''}`;
+const PO_LINE_FROM = 'FROM v_po_line_balance v';
 
-/** Applies the universal filter to an indent-line query (alias `v`). */
+/**
+ * Indent lines (alias `v` = v_indent_line_balance) of the indents the indent list shows
+ * under the same filter, cancelled ones left out, narrowed by its item filter. Department,
+ * cost centre and HOD are the indent's own, as on the list: this filter read each line's
+ * copy of its item's department, and an approved indent of department D2 for a D1 item
+ * showed Approved Qty Awaiting PO 10 under D1 and opened an empty list (2026-10-17 review).
+ */
 function indentLineFilter(f: UniversalFilter): SqlBuilder {
-  const b = new SqlBuilder();
-  b.addRaw("v.indent_status <> 'CANCELLED'");
-  b.add('v.indent_date >= ?', f.dateFrom);
-  b.add('v.indent_date <= ?', f.dateTo);
-  b.addIn('v.item_id', f.itemId);
-  b.addIn('v.department_id', f.departmentId);
-  b.addIn('v.cost_centre_id', f.costCentreId);
-  b.addIn('v.indent_type_id', f.indentTypeId);
-  b.addIn('v.suggested_supplier_id', f.supplierId);
-  b.addIn('v.indent_status', f.status);
-  b.addIn('v.requested_by_user_id', f.userId);
-  if (f.hodId && f.hodId.length > 0) {
-    const p = b.push(f.hodId);
-    b.addRaw(`v.indent_id IN (SELECT id FROM purchase_indent_headers WHERE approved_by = ANY(${p}) OR department_id IN (SELECT id FROM lookups WHERE category = 'DEPARTMENT' AND (extra->>'hodUserId')::bigint = ANY(${p})))`);
-  }
-  return b;
+  const q = indentQuery(f, { excludeCancelled: 'true' });
+  return linesOf(buildIndentFilter(q), (where) => `v.indent_id IN (SELECT h.id FROM purchase_indent_headers h ${where})`, (b) => indentLineScope(q, b, 'v'));
 }
 
 /**
@@ -98,30 +91,19 @@ function indentLineFilter(f: UniversalFilter): SqlBuilder {
  * ignored the item and status filters the list applies.
  */
 function indentHeaderFilter(f: UniversalFilter): SqlBuilder {
-  const b = buildIndentFilter(f);
-  b.addRaw("h.status <> 'CANCELLED'");
-  return b;
+  return buildIndentFilter(indentQuery(f, { excludeCancelled: 'true' }));
 }
 
 /**
- * POSTED GRN lines under the universal filter: the receipts the GRN list shows with status
- * POSTED (its own filter: received by, HOD, department, groups, …), each narrowed to the
- * lines of the filtered items, as the PO-line KPIs narrow theirs. Direct (store) receipts
- * count: 2,716 of the 2,718 GRNs carry no purchase order, and the received figures counted
- * PO receipts only — 267 against the list's 17,051,110.899 (2026-10-16 audit, F09).
+ * POSTED GRN lines (alias `gl`): the receipts the GRN list shows with status POSTED, and of
+ * those the lines its item-level filters select — the lines its total tiles add up
+ * (grnListTotals). Direct (store) receipts count: 2,716 of the 2,718 GRNs carry no purchase
+ * order, and the received figures counted PO receipts only — 267 against the list's
+ * 17,051,110.899 (2026-10-16 audit, F09).
  */
-function grnLineScope(f: UniversalFilter): { where: string; params: unknown[] } {
-  const b = buildGrnFilter({ ...f, status: ['POSTED'] });
-  const conds = [`gl.grn_id IN (SELECT g.id ${GRN_FROM} ${b.where()})`];
-  if (f.itemId?.length) conds.push(`gl.item_id = ANY(${b.push(f.itemId)})`);
-  const item: string[] = [];
-  if (f.departmentId?.length) item.push(`i.department_id = ANY(${b.push(f.departmentId)})`);
-  if (f.costCentreId?.length) item.push(`i.cost_centre_id = ANY(${b.push(f.costCentreId)})`);
-  if (f.mainGroupId?.length) item.push(`i.main_group_id = ANY(${b.push(f.mainGroupId)})`);
-  if (f.subMainGroupId?.length) item.push(`i.sub_main_group_id = ANY(${b.push(f.subMainGroupId)})`);
-  if (f.itemTypeId?.length) item.push(`i.item_type_id = ANY(${b.push(f.itemTypeId)})`);
-  if (item.length) conds.push(`EXISTS (SELECT 1 FROM items i WHERE i.id = gl.item_id AND ${item.join(' AND ')})`);
-  return { where: `WHERE ${conds.join(' AND ')}`, params: b.params };
+function grnLineFilter(f: UniversalFilter): SqlBuilder {
+  const q = grnQuery(f, { status: ['POSTED'] });
+  return linesOf(buildGrnFilter(q), (where) => `gl.grn_id IN (SELECT g.id ${GRN_FROM} ${where})`, (b) => grnLineScope(q, b, 'gl'));
 }
 
 /** Requisition HEADER filter (alias `h`, joined to `b` = v_requisition_header_balance where needed). */
@@ -178,42 +160,31 @@ router.get(
     const f = parsedQuery<z.infer<typeof kpiSchema>>(res);
     const can = (code: string) => req.user!.permissions.has(code);
 
-    /* PO-side aggregates — one pass over the filtered line set. */
+    /* A card's figure is a figure of the list it opens (domain/metrics.ts drilldown): that
+       list's row count or one of its total tiles, under the dashboard filter with the
+       card's own drill parameters on top. Under an item-level filter the tiles add up only
+       that filter's lines, and so do the cards: a Pending POs card counted an order only
+       when its filtered line was pending, while the list it opened kept any order with a
+       filtered line and any pending line (2026-10-17 review). */
+    const poAll = await poListTotals(poQuery(f, { excludeCancelled: 'true' }));    // /purchase-orders?excludeCancelled=true
+    const poPending = await poListTotals(poQuery(f, { view: 'pending' }));         // /purchase-orders/pending
+    const poOverdue = await poListTotals(poQuery(f, { view: 'pending', overdue: 'true' }));
+    const poCompleted = await poListTotals(poQuery(f, { status: ['COMPLETED'] }));
+
+    /* Line figures no list tile holds, over the lines poAll adds up. */
     const pb = poLineFilter(f);
     const [po] = await query<Record<string, string>>(
-      `SELECT
-         COUNT(DISTINCT v.po_id)::int                                          AS po_count,
-         COALESCE(SUM(v.amount), 0)                                            AS po_value,
-         COALESCE(SUM(v.po_qty), 0)                                            AS po_qty,
-         COALESCE(SUM(v.po_qty * v.rate), 0)                                   AS gross_value,
-         COALESCE(SUM(v.received_qty), 0)                                      AS received_qty,
-         COALESCE(SUM(v.pending_amount) FILTER (WHERE ${PENDING}), 0)          AS pending_value,
-         COALESCE(SUM(v.pending_grn_qty) FILTER (WHERE ${PENDING}), 0)         AS pending_qty,
-         COUNT(DISTINCT v.po_id) FILTER (WHERE ${PENDING})::int                AS pending_po_count,
-         COUNT(DISTINCT v.supplier_id)::int                                    AS supplier_count,
-         COUNT(DISTINCT v.item_id)::int                                        AS item_count,
-         -- Orders, not lines: the drill-down lists orders with an overdue line.
-         COUNT(DISTINCT v.po_id) FILTER (WHERE ${PENDING}
-                            AND v.delivery_date IS NOT NULL
-                            AND v.delivery_date < CURRENT_DATE)::int           AS overdue_count
-       ${PO_LINE_FROM(f)} ${pb.where()}`,
+      `SELECT COALESCE(SUM(v.po_qty * v.rate), 0)  AS gross_value,
+              COUNT(DISTINCT v.supplier_id)::int    AS supplier_count,
+              COUNT(DISTINCT v.item_id)::int        AS item_count
+         ${PO_LINE_FROM} ${pb.where()}`,
       pb.params,
     );
 
-    const cb = poLineFilter(f);
-    const [completed] = await query<{ n: string }>(
-      `SELECT COUNT(*)::int AS n FROM v_po_header_balance b
-        WHERE b.derived_status = 'COMPLETED'
-          AND b.po_id IN (SELECT DISTINCT v.po_id ${PO_LINE_FROM(f)} ${cb.where()})`,
-      cb.params,
-    );
-
-    /* Indent-side aggregates. */
+    /* Indent-side aggregates: the rates and averages over the indent list's own rows. */
     const ib = indentHeaderFilter(f);
     const [indent] = await query<Record<string, string>>(
       `SELECT
-         COUNT(*)::int                                                   AS indent_count,
-         COUNT(*) FILTER (WHERE h.status = 'PENDING_APPROVAL')::int      AS pending_approval,
          COUNT(*) FILTER (WHERE h.status = 'APPROVED')::int              AS approved_count,
          COUNT(*) FILTER (WHERE h.status = 'REJECTED')::int              AS rejected_count,
          COALESCE(AVG(EXTRACT(EPOCH FROM (h.approved_at - h.submitted_at)) / 86400)
@@ -222,36 +193,17 @@ router.get(
        FROM purchase_indent_headers h ${ib.where()}`,
       ib.params,
     );
+    const indentAll = await indentListTotals(indentQuery(f, { excludeCancelled: 'true' }));
+    const indentPending = await indentListTotals(indentQuery(f, { status: ['PENDING_APPROVAL'] }));
+    const indentAwaitingPo = await indentListTotals(indentQuery(f, { eligibleOnly: 'true' }));
 
-    const ilb = indentLineFilter(f);
-    const [indentLines] = await query<Record<string, string>>(
-      `SELECT
-         COALESCE(SUM(v.estimated_value), 0)                                        AS indent_value,
-         COALESCE(SUM(v.estimated_value) FILTER (WHERE v.indent_status = 'PENDING_APPROVAL'), 0)
-                                                                                    AS pending_indent_value,
-         COALESCE(SUM(v.pending_qty) FILTER (WHERE v.is_eligible_for_po), 0)        AS eligible_qty,
-         COUNT(*) FILTER (WHERE v.is_eligible_for_po)::int                          AS eligible_lines
-       FROM v_indent_line_balance v ${ilb.where()}`,
-      ilb.params,
-    );
-
-    /* GRN KPIs: the GRN list's own filter with status POSTED, so Goods Receipts is exactly
-       what '/grn?status=POSTED' lists; quantity and value from those receipts' lines. */
-    const gb = buildGrnFilter({ ...f, status: ['POSTED'] });
-    const [grn] = await query<{ grn_count: string }>(
-      `SELECT COUNT(*)::int AS grn_count ${GRN_FROM} ${gb.where()}`, gb.params,
-    );
-    const gs = grnLineScope(f);
-    const [grnLines] = await query<{ grn_qty: string; grn_value: string }>(
-      `SELECT COALESCE(SUM(gl.grn_qty), 0) AS grn_qty, COALESCE(SUM(gl.amount), 0) AS grn_value
-         FROM grn_lines gl ${gs.where}`,
-      gs.params,
-    );
+    /* GRN KPIs: '/grn?status=POSTED', purchase-order and direct receipts alike. */
+    const grn = await grnListTotals(grnQuery(f, { status: ['POSTED'] }));
 
     /* Supplier concentration — top 5 share of the filtered PO value. */
     const sb = poLineFilter(f);
     const topSuppliers = await query<{ supplier_id: number; value: string }>(
-      `SELECT v.supplier_id, SUM(v.amount) AS value ${PO_LINE_FROM(f)} ${sb.where()}
+      `SELECT v.supplier_id, SUM(v.amount) AS value ${PO_LINE_FROM} ${sb.where()}
         GROUP BY v.supplier_id ORDER BY SUM(v.amount) DESC LIMIT 5`,
       sb.params,
     );
@@ -318,52 +270,45 @@ router.get(
       const iso = (d: Date) => d.toISOString().slice(0, 10);
 
       const prevFilter = { ...f, dateFrom: iso(prevFrom), dateTo: iso(prevTo) };
-      const ppb = poLineFilter(prevFilter);
-      const [prev] = await query<Record<string, string>>(
-        `SELECT COUNT(DISTINCT v.po_id)::int AS po_count,
-                COALESCE(SUM(v.amount), 0)   AS po_value,
-                COALESCE(SUM(v.po_qty), 0)   AS po_qty
-           ${PO_LINE_FROM(prevFilter)} ${ppb.where()}`,
-        ppb.params,
-      );
+      const prev = await poListTotals(poQuery(prevFilter, { excludeCancelled: 'true' }));
       // Received value is compared like for like: posted GRN lines in the previous period.
-      const pgs = grnLineScope(prevFilter);
-      const [prevGrn] = await query<{ received_value: string }>(
-        `SELECT COALESCE(SUM(gl.amount), 0) AS received_value FROM grn_lines gl ${pgs.where}`, pgs.params,
-      );
-      previous = prev ? { ...prev, received_value: prevGrn?.received_value ?? '0' } : null;
+      const prevGrn = await grnListTotals(grnQuery(prevFilter, { status: ['POSTED'] }));
+      previous = {
+        po_count: String(prev.poCount), po_value: prev.value, po_qty: prev.totalPoQty,
+        received_value: prevGrn.total_amount,
+      };
     }
 
     const grossValue = dec(po?.gross_value ?? 0);
-    const netValue = dec(po?.po_value ?? 0);
+    const netValue = dec(poAll.value);
     const discountSavings = grossValue.minus(netValue);
 
     /* Assemble against the catalogue — a KPI is emitted only if it is declared in
        `domain/metrics.ts` AND the caller holds its permission. */
     const values: Record<string, { value: string | number; previous?: string | number | null; changePct?: number | null }> = {
-      po_value_total: { value: po?.po_value ?? '0', previous: previous?.po_value ?? null, changePct: previous ? pctChange(po?.po_value ?? 0, previous.po_value ?? 0) : null },
-      po_count: { value: Number(po?.po_count ?? 0), previous: previous ? Number(previous.po_count) : null, changePct: previous ? pctChange(po?.po_count ?? 0, previous.po_count ?? 0) : null },
-      po_qty_total: { value: po?.po_qty ?? '0', previous: previous?.po_qty ?? null, changePct: previous ? pctChange(po?.po_qty ?? 0, previous.po_qty ?? 0) : null },
-      po_avg_value: { value: Number(po?.po_count ?? 0) > 0 ? netValue.div(Number(po!.po_count)).toFixed(2) : '0.00' },
-      po_pending_value: { value: po?.pending_value ?? '0' },
-      po_pending_count: { value: Number(po?.pending_po_count ?? 0) },
-      po_completed_count: { value: Number(completed?.n ?? 0) },
-      po_overdue_count: { value: Number(po?.overdue_count ?? 0) },
-      indent_count: { value: Number(indent?.indent_count ?? 0) },
-      indent_pending_approval: { value: Number(indent?.pending_approval ?? 0) },
-      indent_pending_value: { value: indentLines?.pending_indent_value ?? '0' },
-      indent_approved_open_qty: { value: indentLines?.eligible_qty ?? '0' },
+      po_value_total: { value: poAll.value, previous: previous?.po_value ?? null, changePct: previous ? pctChange(poAll.value, previous.po_value ?? 0) : null },
+      po_count: { value: poAll.poCount, previous: previous ? Number(previous.po_count) : null, changePct: previous ? pctChange(poAll.poCount, previous.po_count ?? 0) : null },
+      po_qty_total: { value: poAll.totalPoQty, previous: previous?.po_qty ?? null, changePct: previous ? pctChange(poAll.totalPoQty, previous.po_qty ?? 0) : null },
+      po_avg_value: { value: poAll.poCount > 0 ? netValue.div(poAll.poCount).toFixed(2) : '0.00' },
+      po_pending_value: { value: poPending.pending },
+      po_pending_count: { value: poPending.poCount },
+      po_completed_count: { value: poCompleted.poCount },
+      po_overdue_count: { value: poOverdue.poCount },
+      indent_count: { value: indentAll.indentCount },
+      indent_pending_approval: { value: indentPending.indentCount },
+      indent_pending_value: { value: indentPending.totalEstimatedValue },
+      indent_approved_open_qty: { value: indentAwaitingPo.totalPendingQty },
       indent_rejection_rate: {
         value: Number(indent?.approved_count ?? 0) + Number(indent?.rejected_count ?? 0) > 0
           ? shareOf(indent?.rejected_count ?? 0, Number(indent?.approved_count ?? 0) + Number(indent?.rejected_count ?? 0))
           : 0,
       },
       indent_avg_approval_days: { value: dec(indent?.avg_approval_days ?? 0).toDecimalPlaces(1).toNumber() },
-      grn_count: { value: Number(grn?.grn_count ?? 0) },
-      grn_qty_total: { value: grnLines?.grn_qty ?? '0' },
-      grn_value_total: { value: grnLines?.grn_value ?? '0', previous: previous?.received_value ?? null, changePct: previous ? pctChange(grnLines?.grn_value ?? 0, previous.received_value ?? 0) : null },
-      grn_pending_qty: { value: po?.pending_qty ?? '0' },
-      grn_fulfilment_rate: { value: shareOf(po?.received_qty ?? 0, po?.po_qty ?? 0) },
+      grn_count: { value: Number(grn.grn_count) },
+      grn_qty_total: { value: grn.total_qty },
+      grn_value_total: { value: grn.total_amount, previous: previous?.received_value ?? null, changePct: previous ? pctChange(grn.total_amount, previous.received_value ?? 0) : null },
+      grn_pending_qty: { value: poPending.totalPendingQty },
+      grn_fulfilment_rate: { value: shareOf(poAll.totalReceivedQty, poAll.totalPoQty) },
       purchase_cycle_days: { value: dec(cycle?.days ?? 0).toDecimalPlaces(1).toNumber() },
       avg_discount_pct: { value: grossValue.isZero() ? 0 : shareOf(discountSavings, grossValue) },
       discount_savings: { value: discountSavings.toFixed(2) },
@@ -418,7 +363,7 @@ router.get(
               SUM(v.po_qty)                     AS po_qty,
               SUM(v.received_amount)            AS received_value,
               SUM(v.pending_amount) FILTER (WHERE ${PENDING}) AS pending_value
-         ${PO_LINE_FROM(f)} ${pb.where()}
+         ${PO_LINE_FROM} ${pb.where()}
         GROUP BY 1 ORDER BY 1`,
       pb.params,
     );
@@ -435,15 +380,15 @@ router.get(
       ib.params,
     );
 
-    // The same receipts as the GRN KPIs (grnLineScope), period by period.
-    const gs = grnLineScope(f);
+    // The same receipt lines as the GRN KPIs (grnLineFilter), period by period.
+    const gs = grnLineFilter(f);
     const grnSeries = await query(
       `SELECT to_char(date_trunc('${bucket}', g.grn_date), 'YYYY-MM-DD') AS period,
               COUNT(DISTINCT g.id)::int AS grn_count,
               SUM(gl.grn_qty)           AS grn_qty,
               SUM(gl.amount)            AS grn_value
          FROM grn_lines gl JOIN grn_headers g ON g.id = gl.grn_id
-         ${gs.where}
+         ${gs.where()}
         GROUP BY 1 ORDER BY 1`,
       gs.params,
     );
@@ -585,10 +530,8 @@ router.get(
     }
     const f = parsedQuery<z.infer<typeof breakdownSchema>>(res);
 
-    // The dimension's own join may already provide `items`; avoid joining twice.
-    const dimJoinsItems = dim.join.includes('JOIN items i');
     const b = poLineFilter(f);
-    const from = `FROM v_po_line_balance v ${dim.join}${!dimJoinsItems && needsItemJoin(f) ? ' JOIN items i ON i.id = v.item_id' : ''}`;
+    const from = `FROM v_po_line_balance v ${dim.join}`;
 
     const sortColumn = {
       value: 'SUM(v.amount)', qty: 'SUM(v.po_qty)',
@@ -623,8 +566,7 @@ router.get(
     const [totals] = await query<Record<string, string>>(
       `SELECT SUM(v.amount) AS total_value, SUM(v.po_qty) AS total_qty,
               COUNT(DISTINCT v.po_id)::int AS po_count, COUNT(DISTINCT ${dim.id})::int AS group_count
-         FROM v_po_line_balance v ${dim.join}${!dimJoinsItems && needsItemJoin(f) ? ' JOIN items i ON i.id = v.item_id' : ''}
-         ${tb.where()}`,
+         ${from} ${tb.where()}`,
       tb.params,
     );
 
@@ -857,7 +799,7 @@ router.get(
               COUNT(DISTINCT v.po_id)::int AS doc_count,
               SUM(v.pending_grn_qty)       AS pending_qty,
               SUM(v.pending_amount)        AS pending_value
-         ${PO_LINE_FROM(f)} ${b.where()}
+         ${PO_LINE_FROM} ${b.where()}
         GROUP BY 1`,
       b.params,
     );
@@ -903,7 +845,6 @@ router.get(
               MAX(v.po_date)                AS last_po_date
          FROM v_po_line_balance v
          JOIN suppliers s ON s.id = v.supplier_id
-         ${needsItemJoin(f) ? 'JOIN items i ON i.id = v.item_id' : ''}
          ${b.where()}
         GROUP BY v.supplier_id, s.supplier_name, s.city, s.state
         ORDER BY SUM(v.amount) DESC
@@ -1025,7 +966,7 @@ router.get(
       `SELECT v.item_id::text AS key, v.item_code, v.item_description AS label,
               SUM(v.amount) AS total_value, SUM(v.po_qty) AS total_qty,
               COUNT(DISTINCT v.po_id)::int AS po_count
-         ${PO_LINE_FROM(f)} ${topB.where()}
+         ${PO_LINE_FROM} ${topB.where()}
         GROUP BY v.item_id, v.item_code, v.item_description
         ORDER BY SUM(v.amount) DESC LIMIT ${topLimit}`,
       topB.params,
@@ -1037,7 +978,7 @@ router.get(
       `SELECT v.item_id::text AS key, v.item_code, v.item_description AS label,
               SUM(v.amount) AS total_value, SUM(v.po_qty) AS total_qty,
               COUNT(DISTINCT v.po_id)::int AS po_count
-         ${PO_LINE_FROM(f)} ${botB.where()}
+         ${PO_LINE_FROM} ${botB.where()}
         GROUP BY v.item_id, v.item_code, v.item_description
         ORDER BY SUM(v.amount) ASC LIMIT ${botLimit}`,
       botB.params,
@@ -1049,7 +990,6 @@ router.get(
       `SELECT v.supplier_id::text AS key, s.supplier_name AS label,
               SUM(v.amount) AS total_value, COUNT(DISTINCT v.po_id)::int AS po_count
          FROM v_po_line_balance v JOIN suppliers s ON s.id = v.supplier_id
-         ${needsItemJoin(f) ? 'JOIN items i ON i.id = v.item_id' : ''}
          ${supB.where()}
         GROUP BY v.supplier_id, s.supplier_name
         ORDER BY SUM(v.amount) DESC LIMIT ${supLimit}`,

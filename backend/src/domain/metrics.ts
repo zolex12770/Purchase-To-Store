@@ -28,6 +28,10 @@ export interface MetricDef {
    * Several targets opened a list that did not hold the figure (2026-10-16 audit, F09):
    * '/indents?eligibleOnly=true' was ignored by the list (50 vs 1,814 indents), and
    * 'Active Suppliers' 88 opened all 1,403 suppliers.
+   *
+   * The analytics route counts a card through this list's own filter and total tiles, so
+   * the number is the list's row count or one of its tiles; under an item-level filter
+   * both add up only that filter's lines (domain/item-scope.ts).
    */
   drilldown: string;
   /** `true` when a rising value is bad (pending, overdue, rejection). */
@@ -109,9 +113,11 @@ export const METRICS: MetricDef[] = [
     key: 'po_completed_count',
     label: 'Completed POs',
     description: 'Purchase orders whose every line has been fully received.',
-    formula: "COUNT(*) WHERE v_po_header_balance.derived_status = 'COMPLETED'",
+    // The status the list filters on; the Exceptions panel flags any order whose stored
+    // status disagrees with its receipts (expected to be none).
+    formula: "COUNT(*) FROM purchase_order_headers WHERE status = 'COMPLETED'",
     unit: 'count',
-    source: 'v_po_header_balance',
+    source: 'purchase_order_headers',
     // The Complete tab also holds short-closed orders, which this does not count.
     drilldown: '/purchase-orders?status=COMPLETED',
     permission: 'po.view',
@@ -155,7 +161,9 @@ export const METRICS: MetricDef[] = [
     label: 'Approved Qty Awaiting PO',
     description:
       'Approved indent quantity not yet converted into a purchase order — the forward order book.',
-    formula: 'Σ v_indent_line_balance.pending_qty WHERE is_eligible_for_po',
+    // The list's Pending Qty tile: an approved indent's lines that are not eligible are
+    // fully ordered, so they add nothing.
+    formula: 'Σ v_indent_line_balance.pending_qty over the approved indents with a line eligible for a PO',
     unit: 'quantity',
     source: 'v_indent_line_balance',
     // The indents holding that quantity; the list has filtered on eligibleOnly since 2026-10-17.

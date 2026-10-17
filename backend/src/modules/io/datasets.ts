@@ -17,9 +17,9 @@ import type { SqlBuilder } from '../../db/index.js';
 import { csvIdArray } from '../../core/http.js';
 import { listSchema as itemListSchema, buildItemFilter } from '../masters/item.routes.js';
 import { listSchema as supplierListSchema, buildSupplierFilter } from '../masters/supplier.routes.js';
-import { listSchema as indentListSchema, buildIndentFilter } from '../indent/routes.js';
-import { listSchema as poListSchema, buildPoFilter, PO_FROM } from '../purchase-order/routes.js';
-import { listSchema as grnListSchema, buildGrnFilter, GRN_FROM } from '../grn/routes.js';
+import { listSchema as indentListSchema, buildIndentFilter, indentLineScope } from '../indent/routes.js';
+import { listSchema as poListSchema, buildPoFilter, poLineScope, PO_FROM } from '../purchase-order/routes.js';
+import { listSchema as grnListSchema, buildGrnFilter, grnLineScope, GRN_FROM } from '../grn/routes.js';
 import {
   listSchema as requisitionListSchema, buildFilter as buildRequisitionFilter, LIST_FROM as REQUISITION_FROM,
 } from '../requisition/routes.js';
@@ -199,7 +199,8 @@ export const DATASETS: Record<string, DatasetDef> = {
     },
   }),
 
-  // Every line of the indents the indent list shows.
+  // The lines the indent list's tiles add up: every line of the indents it shows, or under
+  // the item filter only that item's lines (indentLineScope).
   'indent-lines': dataset({
     key: 'indent-lines',
     title: 'Purchase Indent Lines',
@@ -224,6 +225,7 @@ export const DATASETS: Record<string, DatasetDef> = {
     build: (q) => {
       const b = buildIndentFilter(q);
       b.addIn('h.id', q.ids);
+      const scope = indentLineScope(q, b, 'v');
       return {
         sql: `SELECT v.indent_no, v.indent_date, v.indent_status, v.line_no, v.item_code,
                      v.item_description, v.indent_qty, u.code AS uom_code, v.ordered_qty,
@@ -233,7 +235,7 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN lookups u  ON u.id  = v.uom_id
                 LEFT JOIN lookups d  ON d.id  = v.department_id
                 LEFT JOIN lookups cc ON cc.id = v.cost_centre_id
-               WHERE ${inList('v.indent_id', 'h.id', INDENT_FROM, b)}
+               WHERE ${inList('v.indent_id', 'h.id', INDENT_FROM, b)}${scope ? ` AND ${scope}` : ''}
                ORDER BY v.indent_date DESC, v.indent_no DESC, v.line_no`,
         params: b.params,
       };
@@ -288,7 +290,8 @@ export const DATASETS: Record<string, DatasetDef> = {
     },
   }),
 
-  // Every line of the purchase orders the PO list shows.
+  // The lines the PO list's tiles add up: every line of the orders it shows, or under an
+  // item-level filter only that filter's lines (poLineScope).
   'po-lines': dataset({
     key: 'po-lines',
     title: 'Purchase Order Lines',
@@ -317,6 +320,7 @@ export const DATASETS: Record<string, DatasetDef> = {
     build: (q) => {
       const b = buildPoFilter(q);
       b.addIn('h.id', q.ids);
+      const scope = poLineScope(q, b, 'v');
       return {
         sql: `SELECT v.po_no, v.po_date, pt.name AS po_type_name, s.supplier_name,
                      (SELECT string_agg(DISTINCT src.indent_no, ', ')
@@ -328,7 +332,7 @@ export const DATASETS: Record<string, DatasetDef> = {
                 JOIN suppliers s ON s.id = v.supplier_id
                 LEFT JOIN lookups pt ON pt.id = v.po_type_id
                 LEFT JOIN lookups u  ON u.id  = v.uom_id
-               WHERE ${inList('v.po_id', 'h.id', PO_FROM, b)}
+               WHERE ${inList('v.po_id', 'h.id', PO_FROM, b)}${scope ? ` AND ${scope}` : ''}
                ORDER BY v.po_date DESC, v.po_no DESC, v.line_no`,
         params: b.params,
       };
@@ -380,7 +384,8 @@ export const DATASETS: Record<string, DatasetDef> = {
     },
   }),
 
-  // Every line of the GRNs the GRN list shows.
+  // The lines the GRN list's tiles add up: every line of the receipts it shows, or under
+  // an item-level filter only that filter's lines (grnLineScope).
   'grn-lines': dataset({
     key: 'grn-lines',
     title: 'GRN Lines',
@@ -405,6 +410,7 @@ export const DATASETS: Record<string, DatasetDef> = {
     build: (q) => {
       const b = buildGrnFilter(q);
       b.addIn('g.id', q.ids);
+      const scope = grnLineScope(q, b, 'gl');
       return {
         // po_no is joined through the LINE's own po_line_id, not the header's
         // po_id — correct for a multi-PO GRN, and NULL for a Direct GRN line.
@@ -419,7 +425,7 @@ export const DATASETS: Record<string, DatasetDef> = {
                 LEFT JOIN lookups pt ON pt.id = p.po_type_id
                 LEFT JOIN lookups u  ON u.id  = gl.uom_id
                 LEFT JOIN v_po_line_balance bal ON bal.po_line_id = gl.po_line_id
-               WHERE ${inList('gl.grn_id', 'g.id', GRN_FROM, b)}
+               WHERE ${inList('gl.grn_id', 'g.id', GRN_FROM, b)}${scope ? ` AND ${scope}` : ''}
                ORDER BY g.grn_date DESC, g.grn_no DESC, gl.line_no`,
         params: b.params,
       };
