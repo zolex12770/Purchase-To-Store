@@ -14,7 +14,7 @@ import { chromium } from 'playwright';
 import { query, queryOne, execute, withTransaction, txQuery, txQueryOne, SqlBuilder, type Queryable } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery,
-  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray,
+  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray, attachmentDisposition,
 } from '../../core/http.js';
 import { NotFoundError, BusinessRuleError, ValidationError, AuthorizationError } from '../../core/errors.js';
 import { requirePermission, requireAnyPermission } from '../../auth/middleware.js';
@@ -1004,7 +1004,7 @@ router.get(
       await page.setContent(html, { waitUntil: 'networkidle' });
       const pdf = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '14mm', bottom: '16mm', left: '12mm', right: '12mm' } });
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${doc.requisition_no}.pdf"`);
+      res.setHeader('Content-Disposition', attachmentDisposition(doc.requisition_no, 'pdf'));
       res.send(pdf);
     } finally {
       await browser.close();
@@ -1036,7 +1036,7 @@ router.get(
       await page.setContent(html, { waitUntil: 'networkidle' });
       const pdf = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '14mm', bottom: '16mm', left: '12mm', right: '12mm' } });
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${doc.issue_slip_no}.pdf"`);
+      res.setHeader('Content-Disposition', attachmentDisposition(doc.issue_slip_no, 'pdf'));
       res.send(pdf);
     } finally {
       await browser.close();

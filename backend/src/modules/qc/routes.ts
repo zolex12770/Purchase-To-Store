@@ -9,7 +9,7 @@
  */
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
+import { query, queryOne, withTransaction, txQueryOne, SqlBuilder } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendPage, validateBody, validateQuery, parsedQuery,
   listQuerySchema, offsetOf, idParam, csvIdArray, toKolkataStartOfDay, toKolkataEndOfDay,
@@ -19,6 +19,8 @@ import { requirePermission, requireAnyPermission } from '../../auth/middleware.j
 import { actorFrom, auditIn } from '../../core/audit.js';
 import { inwardGrnLine, type GrnLineForStock } from '../../domain/stock.js';
 import { toQty, dec } from '../../domain/money.js';
+import { toDateOnly } from '../../domain/numbering.js';
+import { CLOSED_QC_STATUS, refreshGrnQcStatus } from '../../domain/qc.js';
 
 const router = Router();
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -81,6 +83,8 @@ router.get(
       passed: (byStatus.QC_PASSED ?? 0) + (byStatus.ACCEPTED_WITH_DEVIATION ?? 0),
       failed: byStatus.QC_FAILED ?? 0,
       onHold: byStatus.ON_HOLD ?? 0,
+      // Closed without a decision because their GRN was cancelled (migration 029).
+      closed: byStatus[CLOSED_QC_STATUS] ?? 0,
     });
   }),
 );
@@ -176,8 +180,10 @@ router.get(
               qi.item_name, qi.supplier_id, qi.supplier_name, qi.received_qty,
               qi.accepted_qty, qi.rejected_qty, qi.uom_id, qi.uom_code, qi.status,
               qi.inspector_id, qi.inspector_name, qi.inspection_date, qi.remarks,
-              qi.rejection_reason, qi.next_action, qi.created_at, qi.updated_at
+              qi.rejection_reason, qi.next_action, qi.created_at, qi.updated_at,
+              gh.status AS grn_status
          FROM qc_inspections qi
+         JOIN grn_headers gh ON gh.id = qi.grn_id
          ${b.where()}
         ORDER BY qi.created_at DESC
         LIMIT ${limit} OFFSET ${offset}`,
@@ -234,6 +240,13 @@ router.post(
     const body = req.body as z.infer<typeof decisionSchema>;
 
     const result = await withTransaction(async (tx) => {
+      // The GRN is locked before the inspection, the order GRN cancel takes
+      // them in, so a decision and a cancel of the same GRN wait for each other.
+      const ref = await txQueryOne<{ grn_id: number }>(tx, 'SELECT grn_id FROM qc_inspections WHERE id = $1', [id]);
+      if (!ref) throw NotFoundError('QC Inspection');
+      const grn = await txQueryOne<{ grn_no: string; status: string; grn_date: string; supplier_id: number | null }>(
+        tx, 'SELECT grn_no, status, grn_date, supplier_id FROM grn_headers WHERE id = $1 FOR UPDATE', [ref.grn_id],
+      );
       const qi = await txQueryOne<{
         id: number; grn_id: number; grn_line_id: number; grn_no: string; item_id: number;
         item_code: string; item_name: string; supplier_id: number | null; received_qty: string;
@@ -245,7 +258,19 @@ router.post(
            FROM qc_inspections WHERE id = $1 FOR UPDATE`,
         [id],
       );
-      if (!qi) throw NotFoundError('QC Inspection');
+      if (!qi || !grn) throw NotFoundError('QC Inspection');
+
+      // Only a posted GRN's material is held for inspection. A pass on a
+      // cancelled GRN added the stock of a receipt that no longer existed, and
+      // nothing ever took it back out (A7 F04).
+      if (grn.status !== 'POSTED' || qi.status === CLOSED_QC_STATUS) {
+        throw BusinessRuleError(
+          grn.status === 'DRAFT'
+            ? `GRN ${grn.grn_no} is still a draft — its material is inspected once the GRN is posted.`
+            : `GRN ${grn.grn_no} has been cancelled, so this inspection is closed and no decision can be recorded on it.`,
+          { grnStatus: grn.status, inspectionStatus: qi.status },
+        );
+      }
 
       if (qi.status === 'QC_PASSED' || qi.status === 'ACCEPTED_WITH_DEVIATION') {
         throw BusinessRuleError(`QC Inspection for ${qi.item_code} on GRN ${qi.grn_no} has already been finalised and passed.`);
@@ -300,18 +325,16 @@ router.post(
       // If passed / accepted with deviation and acceptedQty > 0, release into usable stock!
       let stockMoved = false;
       if (isPass && body.acceptedQty > 0) {
-        const grnHeader = await txQueryOne<{ grn_date: string; supplier_id: number | null }>(
-          tx, 'SELECT grn_date, supplier_id FROM grn_headers WHERE id = $1', [qi.grn_id],
-        );
+        const grnHeader = grn;
         const grnLine = await txQueryOne<{
-          id: number; item_id: number; po_line_id: number | null; grn_qty: string;
+          id: number; line_no: number; item_id: number; po_line_id: number | null; grn_qty: string;
           uom_id: number | null; batch_no: string; receipt_location: string;
         }>(
-          tx, 'SELECT id, item_id, po_line_id, grn_qty, uom_id, batch_no, receipt_location FROM grn_lines WHERE id = $1',
+          tx, 'SELECT id, line_no, item_id, po_line_id, grn_qty, uom_id, batch_no, receipt_location FROM grn_lines WHERE id = $1',
           [qi.grn_line_id],
         );
 
-        if (grnLine && grnHeader) {
+        if (grnLine) {
           const lineForStock: GrnLineForStock = {
             id: grnLine.id,
             item_id: grnLine.item_id,
@@ -323,38 +346,20 @@ router.post(
             receipt_location: grnLine.receipt_location ?? '',
           };
 
+          // SR. NO. is the line's number, as for every line received at posting.
           await inwardGrnLine(tx, lineForStock, {
             grnId: qi.grn_id,
             grnNo: qi.grn_no,
-            grnDate: String(grnHeader.grn_date).slice(0, 10),
+            grnDate: toDateOnly(grnHeader.grn_date),
             supplierId: grnHeader.supplier_id,
-            srNo: 1,
+            srNo: grnLine.line_no,
             userId: req.user!.id,
           });
           stockMoved = true;
         }
       }
 
-      // Recompute and update overall grn_headers.qc_status
-      const allGrnInspections = await txQuery<{ status: string }>(
-        tx, 'SELECT status FROM qc_inspections WHERE grn_id = $1', [qi.grn_id],
-      );
-      let overallQcStatus = 'QC_PASSED';
-      const hasPending = allGrnInspections.some((x) => x.status === 'PENDING_QC');
-      const hasInProgress = allGrnInspections.some((x) => x.status === 'QC_IN_PROGRESS');
-      const hasOnHold = allGrnInspections.some((x) => x.status === 'ON_HOLD');
-      const hasFailed = allGrnInspections.some((x) => x.status === 'QC_FAILED');
-
-      if (hasPending) overallQcStatus = 'PENDING_QC';
-      else if (hasInProgress) overallQcStatus = 'QC_IN_PROGRESS';
-      else if (hasOnHold) overallQcStatus = 'ON_HOLD';
-      else if (hasFailed) overallQcStatus = 'QC_FAILED';
-      else overallQcStatus = 'QC_PASSED';
-
-      await tx.query(
-        `UPDATE grn_headers SET qc_status = $2, updated_at = now() WHERE id = $1`,
-        [qi.grn_id, overallQcStatus],
-      );
+      const overallQcStatus = await refreshGrnQcStatus(tx, qi.grn_id);
 
       await auditIn(tx, {
         actor: actorFrom(req),
