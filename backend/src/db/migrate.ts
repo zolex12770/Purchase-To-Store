@@ -137,6 +137,15 @@ const POST_MIGRATION: Record<string, string[]> = {
     'inventory_items', 'stock_ledger', 'grn_lines', 'grn_line_mlns', 'suppliers', 'requisition_lines',
     'grn_headers', 'purchase_indent_lines', 'inventory_quarantine', 'inventory_sync_checkpoints',
   ].map((t) => `VACUUM (FULL, ANALYZE) ${t}`),
+  // Nor does it ever analyse a table. With no statistics for the PO register imported
+  // on 2026-10-16, the planner took the Pending PO list narrowed by receipt evidence
+  // for a handful of rows and summed every GRN line again for each PO: on a copy of
+  // 2026-10-17 its totals took 2.9 s under 'Receipt on store sheet only' and the
+  // receipt evidence summary 18 to 90 s, against 0.03 s and 0.12 s once analysed.
+  '030_store_grn_link_holds': [
+    'purchase_order_headers', 'purchase_order_lines', 'po_indent_sources', 'grn_headers', 'grn_lines',
+    'suppliers', 'items', 'google_sync_jobs', 'google_sync_errors', 'store_grn_link_holds',
+  ].map((t) => `ANALYZE ${t}`),
 };
 
 /**

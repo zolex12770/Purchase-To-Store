@@ -133,7 +133,7 @@ const exportNos = async (params: Record<string, string | number>) => {
   expect(res.status).toBe(200);
   const lines = res.text.replace(/^﻿/, '').split('\r\n');
   const header = lines.findIndex((l) => l.startsWith('PO No,'));
-  expect(lines[header]).toMatch(/Store Receipts Awaiting Link$/);
+  expect(lines[header]).toMatch(/Store Receipts Awaiting Link,Receipts on Store Sheet Only$/);
   return lines.slice(header + 1).filter(Boolean).map((l) => l.split(',')[0]!).sort();
 };
 const summary = async (params: Record<string, string | number> = {}) => {
