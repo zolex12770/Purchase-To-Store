@@ -260,9 +260,9 @@ router.post(
       );
       if (!qi || !grn) throw NotFoundError('QC Inspection');
 
-      // Only a posted GRN's material is held for inspection. A pass on a
-      // cancelled GRN added the stock of a receipt that no longer existed, and
-      // nothing ever took it back out (A7 F04).
+      // Only a posted GRN's material is held for inspection. Nothing checked the
+      // GRN, so a pass on a cancelled one would add the stock of a receipt that
+      // no longer exists, and nothing would take it back out (A7 F04).
       if (grn.status !== 'POSTED' || qi.status === CLOSED_QC_STATUS) {
         throw BusinessRuleError(
           grn.status === 'DRAFT'
@@ -341,7 +341,6 @@ router.post(
       // If passed / accepted with deviation and acceptedQty > 0, release into usable stock!
       let stockMoved = false;
       if (isPass && body.acceptedQty > 0) {
-        const grnHeader = grn;
         const grnLine = await txQueryOne<{
           id: number; line_no: number; item_id: number; po_line_id: number | null; grn_qty: string;
           uom_id: number | null; batch_no: string; receipt_location: string;
@@ -362,12 +361,15 @@ router.post(
             receipt_location: grnLine.receipt_location ?? '',
           };
 
-          // SR. NO. is the line's number, as for every line received at posting.
+          // grn_date arrives as a Date: its text cut to ten characters was
+          // "Sat Oct 17", and every release failed with a 500 (found 2026-10-17;
+          // production had never run a QC pass). SR. NO. is the line's number,
+          // as for every line received at posting.
           await inwardGrnLine(tx, lineForStock, {
             grnId: qi.grn_id,
             grnNo: qi.grn_no,
-            grnDate: toDateOnly(grnHeader.grn_date),
-            supplierId: grnHeader.supplier_id,
+            grnDate: toDateOnly(grn.grn_date),
+            supplierId: grn.supplier_id,
             srNo: grnLine.line_no,
             userId: req.user!.id,
           });
