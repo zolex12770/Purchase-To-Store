@@ -361,9 +361,13 @@ describe('Refusals that are states of this server, not failed calls to Google', 
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const first = runSync({ trigger: 'MANUAL', dryRun: true, sheets: [mapping!.sheet_name], reader: async () => { await gate; return []; } });
-    await expect(runSync({ trigger: 'MANUAL', dryRun: true, reader: async () => [] }))
-      .rejects.toMatchObject({ status: 409, code: 'CONFLICT', message: expect.stringMatching(/already in progress/) });
-    release();
+    try {
+      await expect(runSync({ trigger: 'MANUAL', dryRun: true, reader: async () => [] }))
+        .rejects.toMatchObject({ status: 409, code: 'CONFLICT', message: expect.stringMatching(/already in progress/) });
+    } finally {
+      // Whatever the answer, the first run is let finish: a run left waiting kept the worker alive.
+      release();
+    }
     expect((await first).status).toBe('SUCCESS');
   });
 });
