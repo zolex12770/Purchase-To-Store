@@ -27,6 +27,7 @@ import { toQty, toRate } from '../../domain/money.js';
 import { toShortUom } from '../../domain/uom.js';
 import { adjustStockPhysicalCount, reverseStockAdjustment } from '../../domain/stock.js';
 import { recordInventoryMovement, reverseInventoryMovement, INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
+import { OPEN_QC_STATUSES } from '../../domain/qc.js';
 import { syncCategoryFromSheet, syncAllInventoryCategories, activeInventorySync, type CategorySyncResult } from './sync-engine.js';
 import { EXCLUSION_TEXT } from './sheet-model.js';
 import directIssueRoutes from './direct-issue.routes.js';
@@ -35,6 +36,24 @@ const router = Router();
 router.use('/direct-issues', directIssueRoutes);
 
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+
+/** The register's valuation rule, used by its rows, summary and export and by the Overview's
+    Total Stock Valuation card, which opens the register. The card valued the sheet figures of
+    every category instead (inventory_items x unit_price): Rs 9.26 cr against the register's
+    Rs 8.55 cr on the 2026-10-17 copy (E2E S5-17b).
+    Rate: the Item Master's standard rate, else the store's own rate from the inventory sheet the
+    stock comes from. No Purchase item has a standard rate (all 17,379 were 0 on 2026-10-16), so
+    valuing at standard rate alone showed Rs 0 for 3,191 items while the Overview valued the same
+    stock at sheet rates. */
+const SHEET_RATE_JOIN = `LEFT JOIN LATERAL (
+        SELECT ii.unit_price AS sheet_rate
+          FROM inventory_items ii
+         WHERE ii.item_id = i.id AND ii.deleted_at IS NULL AND COALESCE(ii.unit_price, 0) > 0
+         ORDER BY (ii.category = i.inventory_category) DESC, ii.id
+         LIMIT 1
+      ) sr ON TRUE`;
+const VALUATION_RATE_SQL = 'COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0)';
+const VALUATION_BASIS_SQL = `CASE WHEN COALESCE(i.standard_rate, 0) > 0 THEN 'STANDARD' WHEN sr.sheet_rate IS NOT NULL THEN 'SHEET' ELSE 'NONE' END`;
 
 /* ── GET /inventory/overview ────────────────────────────────────────────────── */
 
@@ -47,7 +66,7 @@ router.get(
       SELECT
         COUNT(*)::int AS total_items,
         COALESCE(SUM(i.live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
-        (SELECT COALESCE(SUM(live_stock_qty * COALESCE(unit_price, 0)), 0)::numeric(18, 2) FROM inventory_items WHERE deleted_at IS NULL) AS total_valuation,
+        COALESCE(SUM(i.live_stock_qty * ${VALUATION_RATE_SQL}), 0)::numeric(18, 2) AS total_valuation,
         COUNT(CASE WHEN i.live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
         COUNT(CASE WHEN i.live_stock_qty > 0 THEN 1 END)::int AS positive_stock_count,
         COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
@@ -75,6 +94,7 @@ router.get(
            WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
            GROUP BY rl.item_id
         ) req ON req.item_id = i.id
+        ${SHEET_RATE_JOIN}
        WHERE i.deleted_at IS NULL AND i.is_active = TRUE
     `;
     const stats = await queryOne<Record<string, unknown>>(statsSql);
@@ -302,23 +322,17 @@ router.get(
          WHERE is_receivable = TRUE
          GROUP BY item_id
       ) po ON po.item_id = i.id
+      -- Held for QC: everything received in a lot still waiting for its decision. Only a pass
+      -- releases stock (qc/routes.ts), so the interim accepted and rejected figures of a lot
+      -- under test or On Hold have moved nothing. Counting PENDING_QC and QC_IN_PROGRESS only,
+      -- net of those figures, dropped a 5-unit lot put On Hold from the figure (E2E S3-10d/f).
       LEFT JOIN (
-        SELECT item_id, SUM(received_qty - accepted_qty - rejected_qty) AS qc_pending_qty
+        SELECT item_id, SUM(received_qty) AS qc_pending_qty
           FROM qc_inspections
-         WHERE status IN ('PENDING_QC', 'QC_IN_PROGRESS')
+         WHERE status IN (${OPEN_QC_STATUSES.map((s) => `'${s}'`).join(', ')})
          GROUP BY item_id
       ) qc ON qc.item_id = i.id
-      -- Valuation rate: the Item Master's standard rate, else the store's own rate from the
-      -- inventory sheet the stock comes from. No Purchase item has a standard rate (all
-      -- 17,379 were 0 on 2026-10-16), so valuing at standard rate alone showed Rs 0 for
-      -- 3,191 items while the Overview valued the same stock at sheet rates.
-      LEFT JOIN LATERAL (
-        SELECT ii.unit_price AS sheet_rate
-          FROM inventory_items ii
-         WHERE ii.item_id = i.id AND ii.deleted_at IS NULL AND COALESCE(ii.unit_price, 0) > 0
-         ORDER BY (ii.category = i.inventory_category) DESC, ii.id
-         LIMIT 1
-      ) sr ON TRUE
+      ${SHEET_RATE_JOIN}
     `;
 
     // Filter by stockStatus in SQL wrapper
@@ -378,8 +392,8 @@ router.get(
          SELECT i.id,
                 i.inventory_category,
                 i.live_stock_qty,
-                COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0) AS valuation_rate,
-                CASE WHEN COALESCE(i.standard_rate, 0) > 0 THEN 'STANDARD' WHEN sr.sheet_rate IS NOT NULL THEN 'SHEET' ELSE 'NONE' END AS valuation_basis,
+                ${VALUATION_RATE_SQL} AS valuation_rate,
+                ${VALUATION_BASIS_SQL} AS valuation_basis,
                 ${STOCK_STATUS_SQL} AS stock_status
           ${baseFrom}
           ${b.where()}
@@ -397,8 +411,8 @@ router.get(
                i.item_description,
                i.inventory_category AS category,
                COALESCE(i.opening_stock_qty, 0) AS opening_stock_qty,
-               ROUND((i.live_stock_qty * COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0)), 2) AS stock_valuation,
-               CASE WHEN COALESCE(i.standard_rate, 0) > 0 THEN 'STANDARD' WHEN sr.sheet_rate IS NOT NULL THEN 'SHEET' ELSE 'NONE' END AS valuation_basis,
+               ROUND((i.live_stock_qty * ${VALUATION_RATE_SQL}), 2) AS stock_valuation,
+               ${VALUATION_BASIS_SQL} AS valuation_basis,
                u.id AS uom_id,
                COALESCE(u.code, '') AS uom_code,
                COALESCE(u.name, '') AS uom_name,
@@ -476,7 +490,10 @@ router.get(
 
 router.get(
   '/stock/export',
-  requireAnyPermission('inventory.export', 'inventory.view', 'auto_indent.view'),
+  // The three inventory exports need inventory.export itself: any viewing right was enough,
+  // so a Purchase User (inventory.view, no export right) downloaded the stock register,
+  // the ledger and the category registers (E2E S5-07c).
+  requirePermission('inventory.export'),
   validateQuery(stockQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof stockQuerySchema>>(res);
@@ -502,7 +519,7 @@ router.get(
              COALESCE(i.max_stock, 0) AS max_stock,
              COALESCE(ind.pending_indent_qty, 0) AS pending_indents,
              COALESCE(po.pending_po_qty, 0) AS pending_pos,
-             ROUND((i.live_stock_qty * COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0)), 2) AS stock_valuation,
+             ROUND((i.live_stock_qty * ${VALUATION_RATE_SQL}), 2) AS stock_valuation,
              ${STOCK_STATUS_SQL} AS stock_status
         FROM items i
         LEFT JOIN lookups u ON u.id = i.uom_id
@@ -528,13 +545,7 @@ router.get(
            WHERE is_receivable = TRUE
            GROUP BY item_id
         ) po ON po.item_id = i.id
-        LEFT JOIN LATERAL (
-          SELECT ii.unit_price AS sheet_rate
-            FROM inventory_items ii
-           WHERE ii.item_id = i.id AND ii.deleted_at IS NULL AND COALESCE(ii.unit_price, 0) > 0
-           ORDER BY (ii.category = i.inventory_category) DESC, ii.id
-           LIMIT 1
-        ) sr ON TRUE
+        ${SHEET_RATE_JOIN}
        ${b.where()}
        ORDER BY i.item_code ASC
        LIMIT ${EXPORT_ROW_CAP + 1}
@@ -675,7 +686,7 @@ router.get(
 
 router.get(
   '/ledger/export',
-  requireAnyPermission('inventory.export', 'inventory.view', 'auto_indent.view'),
+  requirePermission('inventory.export'),
   validateQuery(ledgerQuerySchema),
   asyncHandler(async (_req, res) => {
     const q = parsedQuery<z.infer<typeof ledgerQuerySchema>>(res);
@@ -793,6 +804,15 @@ router.get(
 const createAdjustmentSchema = z.object({
   itemId: z.coerce.number().int().positive('Item selection is required.'),
   actualStockQty: z.union([z.number(), z.string()]).refine((v) => Number(v) >= 0, 'Actual stock cannot be negative.'),
+  /** The book stock the counter was shown. The adjustment is recorded against the item's stock
+      as it is when its row is locked, and the before/after figures are the audit record, so a
+      count entered against another figure is refused rather than posted: a category workspace
+      showed its sheet figure (6) as the book stock while the count was posted against 26, and
+      the pre-filled count silently took the stock from 26 to 6 (E2E S5-18). Optional, so an
+      existing caller that sends none posts as before. */
+  expectedSystemQty: z.union([z.number(), z.string()])
+    .refine((v) => v !== '' && Number.isFinite(Number(v)), 'The book stock shown must be a number.')
+    .optional(),
   reason: z.string().trim().min(2, 'Reason is mandatory for stock adjustments.').max(500),
   findings: z.string().trim().max(1000).default(''),
   remarks: z.string().trim().max(1000).default(''),
@@ -883,6 +903,13 @@ router.post(
         [body.itemId],
       );
       if (!item) throw NotFoundError('Item');
+      if (body.expectedSystemQty !== undefined && toQty(body.expectedSystemQty) !== toQty(item.live_stock_qty)) {
+        throw ConflictError(
+          `${item.item_code}'s book stock is ${Number(item.live_stock_qty)}, not ${Number(body.expectedSystemQty)} as shown when the count was entered. ` +
+          'Nothing was posted. Reopen the count to see the current figure.',
+          { itemCode: item.item_code, bookStock: toQty(item.live_stock_qty), shown: toQty(body.expectedSystemQty) },
+        );
+      }
 
       const when = new Date(body.adjustmentDate || Date.now());
       const adjustmentNo = await nextDocumentNumber(tx, 'STOCK_ADJUSTMENT', when);
@@ -1012,6 +1039,12 @@ router.get(
 
 /* ── POST /inventory/auto-indent/generate ───────────────────────────────────── */
 
+/** A suggestion stays open until it is converted, ordered or rejected. The scan treated only
+    SUGGESTED, PENDING_APPROVAL, STORE_APPROVED and PURCHASE_APPROVED as open, but a Purchase
+    Head's approval sets APPROVED, so every later scan added another suggestion for the same
+    shortage next to the approved one, and both could become indents (E2E S5-13b). */
+const CLOSED_AUTO_INDENT_STATUSES = ['CONVERTED', 'ORDERED', 'REJECTED'];
+
 router.post(
   ['/auto-indent/generate', '/auto-indents/generate'],
   requireAnyPermission('auto_indent.config', 'auto_indent.approve'),
@@ -1081,12 +1114,13 @@ router.post(
 
     await withTransaction(async (tx) => {
       for (const item of candidates) {
-        // Skip if active auto indent already pending
+        // Skip an item that already has an open suggestion, approved or not.
         const existing = await txQueryOne<{ id: number }>(
           tx,
           `SELECT id FROM auto_indents
-            WHERE item_id = $1 AND status IN ('SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED', 'PURCHASE_APPROVED')`,
-          [item.item_id],
+            WHERE item_id = $1 AND status <> ALL($2::text[])
+            LIMIT 1`,
+          [item.item_id, CLOSED_AUTO_INDENT_STATUSES],
         );
         if (existing) continue;
 
@@ -1159,6 +1193,17 @@ router.post(
 
 /* ── GET /inventory/auto-indents ────────────────────────────────────────────── */
 
+/** A store user approves a suggestion for the store (to STORE_APPROVED); a Purchase Head or
+    Super Admin approves it outright, also once the store has. */
+const isStoreOnlyApprover = (roles: readonly string[]): boolean =>
+  roles.includes('STORE_USER') && !roles.includes('PURCHASE_HEAD') && !roles.includes('SUPER_ADMIN');
+
+/** The statuses a user may approve a suggestion from: the approve route's rule. The list sends
+    each row's can_approve from it, so the queue offers Approve only where approving works: a store
+    user was offered Approve on a store-approved suggestion and got a 422 (E2E S5-09b). */
+const approvableAutoIndentStatuses = (roles: readonly string[]): readonly string[] =>
+  isStoreOnlyApprover(roles) ? ['SUGGESTED', 'PENDING_APPROVAL'] : ['SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED'];
+
 const autoIndentListSchema = listQuerySchema.extend({
   status: z.string().optional(),
   departmentId: csvIdArray,
@@ -1200,9 +1245,10 @@ router.get(
   '/auto-indents',
   requirePermission('auto_indent.view'),
   validateQuery(autoIndentListSchema),
-  asyncHandler(async (_req, res) => {
+  asyncHandler(async (req, res) => {
     const q = parsedQuery<z.infer<typeof autoIndentListSchema>>(res);
     const b = buildAutoIndentFilter(q);
+    const approvable = req.user!.permissions.has('auto_indent.approve') ? approvableAutoIndentStatuses(req.user!.roles) : [];
 
     const totalRow = await queryOne<{ n: string }>(
       `SELECT COUNT(*) AS n FROM auto_indents ai ${b.where()}`,
@@ -1229,7 +1275,7 @@ router.get(
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
 
-    const rows = await query(
+    const rows = await query<{ status: string }>(
       `SELECT ai.* FROM auto_indents ai
        ${b.where()}
        ORDER BY
@@ -1246,7 +1292,7 @@ router.get(
       b.params,
     );
 
-    sendPage(res, rows, total, q.page, q.pageSize, {
+    sendPage(res, rows.map((r) => ({ ...r, can_approve: approvable.includes(r.status) })), total, q.page, q.pageSize, {
       totals: {
         totalSuggestions: total,
         totalSuggestedQty: Number(totalsRow?.total_qty ?? 0),
@@ -1292,9 +1338,7 @@ router.post(
   validateBody(z.object({ remarks: z.string().trim().max(500).optional() })),
   asyncHandler(async (req, res) => {
     const id = idParam(req);
-    const roles = req.user!.roles;
-    const isStoreUser = roles.includes('STORE_USER');
-    const isPurchaseHead = roles.includes('PURCHASE_HEAD') || roles.includes('SUPER_ADMIN');
+    const storeOnly = isStoreOnlyApprover(req.user!.roles);
 
     const result = await withTransaction(async (tx) => {
       const ai = await txQueryOne<{
@@ -1306,19 +1350,11 @@ router.post(
       // A suggestion only moves forward: store approval, then purchase approval. Without
       // this check a rejected or converted suggestion could be approved again and then
       // converted a second time into a duplicate indent (2026-10-16 audit).
-      const approvable = isStoreUser && !isPurchaseHead
-        ? ['SUGGESTED', 'PENDING_APPROVAL']
-        : ['SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED'];
-      if (!approvable.includes(ai.status)) {
+      if (!approvableAutoIndentStatuses(req.user!.roles).includes(ai.status)) {
         throw BusinessRuleError(`Auto indent for ${ai.item_code} is ${ai.status.replace(/_/g, ' ').toLowerCase()} and cannot be approved now.`);
       }
 
-      let nextStatus = 'APPROVED';
-      if (isStoreUser && !isPurchaseHead) {
-        nextStatus = 'STORE_APPROVED';
-      } else {
-        nextStatus = 'APPROVED';
-      }
+      const nextStatus = storeOnly ? 'STORE_APPROVED' : 'APPROVED';
 
       await tx.query(
         `UPDATE auto_indents
@@ -1428,6 +1464,24 @@ router.post(
       // could be converted before (no approval at all).
       if (ai.status !== 'APPROVED' && ai.status !== 'PURCHASE_APPROVED') {
         throw BusinessRuleError(`Auto indent for ${ai.item_code} must be approved before it is converted (it is ${ai.status.replace(/_/g, ' ').toLowerCase()}).`);
+      }
+      // One shortage, one indent. Scans before the open-status fix above left a second open
+      // suggestion for the same shortage next to an approved one (E2E S5-13b); while two are
+      // open neither converts, so only one of them can ever become an indent.
+      const duplicate = await txQueryOne<{ id: number; status: string }>(
+        tx,
+        `SELECT id, status FROM auto_indents
+          WHERE item_id = $1 AND id <> $2 AND status <> ALL($3::text[])
+          ORDER BY id
+          LIMIT 1`,
+        [ai.item_id, id, CLOSED_AUTO_INDENT_STATUSES],
+      );
+      if (duplicate) {
+        throw ConflictError(
+          `Another suggestion for ${ai.item_code} (no. ${duplicate.id}, ${duplicate.status.replace(/_/g, ' ').toLowerCase()}) is open for the same shortage. ` +
+          'Reject one of the two first, so the shortage becomes one indent.',
+          { duplicateId: duplicate.id, duplicateStatus: duplicate.status },
+        );
       }
 
       // Read item details
@@ -1786,7 +1840,7 @@ router.get(
 // 2b. GET /inventory/categories/:category/export - Export Category Register to CSV
 router.get(
   '/categories/:category/export',
-  requirePermission('inventory.view'),
+  requirePermission('inventory.export'),
   asyncHandler(async (req, res) => {
     const rawCategory = (req.params.category || '').toUpperCase();
     const parseCat = categoryParam.safeParse(rawCategory);
