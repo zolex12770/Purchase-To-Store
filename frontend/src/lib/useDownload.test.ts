@@ -57,6 +57,20 @@ describe('downloadFile', () => {
     });
   });
 
+  it('on 401 refreshes once and asks once more — never in a loop', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      calls.push(url);
+      if (url.endsWith('/auth/refresh')) {
+        return new Response(JSON.stringify({ data: { accessToken: 'renewed', user: {} } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ error: { code: 'AUTHENTICATION_ERROR', message: 'Authentication required.' } }), { status: 401 });
+    }));
+    const err = shown(await downloadFile('/grn/7/pdf', 'grn.pdf').catch((e: unknown) => e));
+    expect([err.status, err.code]).toEqual([401, 'AUTHENTICATION_ERROR']);
+    expect(calls.map((u) => u.replace('/api/v1', ''))).toEqual(['/grn/7/pdf', '/auth/refresh', '/grn/7/pdf']);
+  });
+
   it('saves the file under the name the server gives', async () => {
     const saved = fakeDocument();
     vi.stubGlobal('fetch', vi.fn(async () => new Response('a,b', {

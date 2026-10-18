@@ -23,7 +23,9 @@
  * every table. One table per statement, with the event loop handed back in between, so
  * a request waits for one table at most: on the copy of the 2026-10-17 backup the whole
  * database took 0.9 to 1.1 s as one ANALYZE and 0.8 s table by table, the slowest table
- * (inventory_transactions) 0.28 s, and the check itself 15 ms.
+ * (inventory_transactions) 0.28 s, and the check itself 15 ms. With the PO, GRN, indent
+ * and requisition tables' statistics gone, the 12-month Pending PO totals took 115 s; one
+ * periodic check analysed those 9 tables in 0.23 s, and the same totals then took 59 ms.
  */
 import { getDatabase, type Database } from './driver.js';
 import { logger } from '../core/logger.js';

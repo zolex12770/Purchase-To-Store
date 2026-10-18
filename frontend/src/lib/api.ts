@@ -313,8 +313,8 @@ export const api = {
  */
 async function fetchAuthenticated<T>(path: string, read: (res: Response) => Promise<T>, retried = false): Promise<T> {
   const limit = withTimeout();
-  let res: Response;
   try {
+    let res: Response;
     try {
       res = await fetch(`${BASE}${path}`, {
         credentials: 'include',
@@ -324,22 +324,23 @@ async function fetchAuthenticated<T>(path: string, read: (res: Response) => Prom
     } catch (err) {
       throw noAnswer(err);
     }
-    if (!(res.status === 401 && !retried)) {
-      if (!res.ok) throw await toApiError(res);
-      try {
-        return await read(res);
-      } catch (err) {
-        throw err instanceof ApiError ? err : noAnswer(err);
-      }
+    if (res.status === 401 && !retried) {
+      limit.done();
+      // Once more after a refresh, as `request` does — never in a loop.
+      if ((await refreshSession()).ok) return await fetchAuthenticated(path, read, true);
+      accessToken = null;
+      onUnauthenticated?.();
+      throw await toApiError(res);
+    }
+    if (!res.ok) throw await toApiError(res);
+    try {
+      return await read(res);
+    } catch (err) {
+      throw err instanceof ApiError ? err : noAnswer(err);
     }
   } finally {
     limit.done();
   }
-  // 401: once more after a refresh, as `request` does — never in a loop.
-  if ((await refreshSession()).ok) return fetchAuthenticated(path, read, true);
-  accessToken = null;
-  onUnauthenticated?.();
-  throw await toApiError(res);
 }
 
 /**
