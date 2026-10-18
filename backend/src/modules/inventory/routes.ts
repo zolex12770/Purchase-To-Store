@@ -55,6 +55,28 @@ const SHEET_RATE_JOIN = `LEFT JOIN LATERAL (
 const VALUATION_RATE_SQL = 'COALESCE(NULLIF(i.standard_rate, 0), sr.sheet_rate, 0)';
 const VALUATION_BASIS_SQL = `CASE WHEN COALESCE(i.standard_rate, 0) > 0 THEN 'STANDARD' WHEN sr.sheet_rate IS NOT NULL THEN 'SHEET' ELSE 'NONE' END`;
 
+/** What an open requisition line still holds of its item's stock: its balance, never below
+    zero (rl = requisition_lines, v = v_requisition_line_balance). Rule 24 lets the store issue
+    more than a line asks for, and the sums took such a line's balance as it stood (6 asked,
+    8 issued: -2), so the over-issue lowered its item's allocated stock, raised the stock shown
+    available for every other open line, and could lift the item out of CRITICAL or
+    BELOW_REORDER (2026-10-17 E2E review of T1, C06 follow-up). The requisition's own pending
+    (v_requisition_line_balance.pending_qty) is counted the same way; its issued and excess
+    figures keep the over-issue. */
+const OPEN_LINE_BALANCE_SQL = 'GREATEST(0, rl.requested_qty - COALESCE(v.issued_qty, 0))';
+
+/** req.allocated_qty: the stock the open requisitions hold, per item. One copy for the
+    Overview counts, the register, its export and the stock scan, which each kept their own
+    and summed the balances unclamped. */
+const REQUISITION_ALLOCATION_JOIN = `LEFT JOIN (
+        SELECT rl.item_id, SUM(${OPEN_LINE_BALANCE_SQL}) AS allocated_qty
+          FROM requisition_lines rl
+          JOIN requisition_headers rh ON rh.id = rl.requisition_id
+          JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
+         WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
+         GROUP BY rl.item_id
+      ) req ON req.item_id = i.id`;
+
 /* ── GET /inventory/overview ────────────────────────────────────────────────── */
 
 router.get(
@@ -86,14 +108,7 @@ router.get(
                      AND NOT (i.max_stock IS NOT NULL AND i.max_stock > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock)
                    THEN 1 END)::int AS normal_stock
         FROM items i
-        LEFT JOIN (
-          SELECT rl.item_id, SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) AS allocated_qty
-            FROM requisition_lines rl
-            JOIN requisition_headers rh ON rh.id = rl.requisition_id
-            JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
-           WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
-           GROUP BY rl.item_id
-        ) req ON req.item_id = i.id
+        ${REQUISITION_ALLOCATION_JOIN}
         ${SHEET_RATE_JOIN}
        WHERE i.deleted_at IS NULL AND i.is_active = TRUE
     `;
@@ -151,8 +166,10 @@ router.get(
       `SELECT COUNT(DISTINCT po_id)::int AS count, COALESCE(SUM(open_pending_qty), 0)::numeric(18, 4) AS qty
          FROM v_po_line_balance WHERE open_pending_qty > 0`,
     );
+    // The open requisitions' balance as the requisition list totals it, each line at zero or
+    // more: an over-issued line took its excess off the other lines' balance (C06 follow-up).
     const reqsSummary = await queryOne<{ count: string; qty: string }>(
-      `SELECT COUNT(DISTINCT rh.id)::int AS count, COALESCE(SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)), 0)::numeric(18, 4) AS qty
+      `SELECT COUNT(DISTINCT rh.id)::int AS count, COALESCE(SUM(${OPEN_LINE_BALANCE_SQL}), 0)::numeric(18, 4) AS qty
          FROM requisition_lines rl
          JOIN requisition_headers rh ON rh.id = rl.requisition_id
          JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
@@ -306,14 +323,7 @@ router.get(
       LEFT JOIN lookups it ON it.id = i.item_type_id
       LEFT JOIN lookups mg ON mg.id = i.main_group_id
       LEFT JOIN lookups smg ON smg.id = i.sub_main_group_id
-      LEFT JOIN (
-        SELECT rl.item_id, SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) AS allocated_qty
-          FROM requisition_lines rl
-          JOIN requisition_headers rh ON rh.id = rl.requisition_id
-          JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
-         WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
-         GROUP BY rl.item_id
-      ) req ON req.item_id = i.id
+      ${REQUISITION_ALLOCATION_JOIN}
       LEFT JOIN (
         SELECT item_id, SUM(pending_qty) AS pending_indent_qty
           FROM v_indent_line_balance
@@ -533,14 +543,7 @@ router.get(
         LEFT JOIN lookups u ON u.id = i.uom_id
         LEFT JOIN lookups d ON d.id = i.department_id
         LEFT JOIN lookups cc ON cc.id = i.cost_centre_id
-        LEFT JOIN (
-          SELECT rl.item_id, SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) AS allocated_qty
-            FROM requisition_lines rl
-            JOIN requisition_headers rh ON rh.id = rl.requisition_id
-            JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
-           WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
-           GROUP BY rl.item_id
-        ) req ON req.item_id = i.id
+        ${REQUISITION_ALLOCATION_JOIN}
         LEFT JOIN (
           SELECT item_id, SUM(pending_qty) AS pending_indent_qty
             FROM v_indent_line_balance
@@ -1029,7 +1032,9 @@ router.post(
    when the stock covers every open line of the item, so of two lines needing 6
    against 10 on hand both would read short, though the first can be issued now;
    in queue order the first reads 10 and the second 4. Every line in the window
-   has a positive balance (the WHERE below), so nothing over-issued counts. */
+   has a positive balance (the WHERE below), so nothing over-issued counts; the
+   window still sums OPEN_LINE_BALANCE_SQL, the stock figures' own line balance,
+   so the two cannot part again. */
 
 router.get(
   '/requisition-queue',
@@ -1057,7 +1062,7 @@ router.get(
               COALESCE(lu.code, '') AS uom_code,
               i.inventory_category AS category,
               i.live_stock_qty,
-              GREATEST(0, i.live_stock_qty - COALESCE(SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) OVER (
+              GREATEST(0, i.live_stock_qty - COALESCE(SUM(${OPEN_LINE_BALANCE_SQL}) OVER (
                 PARTITION BY rl.item_id
                 ORDER BY h.requisition_date, h.id, rl.line_no
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
@@ -1138,14 +1143,7 @@ router.post(
         LEFT JOIN lookups u ON u.id = i.uom_id
         LEFT JOIN lookups d ON d.id = i.department_id
         LEFT JOIN lookups cc ON cc.id = i.cost_centre_id
-        LEFT JOIN (
-          SELECT rl.item_id, SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) AS allocated_qty
-            FROM requisition_lines rl
-            JOIN requisition_headers rh ON rh.id = rl.requisition_id
-            JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
-           WHERE rh.status IN ('APPROVED', 'PARTIALLY_ISSUED')
-           GROUP BY rl.item_id
-        ) req ON req.item_id = i.id
+        ${REQUISITION_ALLOCATION_JOIN}
         LEFT JOIN (
           SELECT item_id, SUM(pending_qty) AS pending_indent_qty
             FROM v_indent_line_balance

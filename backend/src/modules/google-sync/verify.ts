@@ -417,7 +417,7 @@ export async function verifyLiveParity(): Promise<VerificationReport> {
       entity: 'Stock & Reorder',
       formulaField: 'available_stock_qty',
       status: 'VERIFIED_DERIVED',
-      rule: 'Derived as GREATEST(0, live_stock_qty - allocated_stock_qty). Allocated stock is derived from approved requisitions.',
+      rule: 'Derived as GREATEST(0, live_stock_qty - allocated_stock_qty). Allocated stock is the balance still to issue on approved and partly issued requisitions, each line counted at zero or more: an over-issued line holds none.',
     },
     {
       entity: 'Stock & Reorder',
