@@ -361,13 +361,15 @@ describe('Refusals that are states of this server, not failed calls to Google', 
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const first = runSync({ trigger: 'MANUAL', dryRun: true, sheets: [mapping!.sheet_name], reader: async () => { await gate; return []; } });
+    let refusal: { status?: number; code?: string; message?: string } | null = null;
     try {
-      await expect(runSync({ trigger: 'MANUAL', dryRun: true, reader: async () => [] }))
-        .rejects.toMatchObject({ status: 409, code: 'CONFLICT', message: expect.stringMatching(/already in progress/) });
+      refusal = await runSync({ trigger: 'MANUAL', dryRun: true, reader: async () => [] }).then(() => null, (e: unknown) => e as typeof refusal);
     } finally {
       // Whatever the answer, the first run is let finish: a run left waiting kept the worker alive.
       release();
     }
     expect((await first).status).toBe('SUCCESS');
+    expect({ status: refusal?.status, code: refusal?.code, message: refusal?.message })
+      .toEqual({ status: 409, code: 'CONFLICT', message: 'A synchronisation is already in progress. Please wait for it to finish.' });
   });
 });
