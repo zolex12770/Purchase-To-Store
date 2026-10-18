@@ -168,7 +168,7 @@ export const REASON_TEXT: Record<HoldRowReason, string> = {
   NO_PO_NAMED: 'The GRN tab names no PO for this receipt.',
   SEVERAL_POS: 'The GRN tab names more than one PO for this receipt.',
   PO_NOT_IN_ERP: 'The PO named on the GRN tab is not in the ERP.',
-  PO_NOT_RECEIVABLE: 'The PO named on the GRN tab is a draft or cancelled in the ERP, so it cannot take a receipt.',
+  PO_NOT_RECEIVABLE: 'The PO named on the GRN tab is a draft, cancelled or short-closed in the ERP, or its line for this item is closed, so it cannot take a receipt.',
   ITEM_NOT_ON_PO: 'The PO named on the GRN tab has no line for this item.',
   SEVERAL_PO_LINES: 'The PO has more than one line for this item and the GRN tab does not say which.',
   SUPPLIER_MISMATCH: 'The PO named on the GRN tab belongs to another supplier.',

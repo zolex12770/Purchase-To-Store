@@ -661,6 +661,10 @@ router.get(
               b.po_id, poh.po_no, b.po_qty, b.received_qty, b.pending_grn_qty, b.final_rate AS po_final_rate,
               b.line_no AS po_line_no,
               m.mln_no, m.sr_no AS mln_sr_no,
+              -- The line's quality inspection, when its item needed one: while it is open the
+              -- line is held out of stock and has no lot yet (receiveLines), which the GRN
+              -- screen must say instead of 'added to stock' (2026-10-17 E2E run, S3-D1).
+              qi.status AS qc_inspection_status,
               (SELECT string_agg(DISTINCT ih.indent_no, ', ' ORDER BY ih.indent_no)
                  FROM po_indent_sources pis JOIN purchase_indent_headers ih ON ih.id = pis.indent_id
                 WHERE pis.po_line_id = gl.po_line_id) AS indent_no,
@@ -675,6 +679,9 @@ router.get(
          LEFT JOIN v_po_line_balance b ON b.po_line_id = gl.po_line_id
          LEFT JOIN purchase_order_headers poh ON poh.id = b.po_id
          LEFT JOIN grn_line_mlns m ON m.grn_line_id = gl.id
+         LEFT JOIN LATERAL (
+           SELECT q.status FROM qc_inspections q WHERE q.grn_line_id = gl.id ORDER BY q.id DESC LIMIT 1
+         ) qi ON TRUE
         WHERE gl.grn_id = $1
         ORDER BY gl.line_no`,
       [id],
@@ -951,15 +958,26 @@ async function receiveLines(
     supplierName ??= (await txQueryOne<{ supplier_name: string }>(
       tx, 'SELECT supplier_name FROM suppliers WHERE id = $1', [grn.supplierId],
     ))?.supplier_name ?? '';
+    // The unit is the line's, as on the GRN: a literal '' made the QC queue show
+    // '—' for every inspection's unit (2026-10-17 E2E run, S3-09b).
     await tx.query(
       `INSERT INTO qc_inspections
          (grn_id, grn_line_id, grn_no, item_id, item_code, item_name, supplier_id, supplier_name,
           received_qty, accepted_qty, rejected_qty, uom_id, uom_code, status, remarks)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,$10,'','PENDING_QC','Awaiting quality inspection')`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,$10,COALESCE((SELECT code FROM lookups WHERE id = $10), ''),
+               'PENDING_QC','Awaiting quality inspection')`,
       [
         grn.id, line.id, grn.grnNo, line.item_id, line.item_code, line.item_description,
         grn.supplierId, supplierName, line.grn_qty, line.uom_id,
       ],
+    );
+    // The inspection decides the split: a held line carries none until QC records a
+    // final decision (qc/routes.ts). It kept the accepted and rejected quantities the
+    // client sent, so a line nobody had inspected read 'accepted 8 / rejected 2'.
+    await tx.query(
+      `UPDATE grn_lines SET accepted_qty = NULL, rejected_qty = NULL, updated_at = now()
+        WHERE id = $1 AND (accepted_qty IS NOT NULL OR rejected_qty IS NOT NULL)`,
+      [line.id],
     );
     heldForQc += 1;
   }
@@ -1237,10 +1255,15 @@ async function updatePostedGrn(
       }
 
       const underQc = existing.qc_id != null;
+      // While its inspection is open a held line carries no split: one posted before
+      // 2026-10-18 may still hold the accepted and rejected quantities its client sent,
+      // and keeping them showed a split nobody had decided and failed the line's own
+      // CHECK (accepted + rejected = received) once the received quantity was corrected.
+      const qcOpen = underQc && isOpenQcStatus(existing.qc_status!);
       const newGrnQty = toQty(line.grnQty);
-      const newAccepted = underQc ? existing.accepted_qty
+      const newAccepted = qcOpen ? null : underQc ? existing.accepted_qty
         : line.acceptedQty == null || line.acceptedQty === '' ? null : toQty(line.acceptedQty);
-      const newRejected = underQc ? existing.rejected_qty
+      const newRejected = qcOpen ? null : underQc ? existing.rejected_qty
         : line.rejectedQty == null || line.rejectedQty === '' ? null : toQty(line.rejectedQty);
       const oldUsable = usableQtyOf(existing);
       const newUsable = usableQtyOf({ grn_qty: newGrnQty, accepted_qty: newAccepted });
@@ -1649,19 +1672,24 @@ router.post(
         message: reason,
       });
 
-      return { grnNo: grn.grn_no, poStatuses, wasPosted, linesReversed: toReverse.length, qcInspectionsClosed };
+      return {
+        grnNo: grn.grn_no, poStatuses, poCount: poIdsTouched.size, wasPosted, linesReversed: toReverse.length, qcInspectionsClosed,
+      };
     });
 
     const qcNote = result.qcInspectionsClosed > 0
       ? ` ${result.qcInspectionsClosed} open quality inspection(s) were closed.`
       : '';
+    // A Direct GRN touched no purchase order, so nothing returned to a PO balance: its
+    // cancel said so all the same (2026-10-17 E2E run, S3-D5).
+    const poNote = result.poCount > 0 ? ' its quantities returned to the purchase order balance' : '';
     sendOk(res, {
       ...result,
       message: !result.wasPosted
         ? `Draft GRN ${result.grnNo} has been cancelled.`
         : result.linesReversed > 0
-          ? `GRN ${result.grnNo} has been cancelled — its quantities returned to the purchase order balance and stock was reversed.${qcNote}`
-          : `GRN ${result.grnNo} has been cancelled — its quantities returned to the purchase order balance. ` +
+          ? `GRN ${result.grnNo} has been cancelled —${poNote}${poNote ? ' and' : ''} stock was reversed.${qcNote}`
+          : `GRN ${result.grnNo} has been cancelled${poNote ? ` —${poNote}` : ''}. ` +
             `None of its material had entered stock, so stock is unchanged.${qcNote}`,
     });
   }),

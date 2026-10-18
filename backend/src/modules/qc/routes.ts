@@ -276,10 +276,17 @@ router.post(
         throw BusinessRuleError(`QC Inspection for ${qi.item_code} on GRN ${qi.grn_no} has already been finalised and passed.`);
       }
 
-      const receivedNum = Number(qi.received_qty);
-      if (body.acceptedQty + body.rejectedQty > receivedNum) {
+      // Every quantity is compared as the database stores it (NUMERIC(18,4)), never as a
+      // JS float: 0.1 + 0.2 accepted and rejected of a 0.3 kg receipt added up to
+      // 0.30000000000000004 and the split was refused as exceeding what was received.
+      const accepted = toQty(body.acceptedQty);
+      const rejected = toQty(body.rejectedQty);
+      const split = dec(accepted).plus(dec(rejected));
+      const received = toQty(qi.received_qty);
+      const shown = (v: string) => dec(v).toString();
+      if (split.greaterThan(dec(received))) {
         throw ValidationError(
-          `Sum of accepted (${body.acceptedQty}) and rejected (${body.rejectedQty}) cannot exceed received quantity (${receivedNum}).`,
+          `Sum of accepted (${shown(accepted)}) and rejected (${shown(rejected)}) cannot exceed received quantity (${shown(received)}).`,
           [{ field: 'acceptedQty', message: 'Accepted + Rejected exceeds received quantity.' }],
         );
       }
@@ -299,10 +306,10 @@ router.post(
       // (chk_grn_accepted_rejected, migration 007) wants the two to add up to
       // the received quantity, so a short split used to fail as a bare
       // "violate a data rule" error, and so did every interim decision.
-      if (isFinal && toQty(dec(body.acceptedQty).plus(dec(body.rejectedQty))) !== toQty(qi.received_qty)) {
+      if (isFinal && !split.equals(dec(received))) {
         throw ValidationError(
-          `A final QC decision must account for the whole received quantity: accepted (${body.acceptedQty}) ` +
-          `+ rejected (${body.rejectedQty}) must equal received (${receivedNum}).`,
+          `A final QC decision must account for the whole received quantity: accepted (${shown(accepted)}) ` +
+          `+ rejected (${shown(rejected)}) must equal received (${shown(received)}).`,
           [{ field: 'acceptedQty', message: 'Accepted + Rejected must equal the received quantity.' }],
         );
       }
@@ -322,7 +329,7 @@ router.post(
                 updated_at = now()
           WHERE id = $1`,
         [
-          id, body.status, body.acceptedQty, body.rejectedQty,
+          id, body.status, accepted, rejected,
           req.user!.id, req.user!.employeeName, body.remarks,
           body.rejectionReason, body.nextAction,
         ],
@@ -335,12 +342,12 @@ router.post(
         `UPDATE grn_lines
             SET accepted_qty = $2, rejected_qty = $3, updated_at = now()
           WHERE id = $1`,
-        [qi.grn_line_id, isFinal ? body.acceptedQty : null, isFinal ? body.rejectedQty : null],
+        [qi.grn_line_id, isFinal ? accepted : null, isFinal ? rejected : null],
       );
 
       // If passed / accepted with deviation and acceptedQty > 0, release into usable stock!
       let stockMoved = false;
-      if (isPass && body.acceptedQty > 0) {
+      if (isPass && dec(accepted).greaterThan(0)) {
         const grnLine = await txQueryOne<{
           id: number; line_no: number; item_id: number; po_line_id: number | null; grn_qty: string;
           uom_id: number | null; batch_no: string; receipt_location: string;
@@ -355,7 +362,7 @@ router.post(
             item_id: grnLine.item_id,
             po_line_id: grnLine.po_line_id,
             grn_qty: qi.received_qty,
-            accepted_qty: String(body.acceptedQty),
+            accepted_qty: accepted,
             uom_id: grnLine.uom_id,
             batch_no: grnLine.batch_no ?? '',
             receipt_location: grnLine.receipt_location ?? '',
@@ -387,8 +394,8 @@ router.post(
         entityLabel: `${qi.grn_no} - ${qi.item_code}`,
         before: { status: qi.status },
         after: {
-          status: body.status, acceptedQty: body.acceptedQty,
-          rejectedQty: body.rejectedQty, overallQcStatus, stockMoved,
+          status: body.status, acceptedQty: accepted,
+          rejectedQty: rejected, overallQcStatus, stockMoved,
         },
         message: `QC inspection decision for ${qi.item_code} on GRN ${qi.grn_no}: ${body.status}.`,
       });

@@ -799,3 +799,66 @@ describe('Link store GRNs — audit batches', () => {
     expect(await statusOf('Z/LSG/00500')).toBe('OPEN');
   });
 });
+
+describe('Link store GRNs — what the GRN edit could not correct, and the item the tab names (2026-10-18)', () => {
+  // Z/LSG/00060 is short-closed; Z/LSG/00061's only line is closed. ZG/LSX/0003 was
+  // stored under a duplicate item row (LSG-T1) with the tab's code LSG-T2, and the PO
+  // register wrote a description into its PO line's code column: only the item the
+  // tab's code resolves to names that PO line.
+  beforeAll(async () => {
+    for (const code of ['LSG-SC', 'LSG-CL', 'LSG-T1', 'LSG-T2']) await mkItem(code, '50');
+    await mkPo('Z/LSG/00060', [['LSG-SC', '10']]);
+    await query(`UPDATE purchase_order_headers SET status = 'SHORT_CLOSED', close_reason = 'Balance not coming' WHERE id = $1`, [pos['Z/LSG/00060']!.id]);
+    await mkPo('Z/LSG/00061', [['LSG-CL', '10']]);
+    await query('UPDATE purchase_order_lines SET is_closed = TRUE WHERE id = $1', [pos['Z/LSG/00061']!.lines[0]]);
+    await mkPo('Z/LSG/00062', [['LSG-T2', '10', 'PO register text for T2']]);
+    await query(`UPDATE purchase_order_lines SET item_code = 'Copper rod as the register wrote it' WHERE id = $1`, [pos['Z/LSG/00062']!.lines[0]]);
+    await mkGrn('ZG/LSX/0001', [{ code: 'LSG-SC', qty: '2' }]);
+    await mkGrn('ZG/LSX/0002', [{ code: 'LSG-CL', qty: '2' }]);
+    await mkGrn('ZG/LSX/0003', [{ code: 'LSG-T1', storedCode: 'LSG-T2', qty: '3' }]);
+    grid = [
+      HEADER,
+      row('ZG/LSX/0001', 'LSG-SC', '2', 'Z/LSG/00060'),
+      row('ZG/LSX/0002', 'LSG-CL', '2', 'Z/LSG/00061'),
+      row('ZG/LSX/0003', 'LSG-T2', '3', 'Z/LSG/00062'),
+    ];
+  });
+
+  it('holds a receipt naming a short-closed PO or a closed PO line, saying which', async () => {
+    const d = await dryRun();
+    // Linked, neither receipt's quantity could be corrected again: the GRN edit re-checks
+    // a changed quantity against its PO line, which refuses both (assertGrnReceiptAllowed).
+    expect(heldOf(d, 'ZG/LSX/0001')).toMatchObject([
+      { reason: 'PO_NOT_RECEIVABLE', detail: 'Z/LSG/00060 is SHORT_CLOSED in the ERP.', poNos: ['Z/LSG/00060'] },
+    ]);
+    expect(heldOf(d, 'ZG/LSX/0002')).toMatchObject([
+      { reason: 'PO_NOT_RECEIVABLE', detail: 'Z/LSG/00061 line 1 (LSG-CL) is closed in the ERP.', poNos: ['Z/LSG/00061'] },
+    ]);
+    expect(linksOf(d, 'ZG/LSX/0001')).toEqual([]);
+    expect(linksOf(d, 'ZG/LSX/0002')).toEqual([]);
+  });
+
+  it("links through the item the tab's own code resolves to when nothing else names the PO line", async () => {
+    // The reviewer's mutation (2026-10-17): with the tab's resolved items left out of the
+    // match, every test still passed, as each PO line also matched the GRN line's own item.
+    const d = await dryRun();
+    expect(linksOf(d, 'ZG/LSX/0003')).toEqual(['LSG-T2>Z/LSG/00062']);
+    const res = await apply(d.selectionHash);
+    expect(res.status).toBe(200);
+    expect(Number(await poLineOf(grns['ZG/LSX/0003']!.lines[0]!))).toBe(pos['Z/LSG/00062']!.lines[0]);
+    expect(await poLineOf(grns['ZG/LSX/0001']!.lines[0]!)).toBeNull();
+    expect(await statusOf('Z/LSG/00060')).toBe('SHORT_CLOSED');
+  });
+
+  it('a held receipt keeps its quantity correctable from the GRN screen', async () => {
+    const id = grns['ZG/LSX/0001']!.id;
+    const doc = (await request(app).get(api(`/grn/${id}`)).set(auth(adminToken))).body.data;
+    const line = doc.lines[0];
+    const res = await request(app).put(api(`/grn/${id}`)).set(auth(adminToken)).send({
+      mode: doc.mode, supplierId: doc.supplier_id, post: true, remarks: 'Recounted',
+      lines: [{ id: line.id, itemId: line.item_id, grnQty: '3', rate: String(line.rate) }],
+    });
+    expect([res.status, res.body.error?.message]).toEqual([200, undefined]);
+    expect(Number((await query<{ q: string }>('SELECT grn_qty AS q FROM grn_lines WHERE id = $1', [line.id]))[0]!.q)).toBe(3);
+  });
+});

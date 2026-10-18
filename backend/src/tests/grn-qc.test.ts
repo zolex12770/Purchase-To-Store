@@ -624,3 +624,93 @@ describe('an edit overtaken by another user', () => {
     expect(await stockOf(qcItem)).toBe(0);
   });
 });
+
+/* ── 8. Fractional splits, held lines, units and Direct cancels (2026-10-17 E2E run) ── */
+
+describe('fractional QC splits, held lines, the unit and a Direct cancel', () => {
+  it('compares a fractional split as the database stores it, not as a JS float', async () => {
+    const qcItem = await mkItem('TGRNQC-N1', true);
+    const grn = await receive([{ itemId: qcItem, qty: '0.3' }]);
+    const id = Number((await inspectionsOf(grn.id))[0]!.id);
+    // 0.1 + 0.2 is 0.30000000000000004 as JS numbers: both decisions were refused as
+    // accepting and rejecting more than the 0.3 received.
+    const interim = await decide(id, { status: 'QC_IN_PROGRESS', acceptedQty: 0.1, rejectedQty: 0.2, rejectionReason: 'Two strands short' });
+    expect([interim.status, interim.body.error?.message]).toEqual([200, undefined]);
+    const over = await decide(id, { status: 'QC_PASSED', acceptedQty: 0.2, rejectedQty: 0.2, rejectionReason: 'Two strands short' });
+    expect(over.status).toBe(422);
+    expect(over.body.error.message).toBe('Sum of accepted (0.2) and rejected (0.2) cannot exceed received quantity (0.3).');
+    const final = await decide(id, { status: 'ACCEPTED_WITH_DEVIATION', acceptedQty: 0.1, rejectedQty: 0.2, rejectionReason: 'Two strands short' });
+    expect([final.status, final.body.error?.message]).toEqual([200, undefined]);
+    expect(final.body.data.stockMoved).toBe(true);
+    expect(await stockOf(qcItem)).toBeCloseTo(0.1, 6);
+    const [line] = await linesOf(grn.id);
+    expect([Number(line!.accepted_qty), Number(line!.rejected_qty)]).toEqual([0.1, 0.2]);
+  });
+
+  it('holds an inspected line without an accepted / rejected split until QC decides, whatever the client sent', async () => {
+    const qcItem = await mkItem('TGRNQC-N2', true);
+    const plain = await mkItem('TGRNQC-N3', false);
+    const r = await request(app).post(api('/grn')).set(auth(adminToken)).send({
+      mode: 'DIRECT', supplierId, post: true,
+      lines: [
+        { itemId: qcItem, grnQty: '10', rate: '10', acceptedQty: '8', rejectedQty: '2' },
+        { itemId: plain, grnQty: '5', rate: '10', acceptedQty: '4', rejectedQty: '1' },
+      ],
+    });
+    expect(r.status).toBe(201);
+    const grnId = Number(r.body.data.id);
+    const lines = await linesOf(grnId) as Array<GrnLine & { qc_inspection_status: string | null }>;
+    const held = lineOfItem(lines, qcItem) as GrnLine & { qc_inspection_status: string | null };
+    // Nobody had inspected it, yet it read 'accepted 8 / rejected 2'.
+    expect([held.accepted_qty, held.rejected_qty]).toEqual([null, null]);
+    expect(held.qc_inspection_status).toBe('PENDING_QC');
+    // A line nobody inspects keeps the store's own split, and only what it accepted is in stock.
+    const kept = lineOfItem(lines, plain) as GrnLine & { qc_inspection_status: string | null };
+    expect([Number(kept.accepted_qty), Number(kept.rejected_qty), kept.qc_inspection_status]).toEqual([4, 1, null]);
+    expect([await stockOf(plain), await stockOf(qcItem)]).toEqual([4, 0]);
+
+    // A split an earlier posting left on a held line goes with the next save, and the
+    // received quantity can then be corrected: kept, 8 + 2 failed the line's CHECK against 12.
+    await query('UPDATE grn_lines SET accepted_qty = 8, rejected_qty = 2 WHERE id = $1', [held.id]);
+    const saved = await editLines(grnId, [
+      { id: held.id, itemId: qcItem, grnQty: '12', rate: '10' },
+      { id: kept.id, itemId: plain, grnQty: '5', rate: '10', acceptedQty: '4', rejectedQty: '1' },
+    ]);
+    expect([saved.status, saved.body.error?.message]).toEqual([200, undefined]);
+    const after = lineOfItem(await linesOf(grnId), qcItem);
+    expect([after.accepted_qty, after.rejected_qty, Number(after.grn_qty)]).toEqual([null, null, 12]);
+    expect(Number((await inspectionsOf(grnId))[0]!.received_qty)).toBe(12);
+    expect(await stockOf(qcItem)).toBe(0);
+  });
+
+  it("records the line's unit on its inspection", async () => {
+    const qcItem = await mkItem('TGRNQC-N4', true);
+    const grn = await receive([{ itemId: qcItem, qty: '2' }]);
+    const [unit] = await query<{ code: string }>('SELECT code FROM lookups WHERE id = $1', [uomId]);
+    expect(unit!.code).not.toBe('');
+    // A literal '' was stored, and the QC queue showed '—' for the unit of every inspection.
+    const list = await request(app).get(api(`/qc/inspections?grnNo=${encodeURIComponent(grn.grnNo)}`)).set(auth(adminToken));
+    expect(list.status).toBe(200);
+    expect(list.body.data.map((i: { uom_code: string }) => i.uom_code)).toEqual([unit!.code]);
+  });
+
+  it('cancelling a Direct GRN does not say its quantities went back to a purchase order', async () => {
+    const plain = await mkItem('TGRNQC-N5', false);
+    const direct = await receive([{ itemId: plain, qty: '3' }]);
+    const r = await cancel(direct.id);
+    expect(r.status).toBe(200);
+    expect(r.body.data.poCount).toBe(0);
+    expect(r.body.data.message).toBe(`GRN ${direct.grnNo} has been cancelled — stock was reversed.`);
+
+    const po = await issuedPo(plain, '4');
+    const g = await request(app).post(api('/grn')).set(auth(adminToken))
+      .send({ mode: 'PO', post: true, lines: [{ poLineId: po.lineId, grnQty: '4' }] });
+    expect(g.status).toBe(201);
+    const c = await cancel(Number(g.body.data.id));
+    expect(c.status).toBe(200);
+    expect(c.body.data.poCount).toBe(1);
+    expect(c.body.data.message).toBe(
+      `GRN ${g.body.data.grn_no} has been cancelled — its quantities returned to the purchase order balance and stock was reversed.`,
+    );
+  });
+});
