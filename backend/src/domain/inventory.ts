@@ -183,6 +183,26 @@ export async function reverseInventoryMovement(
       itemStockAfter = after;
     }
   }
+  // The category figure gives back what the movement added under the rule an outward movement
+  // meets (recordInventoryMovement): not below zero. Only the Purchase item's stock was checked,
+  // so reversing a receipt whose stock had since been issued took the category to -5 (E2E S5-19).
+  // Locked after the Purchase item, the order recordInventoryMovement takes the two rows in.
+  const category = await txQueryOne<{ live_stock_qty: string }>(
+    tx,
+    `SELECT live_stock_qty FROM inventory_items
+      WHERE category = $1 AND upper(item_code) = upper($2)
+      FOR UPDATE`,
+    [t.category, t.item_code],
+  );
+  if (category && applied > 0) {
+    const categoryAfter = Math.round((Number(category.live_stock_qty) - applied) * 10000) / 10000;
+    if (categoryAfter < 0) {
+      throw ConflictError(
+        `Reversing ${t.txn_no} would take ${t.item_code}'s ${t.category} stock below zero: the category holds only ` +
+        `${Number(category.live_stock_qty)} of the ${applied} it added. Reverse the later issue first.`,
+      );
+    }
+  }
   await tx.query(
     `UPDATE inventory_items SET live_stock_qty = live_stock_qty - $3,
             available_qty = GREATEST(live_stock_qty - $3 - allocated_qty, 0), updated_at = now()

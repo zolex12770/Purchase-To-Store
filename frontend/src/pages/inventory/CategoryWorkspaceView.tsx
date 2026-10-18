@@ -11,10 +11,12 @@ import { DataTable, type Column } from '../../components/DataTable';
 import { StatTile } from '../../components/KpiCard';
 import {
   Button, Card, CardBody, Badge,
-  Modal, Field, Textarea, Select, Input
+  Modal, Field, Textarea, Select, Input, SearchSelect, type Option,
 } from '../../components/ui';
+import { useDebounced } from '../../components/simple';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
 import { describeSync, type SyncResult } from '../../lib/describeSync';
+import { rowById, rateAfterItemChoice } from '../../lib/inventoryForms';
 
 export type InventoryCategoryKey = 'RM' | 'FG' | 'WIP' | 'TRADING' | 'GENERAL';
 
@@ -158,13 +160,79 @@ interface CategorySummary {
 interface Props {
   category: InventoryCategoryKey;
   onOpenAdjustment?: (item: {
+    /** The Purchase item (items.id) the count is posted against. */
     id: number;
     code: string;
     description: string;
     category: string;
-    currentStock: number;
+    /** This workspace's own (sheet) figure, shown beside the book stock, never as it (E2E S5-18). */
+    sheetStock: number;
     uom: string;
   }) => void;
+}
+
+/** The item a movement is recorded against: a workspace row linked to a Purchase item. */
+interface MoveItem { id: number; code: string; desc: string; stock: number; uom: string; rate?: number; rowId?: number }
+
+/** A workspace row as the movement form needs it (the Receive / Issue row actions pass the same). */
+const moveItemOf = (r: CategoryItemRow & { item_id: number }): MoveItem => ({
+  id: r.item_id, code: r.item_code, desc: r.item_description, stock: Number(r.live_stock_qty || 0),
+  uom: r.primary_uom, rate: Number(r.unit_price || 0), rowId: r.id,
+});
+
+/**
+ * The item picker of a movement opened from a header button: this category's rows that are
+ * in the Purchase item master, the rows the Receive / Issue row actions offer. The header
+ * buttons opened the form with no item and no way to choose one, and Record did nothing at
+ * all (E2E S5-03, F19).
+ */
+function CategoryItemSelect({ category, value, onChange, invalid }: {
+  category: InventoryCategoryKey;
+  value: MoveItem | null;
+  onChange: (item: MoveItem) => void;
+  invalid?: boolean;
+}) {
+  const [term, setTerm] = useState('');
+  const settled = useDebounced(term.trim(), 250);
+  // Read afresh each time the form opens (gcTime 0: no rows kept from an earlier form), and under the
+  // workspace list's key, so a movement, reversal or sync refreshes it: the option's stock is what an
+  // issue is checked against, and a cached one went stale after the first receipt.
+  const { data, isFetching } = useQuery({
+    queryKey: ['inventory-category-items', category, 'pick', settled],
+    queryFn: () => api.getWithMeta<CategoryItemRow[], PageMeta>(
+      `/inventory/categories/${category}${qs({ search: settled || undefined, pageSize: 50, sortBy: 'item_code', sortDir: 'asc' })}`,
+    ),
+    gcTime: 0,
+  });
+  const rows = data?.data ?? [];
+  const linked = rows.filter((r): r is CategoryItemRow & { item_id: number } => r.item_id !== null);
+  const options: Option[] = linked.map((r) => ({
+    value: r.id,
+    label: r.item_code,
+    sublabel: r.item_description,
+    meta: `Stock: ${qty(r.live_stock_qty)} ${toShortUom(r.primary_uom)}`,
+  }));
+  const sheetOnly = rows.length - linked.length;
+  return (
+    <SearchSelect
+      value={value?.rowId ?? null}
+      options={options}
+      onSearch={setTerm}
+      searching={isFetching || term.trim() !== settled}
+      selectedOption={value?.rowId !== undefined ? { value: value.rowId, label: value.code, sublabel: value.desc } : null}
+      placeholder="Type the item code or name…"
+      invalid={invalid}
+      emptyText={
+        sheetOnly > 0
+          ? `${sheetOnly} match${sheetOnly === 1 ? '' : 'es'} only in the Google Sheet: record ${sheetOnly === 1 ? 'its' : 'their'} movements in the sheet.`
+          : term.trim() ? `No ${category} item matches. Check the item code or name.` : `Type the ${category} item code or name.`
+      }
+      onChange={(v) => {
+        const row = rowById(linked, v);
+        if (row) onChange(moveItemOf(row));
+      }}
+    />
+  );
 }
 
 interface SourceSubTab {
@@ -265,12 +333,17 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
 
   // Movement Modal State
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(false);
-  const [moveItem, setMoveItem] = useState<{ id: number; code: string; desc: string; stock: number; uom: string; rate?: number } | null>(null);
+  const [moveItem, setMoveItem] = useState<MoveItem | null>(null);
+  // Opened from a header button: the form asks for the item (CategoryItemSelect).
+  const [movePicksItem, setMovePicksItem] = useState(false);
+  const [moveItemError, setMoveItemError] = useState<string | null>(null);
   const [moveDirection, setMoveDirection] = useState<'IN' | 'OUT'>('IN');
   const [moveTxnType, setMoveTxnType] = useState('GRN_INWARD');
   const [moveQty, setMoveQty] = useState('');
   const [moveWeightKg, setMoveWeightKg] = useState('');
   const [moveRate, setMoveRate] = useState('');
+  // Whether the user typed the rate; otherwise it is the chosen item's own (rateAfterItemChoice).
+  const [moveRateTyped, setMoveRateTyped] = useState(false);
   const [moveLocation, setMoveLocation] = useState('');
   const [moveDepartment, setMoveDepartment] = useState('');
   const [moveRefDoc, setMoveRefDoc] = useState('');
@@ -414,11 +487,10 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     onError: (err) => toast.fromError(err, 'Failed to reverse the movement'),
   });
 
-  const openMoveModal = (
-    item: { id: number; code: string; desc: string; stock: number; uom: string; rate?: number } | null,
-    direction: 'IN' | 'OUT'
-  ) => {
+  const openMoveModal = (item: MoveItem | null, direction: 'IN' | 'OUT') => {
     setMoveItem(item);
+    setMovePicksItem(item === null);
+    setMoveItemError(null);
     setMoveDirection(direction);
     setMoveTxnType(
       direction === 'IN'
@@ -428,6 +500,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     setMoveQty('');
     setMoveWeightKg('');
     setMoveRate(item?.rate ? String(item.rate) : '');
+    setMoveRateTyped(false);
     setMoveLocation('');
     setMoveDepartment('');
     setMoveRefDoc('');
@@ -437,7 +510,10 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
 
   const handlePostMovement = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!moveItem) return;
+    if (!moveItem) {
+      setMoveItemError(moveDirection === 'IN' ? 'Choose the item received.' : 'Choose the item issued.');
+      return;
+    }
     const qNum = Number(moveQty);
     if (isNaN(qNum) || qNum <= 0) {
       toast.error('Please enter a valid positive quantity');
@@ -677,7 +753,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                     code: r.item_code,
                     description: r.item_description,
                     category: r.category,
-                    currentStock: Number(r.live_stock_qty || 0),
+                    sheetStock: Number(r.live_stock_qty || 0),
                     uom: r.primary_uom,
                   })
                 }
@@ -861,15 +937,19 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
             </div>
 
             <div className="row" style={{ gap: 'var(--sp-2)', flexWrap: 'wrap' }}>
-              <Button
-                variant="secondary"
-                size="sm"
-                icon={<Download size={13} />}
-                onClick={() => void exportCategoryCsv()}
-                title={`Export ${category} Stock Register to CSV`}
-              >
-                Export CSV
-              </Button>
+              {/* Only with the export right, as the register's and the ledger's export buttons;
+                  a Purchase User was offered it (E2E S5-07c), and the server now refuses it. */}
+              {can('inventory.export') && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={<Download size={13} />}
+                  onClick={() => void exportCategoryCsv()}
+                  title={`Export ${category} Stock Register to CSV`}
+                >
+                  Export CSV
+                </Button>
+              )}
 
               {can('inventory.adjust') && (
                 <>
@@ -1342,6 +1422,26 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
           onClose={() => setIsMoveModalOpen(false)}
         >
           <form onSubmit={handlePostMovement} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-3)' }}>
+            {movePicksItem && (
+              <Field
+                label="Item"
+                required
+                error={moveItemError ?? undefined}
+                hint={`An item of the ${category} stock that is in the Purchase item master.`}
+              >
+                <CategoryItemSelect
+                  category={category}
+                  value={moveItem}
+                  invalid={Boolean(moveItemError)}
+                  onChange={(it) => {
+                    setMoveItem(it);
+                    setMoveItemError(null);
+                    setMoveRate((r) => rateAfterItemChoice(r, moveRateTyped, it.rate));
+                  }}
+                />
+              </Field>
+            )}
+
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--sp-3)' }}>
               <Field label="Transaction Type" required>
                 <Select value={moveTxnType} onChange={(e) => setMoveTxnType(e.target.value)}>
@@ -1380,7 +1480,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                   placeholder="e.g. 50"
                   value={moveQty}
                   onChange={(e) => setMoveQty(e.target.value)}
-                  autoFocus
+                  autoFocus={!movePicksItem}
                 />
               </Field>
 
@@ -1404,7 +1504,10 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                   step="0.01"
                   placeholder="e.g. 450"
                   value={moveRate}
-                  onChange={(e) => setMoveRate(e.target.value)}
+                  onChange={(e) => {
+                    setMoveRate(e.target.value);
+                    setMoveRateTyped(true);
+                  }}
                 />
               </Field>
 
