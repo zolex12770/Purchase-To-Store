@@ -77,40 +77,57 @@ const REQUISITION_ALLOCATION_JOIN = `LEFT JOIN (
          GROUP BY rl.item_id
       ) req ON req.item_id = i.id`;
 
+/** The register's one stock-status rule, used by its rows, counts, summary and export, and by
+    the Overview's stock-status tiles, which open the register filtered by it. The CSV kept its
+    own copy, which had drifted: it marked 1,759 items BELOW_REORDER that the screen showed as
+    NORMAL (2026-10-16). */
+const AVAILABLE_SQL = 'GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0))';
+
+const STOCK_STATUS_SQL = `CASE
+                 WHEN ${AVAILABLE_SQL} < COALESCE(i.min_stock, 0)
+                      OR (COALESCE(i.min_stock, 0) > 0 AND ${AVAILABLE_SQL} = 0)
+                   THEN 'CRITICAL'
+                 WHEN ${AVAILABLE_SQL} <= COALESCE(i.reorder_level, 0)
+                      AND COALESCE(i.reorder_level, 0) > 0
+                   THEN 'BELOW_REORDER'
+                 WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
+                      AND ${AVAILABLE_SQL} > i.max_stock
+                   THEN 'EXCESS'
+                 ELSE 'NORMAL'
+               END`;
+
 /* ── GET /inventory/overview ────────────────────────────────────────────────── */
 
 router.get(
   '/overview',
   requireAnyPermission('inventory.view', 'auto_indent.view'),
   asyncHandler(async (_req, res) => {
-    // 1. Overall stock health stats
+    // 1. Overall stock health stats. The four stock-status tiles count the register's own
+    // status (STOCK_STATUS_SQL), one per item. They kept their own conditions, and Excess Stock
+    // counted every item above its max stock, also one the register reads as CRITICAL or
+    // BELOW_REORDER (a reorder level above max stock is accepted), so that tile opened a
+    // register without the item and the tiles added up to more than the items (review of the
+    // C06 follow-up, 2026-10-18).
     const statsSql = `
       SELECT
         COUNT(*)::int AS total_items,
-        COALESCE(SUM(i.live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
-        COALESCE(SUM(i.live_stock_qty * ${VALUATION_RATE_SQL}), 0)::numeric(18, 2) AS total_valuation,
-        COUNT(CASE WHEN i.live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
-        COUNT(CASE WHEN i.live_stock_qty > 0 THEN 1 END)::int AS positive_stock_count,
-        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                     OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0)
-                   THEN 1 END)::int AS critical_stock,
-        COUNT(CASE WHEN GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0)
-                     AND COALESCE(i.reorder_level, 0) > 0
-                     AND NOT (GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                              OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0))
-                   THEN 1 END)::int AS below_reorder,
-        COUNT(CASE WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
-                     AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock
-                   THEN 1 END)::int AS excess_stock,
-        COUNT(CASE WHEN NOT (GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) <= COALESCE(i.reorder_level, 0) AND COALESCE(i.reorder_level, 0) > 0)
-                     AND NOT (GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) < COALESCE(i.min_stock, 0)
-                              OR (COALESCE(i.min_stock, 0) > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) = 0))
-                     AND NOT (i.max_stock IS NOT NULL AND i.max_stock > 0 AND GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0)) > i.max_stock)
-                   THEN 1 END)::int AS normal_stock
-        FROM items i
-        ${REQUISITION_ALLOCATION_JOIN}
-        ${SHEET_RATE_JOIN}
-       WHERE i.deleted_at IS NULL AND i.is_active = TRUE
+        COALESCE(SUM(t.live_stock_qty), 0)::numeric(18, 4) AS total_stock_qty,
+        COALESCE(SUM(t.live_stock_qty * t.valuation_rate), 0)::numeric(18, 2) AS total_valuation,
+        COUNT(CASE WHEN t.live_stock_qty = 0 THEN 1 END)::int AS zero_stock_count,
+        COUNT(CASE WHEN t.live_stock_qty > 0 THEN 1 END)::int AS positive_stock_count,
+        COUNT(CASE WHEN t.stock_status = 'CRITICAL' THEN 1 END)::int AS critical_stock,
+        COUNT(CASE WHEN t.stock_status = 'BELOW_REORDER' THEN 1 END)::int AS below_reorder,
+        COUNT(CASE WHEN t.stock_status = 'EXCESS' THEN 1 END)::int AS excess_stock,
+        COUNT(CASE WHEN t.stock_status = 'NORMAL' THEN 1 END)::int AS normal_stock
+        FROM (
+          SELECT i.live_stock_qty,
+                 ${VALUATION_RATE_SQL} AS valuation_rate,
+                 ${STOCK_STATUS_SQL} AS stock_status
+            FROM items i
+            ${REQUISITION_ALLOCATION_JOIN}
+            ${SHEET_RATE_JOIN}
+           WHERE i.deleted_at IS NULL AND i.is_active = TRUE
+        ) t
     `;
     const stats = await queryOne<Record<string, unknown>>(statsSql);
 
@@ -247,24 +264,6 @@ router.get(
     });
   }),
 );
-
-/** The register's one stock-status rule, used by its rows, counts, summary and export.
-    The CSV kept its own copy, which had drifted: it marked 1,759 items BELOW_REORDER that
-    the screen showed as NORMAL (2026-10-16). */
-const AVAILABLE_SQL = 'GREATEST(0, i.live_stock_qty - COALESCE(req.allocated_qty, 0))';
-
-const STOCK_STATUS_SQL = `CASE
-                 WHEN ${AVAILABLE_SQL} < COALESCE(i.min_stock, 0)
-                      OR (COALESCE(i.min_stock, 0) > 0 AND ${AVAILABLE_SQL} = 0)
-                   THEN 'CRITICAL'
-                 WHEN ${AVAILABLE_SQL} <= COALESCE(i.reorder_level, 0)
-                      AND COALESCE(i.reorder_level, 0) > 0
-                   THEN 'BELOW_REORDER'
-                 WHEN i.max_stock IS NOT NULL AND i.max_stock > 0
-                      AND ${AVAILABLE_SQL} > i.max_stock
-                   THEN 'EXCESS'
-                 ELSE 'NORMAL'
-               END`;
 
 /* ── GET /inventory/stock ───────────────────────────────────────────────────── */
 
