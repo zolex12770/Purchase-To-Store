@@ -4,6 +4,7 @@ import { runDownload } from './useDownload';
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -26,6 +27,26 @@ function fakeDocument() {
   return saved;
 }
 
+/**
+ * A body whose parts arrive `at` ms after the answer and that ends at `endAt` (never, if
+ * not given). As Chromium does, a read the request's abort cuts off rejects with a plain
+ * AbortError, not with the abort's reason.
+ */
+function arrivingBody(signal: AbortSignal, parts: { at: number; text: string }[], endAt?: number): ReadableStream<Uint8Array> {
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const bytes = new TextEncoder();
+      for (const { at, text } of parts) timers.push(setTimeout(() => controller.enqueue(bytes.encode(text)), at));
+      if (endAt !== undefined) timers.push(setTimeout(() => controller.close(), endAt));
+      signal.addEventListener('abort', () => {
+        timers.forEach(clearTimeout);
+        controller.error(new DOMException('The user aborted a request.', 'AbortError'));
+      }, { once: true });
+    },
+  });
+}
+
 // C12 (F15; S1-D5, S1-D6, S1-D7, S3-D2, S4-D7): a failed download showed nothing and left
 // "TypeError: Failed to fetch" uncaught.
 describe('downloadFile', () => {
@@ -45,6 +66,66 @@ describe('downloadFile', () => {
     await vi.advanceTimersByTimeAsync(90_000);
     const err = shown(await pending);
     expect([err.isApiError, err.status, err.code]).toEqual([true, 0, 'TIMEOUT']);
+  });
+
+  it('is TIMEOUT when the limit fired, though the browser rejects the fetch with a plain AbortError', async () => {
+    vi.useFakeTimers();
+    // A browser without abort reasons rejects with "The user aborted a request.", not with the
+    // limit's TimeoutError; it was passed on as the caller's own abort, which nobody reports.
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal!.addEventListener('abort', () => reject(new DOMException('The user aborted a request.', 'AbortError')));
+    })));
+    const pending = downloadFile('/io/export/indents?format=csv', 'indents.csv').catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(90_000);
+    const err = shown(await pending);
+    expect([err.isApiError, err.status, err.code]).toEqual([true, 0, 'TIMEOUT']);
+  });
+
+  // C12 follow-up (review of 2026-10-18): the 90-s limit also covered the body, so a ~100 MB
+  // backup over a link slower than about 1.1 MB/s was cut off at 90 s; Chromium rejected the
+  // read with a plain AbortError, taken for the caller's own abort, and nothing was said.
+  it('saves a large file over a slow link however long it takes, while its parts keep arriving', async () => {
+    vi.useFakeTimers();
+    const saved = fakeDocument();
+    const files: Blob[] = [];
+    vi.spyOn(URL, 'createObjectURL').mockImplementation((file) => { files.push(file as Blob); return 'blob:test'; });
+    // A part every 40 s and the end at 170 s: no wait for one part reaches 90 s, the transfer does.
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => new Response(
+      arrivingBody(init.signal!, [40_000, 80_000, 120_000, 160_000].map((at, i) => ({ at, text: `part${i + 1};` })), 170_000),
+      { status: 200, headers: { 'content-disposition': 'attachment; filename="zolex-backup-803.json"', 'content-type': 'application/json' } },
+    )));
+    const outcome = downloadFile('/backup/803/download', 'backup.json').then(() => 'saved', (e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(170_000);
+    expect(await outcome).toBe('saved');
+    expect(saved).toEqual(['zolex-backup-803.json']);
+    expect(files.map((f) => f.type)).toEqual(['application/json']);
+    expect(await files[0]!.text()).toBe('part1;part2;part3;part4;');
+  });
+
+  it('ends a body that stops arriving for the whole limit with TIMEOUT, though the read rejects with a plain AbortError', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => new Response(
+      arrivingBody(init.signal!, [{ at: 10_000, text: 'part1;' }]),
+      { status: 200 },
+    )));
+    let settled = false;
+    const pending = downloadFile('/backup/803/download', 'backup.json').catch((e: unknown) => e).finally(() => { settled = true; });
+    // 99 s in, 89 s since the last part: still waiting.
+    await vi.advanceTimersByTimeAsync(99_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const err = shown(await pending);
+    expect([err.isApiError, err.status, err.code]).toEqual([true, 0, 'TIMEOUT']);
+    expect(err.message).toBe('The file stopped arriving: nothing came for 90 seconds. Check the network connection and try again.');
+  });
+
+  it('a connection lost while the file arrives is NETWORK_ERROR', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      new ReadableStream<Uint8Array>({ pull(controller) { controller.error(new TypeError('network error')); } }),
+      { status: 200 },
+    )));
+    const err = shown(await downloadFile('/backup/803/download', 'backup.json').catch((e: unknown) => e));
+    expect([err.isApiError, err.status, err.code]).toEqual([true, 0, 'NETWORK_ERROR']);
   });
 
   it('a refusal keeps the server\'s code and words', async () => {
@@ -92,11 +173,17 @@ describe('runDownload (what useDownload runs on a click)', () => {
     expect(report).toHaveBeenCalledTimes(2);
   });
 
-  it('resolves true and reports nothing when the file was saved, or when the caller aborted', async () => {
+  it('resolves true and reports nothing when the file was saved', async () => {
     const report = vi.fn();
     await expect(runDownload(async () => undefined, report)).resolves.toBe(true);
-    await expect(runDownload(async () => { throw new DOMException('aborted', 'AbortError'); }, report)).resolves.toBe(false);
     expect(report).not.toHaveBeenCalled();
+  });
+
+  it('reports an AbortError too: no caller can abort a download (C12 follow-up)', async () => {
+    const report = vi.fn();
+    const aborted = new DOMException('The user aborted a request.', 'AbortError');
+    await expect(runDownload(async () => { throw aborted; }, report)).resolves.toBe(false);
+    expect(report).toHaveBeenCalledWith(aborted);
   });
 });
 

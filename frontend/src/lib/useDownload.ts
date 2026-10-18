@@ -12,15 +12,17 @@ import { useToast } from '../components/Toast';
 
 /**
  * Runs `fetchFile`; a failure goes to `report` and the result is false. Never rejects.
- * The caller's own abort is not a failure to report. Apart from the hook so it is
- * unit-tested (useDownload.test.ts).
+ * Every failure is reported, an AbortError too: no caller can abort a download, and this
+ * let pass in silence the plain AbortError of a body read the time limit had cut off (a
+ * backup over a slow link ended with no file and no word, C12 follow-up). Apart from the
+ * hook so it is unit-tested (useDownload.test.ts).
  */
 export async function runDownload(fetchFile: () => Promise<void>, report: (err: unknown) => void): Promise<boolean> {
   try {
     await fetchFile();
     return true;
   } catch (err) {
-    if (!(err instanceof DOMException && err.name === 'AbortError')) report(err);
+    report(err);
     return false;
   }
 }
