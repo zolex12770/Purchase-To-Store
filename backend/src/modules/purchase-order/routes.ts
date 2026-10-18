@@ -163,8 +163,9 @@ export const PO_FROM = `
 
 /**
  * The same rows as PO_FROM (the balance view has one row per order) without the view, for
- * queries that read no balance column and would otherwise total every order's receipts
- * just to filter: the KPI cards run the list's totals four times per dashboard load.
+ * a query that reads no balance column and would otherwise total every order's receipts
+ * just to filter: the KPI line filter (analytics poLineFilter) selects its orders through
+ * it. Not poListTotals: see there.
  */
 export const PO_ROWS_FROM = `
   FROM purchase_order_headers h
@@ -200,6 +201,12 @@ export interface PoListTotals {
  *
  * `db` is a transaction when several totals must come from one moment (the receipt
  * evidence summary's parts and their whole).
+ *
+ * The orders are read through PO_FROM although no balance column is used: without the
+ * view (PO_ROWS_FROM, commit 5ee235d) the planner adds up the Pending view's lines in a
+ * nested loop, order by order, and its totals took 36 -> 45 ms with no filter and 36 -> 43
+ * ms for one department on the 2026-10-17 copy (24,297 buffer hits against 1,027), on the
+ * Pending PO list and the pending KPI card alike (2026-10-18 measurement).
  */
 export async function poListTotals(q: PoListFilter, db?: Queryable): Promise<PoListTotals> {
   const b = buildPoFilter(q);
@@ -215,7 +222,7 @@ export async function poListTotals(q: PoListFilter, db?: Queryable): Promise<PoL
             COALESCE(SUM(tl.open_pending_amount), 0) AS pending,
             COALESCE(SUM(tl.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
             COALESCE(SUM(tl.amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"
-       ${PO_ROWS_FROM}
+       ${PO_FROM}
        LEFT JOIN v_po_line_balance tl ON tl.po_id = h.id${scope ? ` AND ${scope}` : ''}
        ${b.where()}`,
     b.params,
