@@ -17,6 +17,8 @@
  *   5. C19 (S5-19): reversing a receipt is refused while its category figure has been issued.
  *   6. C22 (S5-17b): the Overview's Total Stock Valuation is the register's own total.
  *   7. C30 (S5-07c): the stock, ledger and category exports need inventory.export.
+ *   8. Review of the C06 follow-up (2026-10-18): the Overview's stock-status tiles count each
+ *      item once, under the status the register gives it.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
@@ -430,5 +432,36 @@ describe('the inventory exports need inventory.export (C30, E2E S5-07c)', () => 
       expect(r.status, path).toBe(200);
       expect(r.headers['content-type']).toContain('text/csv');
     }
+  });
+});
+
+/* ── 8. The Overview's stock-status tiles split the items as the register does ── */
+
+describe("the Overview's stock-status tiles (review of the C06 follow-up, 2026-10-18)", () => {
+  it('count each item once, under the status the register gives it', async () => {
+    // Reorder level 10 above max stock 5 (the item master checks only min <= max), stocked to
+    // 7: the register reads BELOW_REORDER, which it puts before EXCESS. The Overview counted the
+    // item under Below Reorder and again under Excess Stock, whose tile opens a register filtered
+    // to EXCESS that does not list it, and the four tiles added up to more than the items.
+    type Kpis = Record<string, number>;
+    const before = (await get('/inventory/overview')).body.data.kpis as Kpis;
+    const itemId = await mkItem('TINV2-TILES', { reorderLevel: '10', maxStock: '5' });
+    await receive(itemId, '7');
+    expect((await registerRow(itemId)).stock_status).toBe('BELOW_REORDER');
+
+    const overview = await get('/inventory/overview');
+    expect(overview.status).toBe(200);
+    const after = overview.body.data.kpis as Kpis;
+    const tiles = (k: Kpis) => [k.criticalStock, k.belowReorder, k.excessStock, k.normalStock];
+    expect(tiles(after).map((n, i) => n - tiles(before)[i]!)).toEqual([0, 1, 0, 0]);
+    expect(tiles(after).reduce((a, n) => a + n, 0)).toBe(after.totalItems);
+
+    const register = await get('/inventory/stock');
+    expect(register.status).toBe(200);
+    const summary = register.body.meta.summary as Kpis;
+    expect(tiles(after)).toEqual(tiles(summary));
+    const excess = await get('/inventory/stock?stockStatus=EXCESS&pageSize=200');
+    expect((excess.body.data as { item_id: number }[]).map((r) => Number(r.item_id))).not.toContain(itemId);
+    expect(excess.body.meta.total).toBe(after.excessStock);
   });
 });

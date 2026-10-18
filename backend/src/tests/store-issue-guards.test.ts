@@ -21,6 +21,11 @@
  *      held negative demand in the stock figures, so it lowered its item's allocated
  *      stock and raised the stock shown available for every other line. The register,
  *      its export, the Overview and the stock scan count each open line at zero or more.
+ *   7. Review of the C06 follow-up (2026-10-18): an over-issue on one line closed the
+ *      whole requisition (FULLY_ISSUED once the issued total reached the requested
+ *      total), so another line with nothing issued left the stock figures and both
+ *      store queues. A requisition is fully issued when every line is; migration 032
+ *      re-derives the ones the old rule closed early.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
@@ -336,6 +341,126 @@ describe('an over-issued line holds no stock in the stock figures (C06 follow-up
   it('the requisition itself still shows the over-issue', async () => {
     const line = (await requisition(reqA.id)).lines[0] as Record<string, string>;
     expect([Number(line.issued_qty), Number(line.pending_qty), Number(line.excess_qty)]).toEqual([8, 0, 2]);
+  });
+});
+
+describe('an over-issue on one line leaves the other lines waiting (review of the C06 follow-up, 2026-10-18)', () => {
+  // Item X has 10 in stock; item Y has 2 and min stock 1. Requisition [X 1, Y 2] is approved
+  // and the store issues 4 of X (Rule 24). 4 issued reached the 3 requested in total, so the
+  // requisition read FULLY_ISSUED (store status ISSUED) with nothing of Y issued, and every
+  // figure that counts only APPROVED and PARTIALLY_ISSUED requisitions let Y's line go: the
+  // register showed Y's 2 available and the item NORMAL, and the line left the store's queue
+  // and the store-queue list, though the detail page still offered it for issue.
+  type QueueRow = { requisition_line_id: number; balance_to_issue: string };
+  let xId = 0;
+  let yId = 0;
+  let req = { id: 0, lineIds: [] as number[] };
+  let ySlipId = 0;
+  const yRow = async () => {
+    const r = await request(app).get(api(`/inventory/stock?itemId=${yId}`)).set(auth(adminToken));
+    expect(r.status).toBe(200);
+    const row = r.body.data[0] as Record<string, string>;
+    return [Number(row.live_stock_qty), Number(row.allocated_stock_qty), Number(row.available_stock_qty), row.stock_status];
+  };
+  const statusOf = async () => {
+    const doc = await requisition(req.id);
+    return [doc.status, doc.store_status];
+  };
+  /** This requisition's lines in the store's queue (GET /inventory/requisition-queue), with their balance. */
+  const queueLines = async () => {
+    const r = await request(app).get(api('/inventory/requisition-queue')).set(auth(storeToken));
+    expect(r.status).toBe(200);
+    return (r.body.data as QueueRow[])
+      .filter((q) => req.lineIds.includes(Number(q.requisition_line_id)))
+      .map((q) => [Number(q.requisition_line_id), Number(q.balance_to_issue)]);
+  };
+  /** The requisitions with a line for Y in the requisition list's store queue. */
+  const storeQueue = async () => {
+    const r = await request(app).get(api(`/requisitions?view=store-queue&itemId=${yId}`)).set(auth(adminToken));
+    expect(r.status).toBe(200);
+    return (r.body.data as { id: number }[]).map((h) => Number(h.id));
+  };
+
+  beforeAll(async () => {
+    xId = await mkItem('TSIG-NET-X');
+    yId = await mkItem('TSIG-NET-Y', undefined, { minStock: '1' });
+    await stockUp(xId, '10');
+    await stockUp(yId, '2');
+    req = await approvedRequisition([{ itemId: xId, qty: '1' }, { itemId: yId, qty: '2' }]);
+    expect(await yRow()).toEqual([2, 2, 0, 'CRITICAL']);
+  });
+
+  it('4 of X issued: the requisition is PARTIALLY_ISSUED and its store status PENDING, Y having 2 to come', async () => {
+    const r = await issue(req.id, [{ requisitionLineId: req.lineIds[0]!, issueQty: '4', expectedIssuedQty: '0' }]);
+    expect(r.status).toBe(201);
+    expect(r.body.data.status).toBe('PARTIALLY_ISSUED');
+    expect(await statusOf()).toEqual(['PARTIALLY_ISSUED', 'PENDING']);
+    const lines = (await requisition(req.id)).lines as Record<string, string>[];
+    expect(lines.map((l) => [Number(l.issued_qty), Number(l.pending_qty)])).toEqual([[4, 0], [0, 2]]);
+  });
+
+  it("Y's 2 stay allocated: the register reads 2 live, 2 allocated, 0 available, CRITICAL", async () => {
+    expect(await yRow()).toEqual([2, 2, 0, 'CRITICAL']);
+  });
+
+  it("Y's line stays in the store's queue, and the requisition in the store-queue list", async () => {
+    expect(await queueLines()).toEqual([[req.lineIds[1], 2]]);
+    expect(await storeQueue()).toEqual([req.id]);
+  });
+
+  it("Y's 2 issued: FULLY_ISSUED and ISSUED, nothing allocated, out of both queues", async () => {
+    const r = await issue(req.id, [{ requisitionLineId: req.lineIds[1]!, issueQty: '2', expectedIssuedQty: '0' }]);
+    expect(r.status).toBe(201);
+    expect(r.body.data.status).toBe('FULLY_ISSUED');
+    ySlipId = Number(r.body.data.issueId);
+    expect(await statusOf()).toEqual(['FULLY_ISSUED', 'ISSUED']);
+    expect(await yRow()).toEqual([0, 0, 0, 'CRITICAL']);
+    expect(await queueLines()).toEqual([]);
+    expect(await storeQueue()).toEqual([]);
+  });
+
+  it("Y's slip reversed: back to PARTIALLY_ISSUED and PENDING, Y's 2 allocated and in the queue again", async () => {
+    const r = await request(app).post(api(`/requisitions/${req.id}/issues/${ySlipId}/reverse`)).set(auth(storeToken))
+      .send({ reason: 'Issued to the wrong machine' });
+    expect(r.status).toBe(200);
+    expect(r.body.data.status).toBe('PARTIALLY_ISSUED');
+    expect(await statusOf()).toEqual(['PARTIALLY_ISSUED', 'PENDING']);
+    expect(await yRow()).toEqual([2, 2, 0, 'CRITICAL']);
+    expect(await queueLines()).toEqual([[req.lineIds[1], 2]]);
+    expect(await storeQueue()).toEqual([req.id]);
+  });
+
+  it('migration 032 sets a requisition the old rule left FULLY_ISSUED with a line to issue back to PARTIALLY_ISSUED, and nothing else', async () => {
+    const fs = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { splitStatements } = await import('../db/migrate.js');
+    const sql = fs.readFileSync(fileURLToPath(new URL('../db/migrations/032_requisition_fully_issued_every_line.sql', import.meta.url)), 'utf8');
+    const backfill = splitStatements(sql).filter((s) => /^\s*UPDATE requisition_headers/m.test(s));
+    expect(backfill).toHaveLength(1);
+
+    // [X 1, Y 2] with 4 of X issued, stored as the old rule left it.
+    const netted = await approvedRequisition([{ itemId: xId, qty: '1' }, { itemId: yId, qty: '2' }]);
+    expect((await issue(netted.id, [{ requisitionLineId: netted.lineIds[0]!, issueQty: '4' }])).status).toBe(201);
+    await query(`UPDATE requisition_headers SET status = 'FULLY_ISSUED' WHERE id = $1`, [netted.id]);
+    // Every line issued in full, one of them over.
+    await stockUp(yId, '3');
+    const full = await approvedRequisition([{ itemId: xId, qty: '1' }, { itemId: yId, qty: '2' }]);
+    expect((await issue(full.id, [
+      { requisitionLineId: full.lineIds[0]!, issueQty: '1' }, { requisitionLineId: full.lineIds[1]!, issueQty: '3' },
+    ])).status).toBe(201);
+    // Nothing issued yet.
+    const waiting = await approvedRequisition([{ itemId: xId, qty: '1' }, { itemId: yId, qty: '2' }]);
+
+    const ids = [netted.id, full.id, waiting.id, req.id];
+    const statuses = async () => {
+      const rows = await query<{ id: string; status: string }>('SELECT id, status FROM requisition_headers WHERE id = ANY($1::bigint[])', [ids]);
+      return ids.map((id) => rows.find((r) => Number(r.id) === id)!.status);
+    };
+    expect(await statuses()).toEqual(['FULLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
+    await query(backfill[0]!);
+    expect(await statuses()).toEqual(['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
+    await query(backfill[0]!);
+    expect(await statuses()).toEqual(['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
   });
 });
 
