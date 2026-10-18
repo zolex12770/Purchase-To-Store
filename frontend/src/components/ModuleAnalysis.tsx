@@ -14,7 +14,8 @@ import { useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Printer, Download } from 'lucide-react';
-import { api, qs, downloadFile } from '../lib/api';
+import { api, qs } from '../lib/api';
+import { useDownload } from '../lib/useDownload';
 import { useFilters, drilldownLink, type FilterState } from '../lib/useFilters';
 import { periodRange, isDrillable, kpiPanelState } from '../lib/analysis';
 import { PageHeader, PrintHeader } from '../layout/AppShell';
@@ -86,6 +87,7 @@ export function ModuleAnalysis({
   dimensions, drilldownRoute, breakdown: config, filterKeys, statusOptions, ageingBasis, ageingTitle, exportDataset,
 }: ModuleAnalysisProps) {
   const navigate = useNavigate();
+  const download = useDownload();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
   const [dimension, setDimension] = useState(dimensions[0]!.key);
   const [granularity, setGranularity] = useState<'day' | 'week' | 'month'>('month');
@@ -162,7 +164,7 @@ export function ModuleAnalysis({
             {exportDataset && (
               <Button
                 variant="secondary" size="sm" icon={<Download size={13} />}
-                onClick={() => void downloadFile(`/io/export/${exportDataset}?format=xlsx${query.replace('?', '&')}`, `${exportDataset}.xlsx`)}
+                onClick={() => void download(`/io/export/${exportDataset}?format=xlsx${query.replace('?', '&')}`, `${exportDataset}.xlsx`, 'Could not export')}
               >
                 Export
               </Button>

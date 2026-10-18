@@ -190,14 +190,10 @@ describe('runDownload (what useDownload runs on a click)', () => {
 describe('every click that downloads goes through useDownload', () => {
   // Raw sources of every page and component, read by Vite at test time.
   const sources = import.meta.glob(['../pages/**/*.tsx', '../components/**/*.tsx'], { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
-  // Track T3 owns this file's KPI error state in the same change round; its one Export
-  // button moves to useDownload there (see the T4 report).
-  const OWNED_ELSEWHERE = new Set(['../components/ModuleAnalysis.tsx']);
 
   it('no handler starts downloadFile and forgets it', () => {
     expect(Object.keys(sources).length).toBeGreaterThan(40);
     const offenders = Object.entries(sources)
-      .filter(([file]) => !OWNED_ELSEWHERE.has(file))
       .flatMap(([file, text]) => text.split('\n').map((line, i) => [file, i + 1, line] as const))
       .filter(([, , line]) => /void\s+downloadFile\(/.test(line))
       .map(([file, line]) => `${file}:${line}`);
