@@ -329,12 +329,15 @@ export const DATASETS: Record<string, DatasetDef> = {
       b.addIn('h.id', q.ids);
       const scope = poLineScope(q, b, 'v');
       return {
+        // Pending GRN Qty is what the list's Pending Qty tile adds up: the line's balance
+        // while it is still to be received on an issued, open order (migration 031), so
+        // a short-closed or cancelled order's lines add nothing, as on its PO screen.
         sql: `SELECT v.po_no, v.po_date, pt.name AS po_type_name, s.supplier_name,
                      (SELECT string_agg(DISTINCT src.indent_no, ', ')
                         FROM v_po_line_sources src WHERE src.po_line_id = v.po_line_id) AS source_indents,
                      v.line_no, v.item_code, v.item_description, v.po_qty, u.code AS uom_code,
                      v.rate, v.discount_pct, v.final_rate, v.amount, v.received_qty,
-                     v.pending_grn_qty, v.item_specification, v.line_status
+                     v.open_pending_qty AS pending_grn_qty, v.item_specification, v.line_status
                 FROM v_po_line_balance v
                 JOIN suppliers s ON s.id = v.supplier_id
                 LEFT JOIN lookups pt ON pt.id = v.po_type_id

@@ -230,7 +230,7 @@ export interface LinkPlan {
   };
   /** Every PO, by stored status: now, and once the affected POs carry their derived status. */
   poStatusCounts: { before: Record<string, number>; after: Record<string, number> };
-  /** The dashboard's Pending PO Value (Σ pending_amount over receivable lines), before and after. */
+  /** The dashboard's Pending PO Value (Σ open_pending_amount: lines still to be received on issued orders), before and after. */
   pendingValue: { before: string; after: string };
   /** sha256 over the links, the PO-line figures they were checked against, the header changes and the review choices. */
   selectionHash: string;
@@ -319,8 +319,11 @@ type PoLineRow = {
 
 /**
  * Each affected PO before and after the links, with v_po_line_balance's arithmetic and
- * v_po_header_balance's status rule: $2 lists the quantity each PO line would gain.
+ * v_po_header_balance's rules: pending is what an issued, open order still has to receive
+ * on its open lines (open_pending_qty, migration 031), the status is derived from the raw
+ * balance. $2 lists the quantity each PO line would gain.
  */
+const OPEN_LINE = (rcv: string) => `h.status IN ('OPEN', 'PARTIALLY_RECEIVED') AND NOT l.is_closed AND l.po_qty - ${rcv} > 0`;
 const PO_FIGURES_SQL = `
   WITH added AS (
     SELECT a.po_line_id, SUM(a.qty) AS qty
@@ -333,12 +336,10 @@ const PO_FIGURES_SQL = `
      WHERE b.po_id = ANY($1::bigint[])
   )
   SELECT h.id AS po_id, h.po_no, h.status,
-         COALESCE(SUM(GREATEST(l.po_qty - l.rcv0, 0)), 0)::text AS pending_qty_before,
-         COALESCE(SUM(GREATEST(l.po_qty - l.rcv1, 0)), 0)::text AS pending_qty_after,
-         COALESCE(SUM(round(GREATEST(l.po_qty - l.rcv0, 0) * l.final_rate, 2))
-           FILTER (WHERE h.status NOT IN ('CANCELLED', 'SHORT_CLOSED') AND NOT l.is_closed AND l.po_qty - l.rcv0 > 0), 0)::text AS pending_value_before,
-         COALESCE(SUM(round(GREATEST(l.po_qty - l.rcv1, 0) * l.final_rate, 2))
-           FILTER (WHERE h.status NOT IN ('CANCELLED', 'SHORT_CLOSED') AND NOT l.is_closed AND l.po_qty - l.rcv1 > 0), 0)::text AS pending_value_after,
+         COALESCE(SUM(l.po_qty - l.rcv0) FILTER (WHERE ${OPEN_LINE('l.rcv0')}), 0)::text AS pending_qty_before,
+         COALESCE(SUM(l.po_qty - l.rcv1) FILTER (WHERE ${OPEN_LINE('l.rcv1')}), 0)::text AS pending_qty_after,
+         COALESCE(SUM(round((l.po_qty - l.rcv0) * l.final_rate, 2)) FILTER (WHERE ${OPEN_LINE('l.rcv0')}), 0)::text AS pending_value_before,
+         COALESCE(SUM(round((l.po_qty - l.rcv1) * l.final_rate, 2)) FILTER (WHERE ${OPEN_LINE('l.rcv1')}), 0)::text AS pending_value_after,
          CASE WHEN h.status IN ('DRAFT', 'CANCELLED', 'SHORT_CLOSED') THEN h.status
               WHEN COALESCE(SUM(GREATEST(l.po_qty - l.rcv1, 0)), 0) <= 0 AND COUNT(l.po_id) > 0 THEN 'COMPLETED'
               WHEN COALESCE(SUM(l.rcv1), 0) > 0 THEN 'PARTIALLY_RECEIVED'
@@ -686,8 +687,10 @@ export async function planStoreGrnLinks(
     after[p.statusBefore] = (after[p.statusBefore] ?? 0) - 1;
     after[p.statusAfter] = (after[p.statusAfter] ?? 0) + 1;
   }
+  // The dashboard's Pending PO Value with no filter: open lines of issued orders only
+  // (migration 031), so a draft's lines are not counted as they were here.
   const [pending] = await run<{ value: string }>(
-    'SELECT COALESCE(SUM(pending_amount) FILTER (WHERE is_receivable), 0)::text AS value FROM v_po_line_balance', [],
+    'SELECT COALESCE(SUM(open_pending_amount), 0)::text AS value FROM v_po_line_balance', [],
   );
   const pendingBefore = dec(pending?.value ?? 0);
   const pendingDrop = affectedPos.reduce((s, p) => s.plus(dec(p.pendingValueBefore)).minus(dec(p.pendingValueAfter)), dec(0));

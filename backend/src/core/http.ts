@@ -196,6 +196,9 @@ export const universalFilterSchema = z.object({
   itemTypeId: csvIdArray,
   userId: csvIdArray,
   hodId: csvIdArray,
+  /** A requisition's machine (requisition headers only): Requisition Analysis sent it and
+      zod dropped it, so its KPIs and breakdowns ignored it while the list it opened applied it. */
+  machineId: csvIdArray,
   qcStatus: csvArray,
   status: csvArray,
 });

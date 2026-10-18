@@ -228,10 +228,11 @@ beforeAll(async () => {
   ids.indentMixed = await indentOf(ids.dept, [[ids.a, '3'], [ids.b, '5']], true);
   await approve(ids.indentMixed);
 
-  /* Requisitions: pending with the HOD, approved, approved then cancelled, a draft. */
-  const requisition = async (submit: boolean, lines: Array<[number, string]>) => {
+  /* Requisitions: pending with the HOD, approved (on a machine), approved then cancelled, a draft. */
+  ids.machine = await mk('MACHINE', 'KPI-M1', 'KPI Press 1');
+  const requisition = async (submit: boolean, lines: Array<[number, string]>, machineId?: number) => {
     const res = await request(app).post('/api/v1/requisitions').set(auth(adminToken)).send({
-      requesterUserId: ids.requester, costCentreId: ids.cc, submit,
+      requesterUserId: ids.requester, costCentreId: ids.cc, submit, machineId,
       lines: lines.map(([itemId, requestedQty]) => ({ itemId, requestedQty })),
     });
     expect(res.status).toBe(201);
@@ -242,7 +243,7 @@ beforeAll(async () => {
     expect(res.status).toBe(200);
   };
   await requisition(true, [[ids.a, '2'], [ids.b, '1']]);
-  ids.reqApproved = await requisition(true, [[ids.b, '3']]);
+  ids.reqApproved = await requisition(true, [[ids.b, '3']], ids.machine);
   await hodApprove(ids.reqApproved);
   ids.reqCancelled = await requisition(true, [[ids.a, '1']]);
   await hodApprove(ids.reqCancelled);
@@ -294,6 +295,9 @@ describe('Each KPI equals the list it opens', () => {
     ['an HOD', { hodId: '__hod__' }],
     ['a department and a supplier', { departmentId: '__dept__', supplierId: '__s2__' }],
     ['a department and a main group no single line has', { departmentId: '__dept2__', mainGroupId: '__mg__' }],
+    // Requisition Analysis sends its machine filter; the requisition figures dropped it
+    // while the list they open applied it (2026-10-17 review). Purchase figures ignore it.
+    ['a machine', { machineId: '__machine__' }],
   ];
 
   for (const [name, raw] of contexts) {

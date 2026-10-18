@@ -89,7 +89,9 @@ export const listSchema = listQuerySchema.extend({
  * A PO line still to be received: on an issued, open order (a DRAFT was never sent to
  * the supplier), not closed, with quantity outstanding. The Pending view, the overdue
  * filter and the pending KPIs (analytics) share this one rule, so a pending KPI opens
- * exactly the orders it counts. `alias` is a v_po_line_balance row.
+ * exactly the orders it counts. `alias` is a v_po_line_balance row, whose
+ * open_pending_qty / open_pending_amount are its pending figures under this same rule
+ * (migration 031) and are what every pending total adds up.
  */
 export const pendingLineSql = (alias: string): string =>
   `${alias}.is_receivable AND ${alias}.po_status IN ('OPEN', 'PARTIALLY_RECEIVED')`;
@@ -182,6 +184,11 @@ export interface PoListTotals {
  * `po_value_total` metric means (ADR-009 — one definition per KPI). Cancelled
  * value is reported separately so nothing is hidden from the user.
  *
+ * Pending adds up only what is still to be received on an issued, open order
+ * (open_pending_qty / open_pending_amount, migration 031: the pendingLineSql rule), as
+ * the rows above it now do. It added up every non-cancelled line, so a short-closed
+ * order's balance swelled 'Committed pending receipt' (2026-10-17 E2E run, S2-D1).
+ *
  * `db` is a transaction when several totals must come from one moment (the receipt
  * evidence summary's parts and their whole).
  */
@@ -194,9 +201,9 @@ export async function poListTotals(q: PoListFilter, db?: Queryable): Promise<PoL
             (COUNT(tl.po_line_id) FILTER (WHERE h.status <> 'CANCELLED'))::int AS "lineCount",
             COALESCE(SUM(tl.po_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPoQty",
             COALESCE(SUM(tl.received_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalReceivedQty",
-            COALESCE(SUM(tl.pending_grn_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPendingQty",
+            COALESCE(SUM(tl.open_pending_qty), 0) AS "totalPendingQty",
             COALESCE(SUM(tl.amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS value,
-            COALESCE(SUM(tl.pending_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS pending,
+            COALESCE(SUM(tl.open_pending_amount), 0) AS pending,
             COALESCE(SUM(tl.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
             COALESCE(SUM(tl.amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"
        ${PO_FROM}
