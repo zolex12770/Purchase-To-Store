@@ -280,22 +280,32 @@ export async function recomputeIndentClosure(tx: Queryable, indentId: number): P
 /**
  * Re-derives an approved requisition's store status from its POSTED issue slips
  * (v_requisition_header_balance ignores reversed ones): nothing issued ->
- * APPROVED, everything requested issued -> FULLY_ISSUED, otherwise
+ * APPROVED, every line issued in full -> FULLY_ISSUED, otherwise
  * PARTIALLY_ISSUED. Called after every issue and every issue reversal, both of
  * which change what the requisition has received, so the header is always
  * stamped. Any other status (draft, pending, rejected, cancelled) is a decision
  * a person made and is left alone. The derived status is written without
  * assertRequisitionTransition on purpose: issued -> APPROVED is not in the
  * transition table, which keeps it out of reach of the approve action.
+ *
+ * "Every line" is total_pending_qty = 0: each line's balance at zero or more,
+ * summed. Comparing the issued total with the requested total let an over-issue
+ * on one line (Rule 24) stand in for another line nothing was issued against:
+ * [X 1, Y 2] with 4 of X issued read FULLY_ISSUED, and the stock figures and both
+ * store queues, which count only APPROVED and PARTIALLY_ISSUED requisitions,
+ * dropped Y's line (review of the C06 follow-up, 2026-10-18). Migration 032 gives
+ * the view's store_status the same rule and re-derives the requisitions the old
+ * one closed early.
  */
 export async function recomputeRequisitionStatus(
   tx: Queryable,
   requisitionId: number,
   userId: number | null,
 ): Promise<{ from: string; to: string; totalRequested: string; totalIssued: string }> {
-  const row = await txQueryOne<{ status: string; total_requested_qty: string; total_issued_qty: string }>(
+  const row = await txQueryOne<{ status: string; total_requested_qty: string; total_issued_qty: string; total_pending_qty: string }>(
     tx,
-    'SELECT status, total_requested_qty, total_issued_qty FROM v_requisition_header_balance WHERE requisition_id = $1',
+    `SELECT status, total_requested_qty, total_issued_qty, total_pending_qty
+       FROM v_requisition_header_balance WHERE requisition_id = $1`,
     [requisitionId],
   );
   if (!row) throw NotFoundError('Requisition');
@@ -303,9 +313,8 @@ export async function recomputeRequisitionStatus(
   if (!['APPROVED', 'PARTIALLY_ISSUED', 'FULLY_ISSUED'].includes(row.status)) {
     return { from: row.status, to: row.status, ...totals };
   }
-  const issued = dec(row.total_issued_qty);
-  const to = !issued.greaterThan(0) ? 'APPROVED'
-    : issued.greaterThanOrEqualTo(dec(row.total_requested_qty)) ? 'FULLY_ISSUED'
+  const to = !dec(row.total_issued_qty).greaterThan(0) ? 'APPROVED'
+    : !dec(row.total_pending_qty).greaterThan(0) ? 'FULLY_ISSUED'
       : 'PARTIALLY_ISSUED';
   await tx.query(
     'UPDATE requisition_headers SET status = $2, updated_at = now(), updated_by = $3 WHERE id = $1',
