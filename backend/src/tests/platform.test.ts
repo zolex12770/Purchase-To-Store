@@ -138,6 +138,32 @@ describe('export and import refusals (C36)', () => {
   });
 });
 
+/* ── C41: the filter bar names a record that arrives in the address by id ───── */
+
+describe('the item and supplier searches name records by id (C41)', () => {
+  it('returns exactly the records asked for, inactive ones too, under the same right', async () => {
+    const [active] = await query<{ id: string }>(`INSERT INTO items (item_code, item_description, is_active) VALUES ('T4-ID-A', 'Platform item active', TRUE) RETURNING id`);
+    const [inactive] = await query<{ id: string }>(`INSERT INTO items (item_code, item_description, is_active) VALUES ('T4-ID-B', 'Platform item inactive', FALSE) RETURNING id`);
+    const [sup] = await query<{ id: string }>(`INSERT INTO suppliers (supplier_code, supplier_name, is_active) VALUES ('T4-SUP-ID', 'Platform supplier by id', FALSE) RETURNING id`);
+
+    const items = await request(app).get(api(`/items/search?ids=${active!.id},${inactive!.id}&limit=2`)).set(auth(adminToken));
+    expect(items.status).toBe(200);
+    expect(items.body.data.map((r: { item_code: string }) => r.item_code)).toEqual(['T4-ID-A', 'T4-ID-B']);
+    // The typeahead itself still offers active items only.
+    const typed = await request(app).get(api('/items/search?q=T4-ID')).set(auth(adminToken));
+    expect(typed.body.data.map((r: { item_code: string }) => r.item_code)).toEqual(['T4-ID-A']);
+
+    const suppliers = await request(app).get(api(`/suppliers/search?ids=${sup!.id}&limit=1`)).set(auth(adminToken));
+    expect(suppliers.status).toBe(200);
+    expect(suppliers.body.data).toEqual([expect.objectContaining({ id: expect.anything(), supplier_name: 'Platform supplier by id' })]);
+
+    // Nothing that is not an id reaches the query; the right is the search's own.
+    const junk = await request(app).get(api('/items/search?ids=abc&limit=5')).set(auth(adminToken));
+    expect(junk.status).toBe(200);
+    expect((await request(app).get(api(`/suppliers/search?ids=${sup!.id}`)).set(auth(viewerToken))).status).toBe(403);
+  });
+});
+
 /* ── 2. C01: planner statistics kept current ────────────────────────────────── */
 
 describe('planner statistics while the server runs (C01)', () => {

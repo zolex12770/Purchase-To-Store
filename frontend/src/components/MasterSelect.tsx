@@ -10,12 +10,13 @@
  *
  * These wrap `SearchSelect` with a server search (`/items/search`,
  * `/suppliers/search`), debounced, and always keep the currently chosen record
- * showing even when it is not part of the latest result list.
+ * showing even when it is not part of the latest result list. A search the server
+ * refuses or that fails says so in place of "No item found" (C40).
  */
 import { useMemo, useState } from 'react';
 import { SearchSelect, type Option } from './ui';
 import { useDebounced } from './simple';
-import { useItemSearch, useSupplierSearch, type ItemOption, type SupplierOption } from '../lib/masters';
+import { useItemSearch, useSupplierSearch, masterSearchEmptyText, type ItemOption, type SupplierOption } from '../lib/masters';
 
 export function ItemSelect({
   value, onChange, selectedCode, selectedDescription, placeholder = 'Type item code or name…',
@@ -34,7 +35,7 @@ export function ItemSelect({
 }) {
   const [term, setTerm] = useState('');
   const settled = useDebounced(term.trim(), 250);
-  const { data, isFetching } = useItemSearch(settled);
+  const { data, isFetching, error } = useItemSearch(settled);
 
   const options = useMemo<Option[]>(
     () => (data ?? [])
@@ -58,7 +59,7 @@ export function ItemSelect({
       placeholder={placeholder}
       disabled={disabled}
       invalid={invalid}
-      emptyText={term.trim() ? 'No item found. Check the item code or name.' : 'Type the item code or name to search.'}
+      emptyText={masterSearchEmptyText('item', term.trim(), error)}
       onChange={(v) => {
         if (v === null) { onChange(null, null); return; }
         const id = Number(v);
@@ -81,7 +82,7 @@ export function SupplierSelect({
 }) {
   const [term, setTerm] = useState('');
   const settled = useDebounced(term.trim(), 250);
-  const { data, isFetching } = useSupplierSearch(settled);
+  const { data, isFetching, error } = useSupplierSearch(settled);
 
   const options = useMemo<Option[]>(
     () => (data ?? []).map((s) => ({
@@ -101,7 +102,7 @@ export function SupplierSelect({
       placeholder={placeholder}
       disabled={disabled}
       invalid={invalid}
-      emptyText={term.trim() ? 'No supplier found. Check the name.' : 'Type the supplier name to search.'}
+      emptyText={masterSearchEmptyText('supplier', term.trim(), error)}
       onChange={(v) => {
         if (v === null) { onChange(null, null); return; }
         const id = Number(v);

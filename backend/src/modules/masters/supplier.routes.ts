@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { query, queryOne, withTransaction, txQueryOne, SqlBuilder } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery,
-  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam,
+  parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvIdArray,
 } from '../../core/http.js';
 import { NotFoundError, ConflictError } from '../../core/errors.js';
 import { requirePermission } from '../../auth/middleware.js';
@@ -117,18 +117,25 @@ router.get(
 router.get(
   '/search',
   requirePermission('supplier.view'),
-  validateQuery(z.object({ q: z.string().trim().max(120).optional(), limit: z.coerce.number().int().min(1).max(50).default(20) })),
+  validateQuery(z.object({
+    q: z.string().trim().max(120).optional(),
+    limit: z.coerce.number().int().min(1).max(50).default(20),
+    // Names the records a filter holds by id (a drill-down's ?supplierId=), inactive ones
+    // too: the filter bar showed "Supplier: #10039" for any not in its results (C41).
+    ids: csvIdArray,
+  })),
   asyncHandler(async (_req, res) => {
-    const { q, limit } = parsedQuery<{ q?: string; limit: number }>(res);
-    const term = `%${(q ?? '').toLowerCase()}%`;
+    const { q, limit, ids } = parsedQuery<{ q?: string; limit: number; ids?: number[] }>(res);
+    const match = ids
+      ? { sql: 'id = ANY($1::bigint[])', param: ids }
+      : { sql: `is_active = TRUE AND ($1 = '%%' OR lower(supplier_name) LIKE $1 OR lower(supplier_code) LIKE $1 OR lower(gst_no) LIKE $1)`, param: `%${(q ?? '').toLowerCase()}%` };
     const rows = await query(
       `SELECT id, supplier_code, supplier_name, address, city, state, payment_terms, currency_code, gst_no, mobile_no, email
          FROM suppliers
-        WHERE deleted_at IS NULL AND is_active = TRUE
-          AND ($1 = '%%' OR lower(supplier_name) LIKE $1 OR lower(supplier_code) LIKE $1 OR lower(gst_no) LIKE $1)
+        WHERE deleted_at IS NULL AND ${match.sql}
         ORDER BY supplier_name
         LIMIT $2`,
-      [term, limit],
+      [match.param, limit],
     );
     sendOk(res, rows);
   }),
