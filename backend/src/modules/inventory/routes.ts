@@ -963,10 +963,11 @@ router.post(
    used to be live stock less EVERY open line's balance, this line's own included,
    so a line needing 2 with 3 on hand and nothing else waiting read 1 and
    "Shortage" (2026-10-17 E2E S4-07b), and an over-issued line counted as negative
-   demand. Live stock less only the OTHER lines' balances would still mark both of
-   two lines needing 6 against 10 on hand as short, though the first can be issued
-   now; in queue order the first reads 10 and the second 4. Every line in the
-   window has a positive balance (the WHERE below), so nothing over-issued counts. */
+   demand. Live stock less only the OTHER lines' balances calls a line covered only
+   when the stock covers every open line of the item, so of two lines needing 6
+   against 10 on hand both would read short, though the first can be issued now;
+   in queue order the first reads 10 and the second 4. Every line in the window
+   has a positive balance (the WHERE below), so nothing over-issued counts. */
 
 router.get(
   '/requisition-queue',

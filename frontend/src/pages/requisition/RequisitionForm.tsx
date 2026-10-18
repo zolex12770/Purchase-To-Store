@@ -208,9 +208,7 @@ export default function RequisitionForm() {
     },
     onSuccess: (res, vars) => {
       toast.success(
-        vars.submit
-          ? (mode === 'returned' ? 'Requisition resubmitted for HOD approval' : 'Requisition submitted for HOD approval')
-          : isEdit ? 'Requisition saved' : 'Requisition created',
+        vars.submit ? 'Requisition submitted for HOD approval' : isEdit ? 'Requisition saved' : 'Requisition created',
         res.requisition_no,
       );
       void qc.invalidateQueries({ queryKey: ['requisitions'] });
