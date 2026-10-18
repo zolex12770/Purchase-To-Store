@@ -12,6 +12,8 @@
  *   3. S4-24b: the direct-issue slip wrote what users typed straight into its HTML,
  *      and a cancelled issue's slip did not say so. The print documents now go out
  *      with a policy that lets them run and load nothing.
+ *   4. S1-06: the requisition list names the raiser and the HOD of each row, so the
+ *      screen can offer the HOD decisions to that HOD only.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
@@ -28,6 +30,8 @@ let query: Q;
 let adminToken = '';
 let storeToken = '';
 let adminUserId = 0;
+let storeUserId = 0;
+let deptId = 0;
 let uomId = 0;
 let supplierId = 0;
 const PASSWORD = 'StoreIss@Test2026';
@@ -99,6 +103,8 @@ beforeAll(async () => {
     password: PASSWORD, mustChangePassword: false, roleIds: [roles.find((x) => x.code === 'STORE_USER')!.id],
   });
   expect(store.status).toBe(201);
+  storeUserId = Number(store.body.data.id);
+  deptId = Number(dept.body.data.id);
   storeToken = await login('T-SIG-STORE', PASSWORD);
 });
 
@@ -304,6 +310,20 @@ describe('the direct-issue slip (S4-24b)', () => {
     expect(slip.text).toContain('Reason: Issued to the wrong &lt;dept&gt;');
     expect(slip.text).toContain('this slip no longer counts as issued');
     expect(slip.text).toContain(`<title>Direct Store Issue Slip - ${issueNo} (cancelled)</title>`);
+  });
+});
+
+describe('the requisition list says who raised each requisition and who decides it (E2E S1-06)', () => {
+  it('returns requester_user_id and hod_user_id, so the list offers the HOD decisions only to that HOD', async () => {
+    const itemId = await mkItem('TSIG-LIST');
+    expect((await request(app).put(api(`/requisitions/departments/${deptId}/hod`)).set(auth(adminToken)).send({ hodUserId: adminUserId })).status).toBe(200);
+    const created = await request(app).post(api('/requisitions')).set(auth(storeToken))
+      .send({ remarks: 'list', submit: true, lines: [{ itemId, requestedQty: '1' }] });
+    expect(created.status).toBe(201);
+    const list = await request(app).get(api('/requisitions?search=TSIG-LIST')).set(auth(adminToken));
+    expect(list.status).toBe(200);
+    const row = (list.body.data as { id: number; requester_user_id: number; hod_user_id: number }[]).find((r) => r.id === created.body.data.id);
+    expect(row).toMatchObject({ requester_user_id: storeUserId, hod_user_id: adminUserId });
   });
 });
 
