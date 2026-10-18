@@ -143,9 +143,13 @@ router.get(
       `SELECT COUNT(DISTINCT indent_id)::int AS count, COALESCE(SUM(pending_qty), 0)::numeric(18, 4) AS qty
          FROM v_indent_line_balance WHERE indent_status IN ('APPROVED', 'PENDING_APPROVAL')`,
     );
+    // 'Pipeline POs (Awaiting GRN)': orders a supplier still has to deliver against, the
+    // Pending PO list's rule (open_pending_qty, migration 031), so the card counts the
+    // orders /purchase-orders/pending lists. It counted drafts, which no supplier has
+    // seen and no GRN can receive (2026-10-17 E2E run, S5-D8).
     const posSummary = await queryOne<{ count: string; qty: string }>(
-      `SELECT COUNT(DISTINCT po_id)::int AS count, COALESCE(SUM(pending_grn_qty), 0)::numeric(18, 4) AS qty
-         FROM v_po_line_balance WHERE is_receivable = TRUE`,
+      `SELECT COUNT(DISTINCT po_id)::int AS count, COALESCE(SUM(open_pending_qty), 0)::numeric(18, 4) AS qty
+         FROM v_po_line_balance WHERE open_pending_qty > 0`,
     );
     const reqsSummary = await queryOne<{ count: string; qty: string }>(
       `SELECT COUNT(DISTINCT rh.id)::int AS count, COALESCE(SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)), 0)::numeric(18, 4) AS qty
@@ -316,6 +320,10 @@ router.get(
          WHERE indent_status IN ('APPROVED', 'PENDING_APPROVAL')
          GROUP BY item_id
       ) ind ON ind.item_id = i.id
+      -- The register's Pending POs is supply in the pipeline, drafts included, as Pending
+      -- Indents counts indents still awaiting approval: a draft PO already holds its
+      -- indents' quantity (v_indent_line_balance), so leaving it out here would drop that
+      -- quantity from both columns, and the stock scan would suggest ordering it again.
       LEFT JOIN (
         SELECT item_id, SUM(pending_grn_qty) AS pending_po_qty
           FROM v_po_line_balance
@@ -1144,6 +1152,8 @@ router.post(
            WHERE indent_status IN ('APPROVED', 'PENDING_APPROVAL')
            GROUP BY item_id
         ) ind ON ind.item_id = i.id
+        -- Drafts included, as in the register: a draft PO holds its indents' quantity, so
+        -- without it that supply would be suggested again.
         LEFT JOIN (
           SELECT item_id, SUM(pending_grn_qty) AS pending_po_qty
             FROM v_po_line_balance

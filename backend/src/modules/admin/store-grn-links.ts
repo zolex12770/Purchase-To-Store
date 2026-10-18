@@ -14,8 +14,11 @@
  *   · its GRN number and item are on the tab, the item matched as the engine's GRN
  *     reconciliation matches it: the resolved item, the code or the description;
  *   · every tab row for it names the same one PO (a blank or '-' names none);
- *   · that PO is in the ERP, is neither DRAFT nor CANCELLED (neither can hold a
- *     receipt), and has exactly one line for the item, matched the same way;
+ *   · that PO is in the ERP, is neither DRAFT, CANCELLED nor SHORT_CLOSED (none can
+ *     hold a receipt), and has exactly one line for the item, matched the same way,
+ *     and that line is not closed. A receipt linked to a short-closed PO or a closed
+ *     line could never have its quantity corrected again: the GRN edit re-checks a
+ *     changed quantity against the PO line (assertGrnReceiptAllowed), which refuses both;
  *   · the PO is the GRN's supplier's: the ERP's own receipt takes a PO GRN's supplier
  *     from its PO and never mixes two. A GRN the import gave its placeholder supplier
  *     is exempt, and so are two supplier records the reviewer confirms are one
@@ -89,7 +92,7 @@ export const HOLD_REASONS = {
   NO_PO_NAMED: 'A tab row for it names no PO (blank or -).',
   SEVERAL_POS: 'Its tab rows name more than one PO.',
   PO_NOT_IN_ERP: 'The PO the tab names is not in the ERP.',
-  PO_NOT_RECEIVABLE: 'The PO the tab names is DRAFT or CANCELLED in the ERP and cannot hold a receipt.',
+  PO_NOT_RECEIVABLE: 'The PO the tab names is DRAFT, CANCELLED or SHORT_CLOSED in the ERP, or its line for the item is closed, and cannot hold a receipt.',
   ITEM_NOT_ON_PO: 'The PO the tab names has no line for this item.',
   SEVERAL_PO_LINES: 'The PO the tab names has more than one line for this item.',
   SUPPLIER_MISMATCH: "The PO the tab names is another supplier's, and the two supplier records are not confirmed as one company (sameSupplierPairs).",
@@ -227,7 +230,7 @@ export interface LinkPlan {
   };
   /** Every PO, by stored status: now, and once the affected POs carry their derived status. */
   poStatusCounts: { before: Record<string, number>; after: Record<string, number> };
-  /** The dashboard's Pending PO Value (Σ pending_amount over receivable lines), before and after. */
+  /** The dashboard's Pending PO Value (Σ open_pending_amount: lines still to be received on issued orders), before and after. */
   pendingValue: { before: string; after: string };
   /** sha256 over the links, the PO-line figures they were checked against, the header changes and the review choices. */
   selectionHash: string;
@@ -311,13 +314,16 @@ type GrnLineRow = {
 type PoHeaderRow = { id: number; po_no: string; key: string; status: string; po_date: string; supplier_id: number; supplier_name: string };
 type PoLineRow = {
   po_line_id: number; po_id: number; line_no: number; item_id: number; item_code: string; item_description: string;
-  po_qty: string; received_qty: string;
+  po_qty: string; received_qty: string; is_closed: boolean;
 };
 
 /**
  * Each affected PO before and after the links, with v_po_line_balance's arithmetic and
- * v_po_header_balance's status rule: $2 lists the quantity each PO line would gain.
+ * v_po_header_balance's rules: pending is what an issued, open order still has to receive
+ * on its open lines (open_pending_qty, migration 031), the status is derived from the raw
+ * balance. $2 lists the quantity each PO line would gain.
  */
+const OPEN_LINE = (rcv: string) => `h.status IN ('OPEN', 'PARTIALLY_RECEIVED') AND NOT l.is_closed AND l.po_qty - ${rcv} > 0`;
 const PO_FIGURES_SQL = `
   WITH added AS (
     SELECT a.po_line_id, SUM(a.qty) AS qty
@@ -330,12 +336,10 @@ const PO_FIGURES_SQL = `
      WHERE b.po_id = ANY($1::bigint[])
   )
   SELECT h.id AS po_id, h.po_no, h.status,
-         COALESCE(SUM(GREATEST(l.po_qty - l.rcv0, 0)), 0)::text AS pending_qty_before,
-         COALESCE(SUM(GREATEST(l.po_qty - l.rcv1, 0)), 0)::text AS pending_qty_after,
-         COALESCE(SUM(round(GREATEST(l.po_qty - l.rcv0, 0) * l.final_rate, 2))
-           FILTER (WHERE h.status NOT IN ('CANCELLED', 'SHORT_CLOSED') AND NOT l.is_closed AND l.po_qty - l.rcv0 > 0), 0)::text AS pending_value_before,
-         COALESCE(SUM(round(GREATEST(l.po_qty - l.rcv1, 0) * l.final_rate, 2))
-           FILTER (WHERE h.status NOT IN ('CANCELLED', 'SHORT_CLOSED') AND NOT l.is_closed AND l.po_qty - l.rcv1 > 0), 0)::text AS pending_value_after,
+         COALESCE(SUM(l.po_qty - l.rcv0) FILTER (WHERE ${OPEN_LINE('l.rcv0')}), 0)::text AS pending_qty_before,
+         COALESCE(SUM(l.po_qty - l.rcv1) FILTER (WHERE ${OPEN_LINE('l.rcv1')}), 0)::text AS pending_qty_after,
+         COALESCE(SUM(round((l.po_qty - l.rcv0) * l.final_rate, 2)) FILTER (WHERE ${OPEN_LINE('l.rcv0')}), 0)::text AS pending_value_before,
+         COALESCE(SUM(round((l.po_qty - l.rcv1) * l.final_rate, 2)) FILTER (WHERE ${OPEN_LINE('l.rcv1')}), 0)::text AS pending_value_after,
          CASE WHEN h.status IN ('DRAFT', 'CANCELLED', 'SHORT_CLOSED') THEN h.status
               WHEN COALESCE(SUM(GREATEST(l.po_qty - l.rcv1, 0)), 0) <= 0 AND COUNT(l.po_id) > 0 THEN 'COMPLETED'
               WHEN COALESCE(SUM(l.rcv1), 0) > 0 THEN 'PARTIALLY_RECEIVED'
@@ -463,7 +467,7 @@ export async function planStoreGrnLinks(
   }
   const poLines = poIds.length === 0 ? [] : await run<PoLineRow>(
     `SELECT po_line_id, po_id, line_no, item_id, item_code, item_description,
-            po_qty::text AS po_qty, received_qty::text AS received_qty
+            po_qty::text AS po_qty, received_qty::text AS received_qty, is_closed
        FROM v_po_line_balance WHERE po_id = ANY($1::bigint[]) ORDER BY po_id, line_no, po_line_id`,
     [poIds],
   );
@@ -487,7 +491,9 @@ export async function planStoreGrnLinks(
       continue;
     }
     const header = found[0]!;
-    if (header.status === 'DRAFT' || header.status === 'CANCELLED') {
+    // The statuses assertGrnReceiptAllowed refuses: a link to a short-closed PO went
+    // through, and the GRN's quantity could then never be corrected (updatePostedGrn).
+    if (header.status === 'DRAFT' || header.status === 'CANCELLED' || header.status === 'SHORT_CLOSED') {
       hold(n.ref, 'PO_NOT_RECEIVABLE', `${header.po_no} is ${header.status} in the ERP.`, { poNos: [n.poNo] });
       continue;
     }
@@ -507,6 +513,13 @@ export async function planStoreGrnLinks(
         + `(lines ${matches.map((pl) => pl.line_no).join(', ')}).`, {
         poNos: [n.poNo],
         poLines: matches.map((pl) => ({ poLineId: Number(pl.po_line_id), lineNo: Number(pl.line_no), itemCode: pl.item_code, poQty: toQty(pl.po_qty) })),
+      });
+      continue;
+    }
+    // A closed line takes no receipt either (assertGrnReceiptAllowed), on any PO status.
+    if (matches[0]!.is_closed) {
+      hold(n.ref, 'PO_NOT_RECEIVABLE', `${header.po_no} line ${matches[0]!.line_no} (${matches[0]!.item_code}) is closed in the ERP.`, {
+        poNos: [n.poNo],
       });
       continue;
     }
@@ -674,8 +687,10 @@ export async function planStoreGrnLinks(
     after[p.statusBefore] = (after[p.statusBefore] ?? 0) - 1;
     after[p.statusAfter] = (after[p.statusAfter] ?? 0) + 1;
   }
+  // The dashboard's Pending PO Value with no filter: open lines of issued orders only
+  // (migration 031), so a draft's lines are not counted as they were here.
   const [pending] = await run<{ value: string }>(
-    'SELECT COALESCE(SUM(pending_amount) FILTER (WHERE is_receivable), 0)::text AS value FROM v_po_line_balance', [],
+    'SELECT COALESCE(SUM(open_pending_amount), 0)::text AS value FROM v_po_line_balance', [],
   );
   const pendingBefore = dec(pending?.value ?? 0);
   const pendingDrop = affectedPos.reduce((s, p) => s.plus(dec(p.pendingValueBefore)).minus(dec(p.pendingValueAfter)), dec(0));

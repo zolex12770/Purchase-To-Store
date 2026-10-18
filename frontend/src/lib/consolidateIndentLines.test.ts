@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { consolidateEligibleLines, reallocateSources, type ConsolidatedSource, type EligibleIndentLine } from './consolidateIndentLines';
+import {
+  consolidateEligibleLines, reallocateSources, indentQtyOfSources, type ConsolidatedSource, type EligibleIndentLine,
+} from './consolidateIndentLines';
 
 let seq = 0;
 const row = (overrides: Partial<EligibleIndentLine> & { item_id: number }): EligibleIndentLine => {
@@ -181,5 +183,24 @@ describe('reallocateSources', () => {
     const restoredTo6 = reallocateSources(full, 6);
     expect(restoredTo6).toEqual(full);
     expect(trimmedTo4).not.toEqual(full);
+  });
+});
+
+// 2026-10-17 E2E run, S2-D4: the PO edit form showed '—' for Indent Qty on every line,
+// though GET /purchase-orders/:id returns each line's sources with their indent_qty.
+describe('indentQtyOfSources', () => {
+  it('adds up the indent quantity of each indent line a saved PO line draws from, as the create form does', () => {
+    const made = consolidateEligibleLines([
+      row({ item_id: 7, indent_line_id: 101, indent_qty: '10', pending_qty: '6' }),
+      row({ item_id: 7, indent_line_id: 102, indent_qty: '4', pending_qty: '4' }),
+    ]);
+    expect(indentQtyOfSources([{ indent_line_id: 101, indent_qty: '10.0000' }, { indent_line_id: 102, indent_qty: '4.0000' }]))
+      .toBe(made[0]!.indentQty);
+  });
+
+  it('counts an indent line once, sums as stored, and is null for a line no indent is behind', () => {
+    expect(indentQtyOfSources([{ indent_line_id: 5, indent_qty: '3' }, { indent_line_id: 5, indent_qty: '3' }])).toBe('3');
+    expect(indentQtyOfSources([{ indent_line_id: 1, indent_qty: '0.1' }, { indent_line_id: 2, indent_qty: '0.2' }])).toBe('0.3');
+    expect(indentQtyOfSources([])).toBeNull();
   });
 });

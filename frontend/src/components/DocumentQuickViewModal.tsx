@@ -139,8 +139,10 @@ export function DocumentQuickViewModal({ type, id, onClose }: { type: DocumentTy
                       <>
                         <td className="right num">{qty(l.po_qty as string)}</td>
                         <td className="right num">{qty((l.received_qty as string) ?? '0')}</td>
-                        <td className="right num" style={pendingStyle(l.pending_grn_qty)}>
-                          {qty((l.pending_grn_qty as string) ?? '0')}
+                        {/* What the order still expects, as on the list row it was opened from
+                            (open_pending_qty: 0 once the order is short-closed or the line closed). */}
+                        <td className="right num" style={pendingStyle(l.open_pending_qty)}>
+                          {qty((l.open_pending_qty as string) ?? '0')}
                         </td>
                       </>
                     )}

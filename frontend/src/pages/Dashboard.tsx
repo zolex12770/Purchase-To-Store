@@ -16,10 +16,11 @@ import {
 import { api, qs } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useFilters, drilldownLink } from '../lib/useFilters';
+import { periodRange, isDrillable, kpiPanelState } from '../lib/analysis';
 import { PageHeader, PrintHeader } from '../layout/AppShell';
 import { FilterBar } from '../components/FilterBar';
 import { KpiCard, KpiGrid, type MetricValue } from '../components/KpiCard';
-import { Card, CardHeader, CardBody, Button, Tabs, Badge, EmptyState, LoadingBlock } from '../components/ui';
+import { Card, CardHeader, CardBody, Button, Tabs, Badge, EmptyState, ErrorState, LoadingBlock, Banner } from '../components/ui';
 import {
   ChartFrame, TrendChart, RankBarChart, DonutChart, AgeingChart,
   type BreakdownRow, type AgeingBucket, type TrendPoint,
@@ -28,16 +29,23 @@ import { money, moneyCompact, qty, percent, count, formatDate } from '../lib/for
 
 type Dimension = 'supplier' | 'item' | 'department' | 'costCentre' | 'mainGroup' | 'poType' | 'itemType' | 'user' | 'hod';
 
+/**
+ * The orders every PO figure here counts: all but cancelled (the breakdown, the trend and
+ * supplier performance leave cancelled orders out). Their bars and rows opened
+ * '/purchase-orders', which lists cancelled orders too (2026-10-17 E2E run, S1-D3).
+ */
+const PO_LIST = '/purchase-orders?excludeCancelled=true';
+
 const DIMENSIONS: { key: Dimension; label: string; icon: React.ReactNode; param: string; route: string }[] = [
-  { key: 'supplier',   label: 'Supplier',    icon: <Building2 size={14} />, param: 'supplierId',    route: '/purchase-orders' },
-  { key: 'item',       label: 'Item',        icon: <Package size={14} />,   param: 'itemId',        route: '/purchase-orders' },
-  { key: 'department', label: 'Department',  icon: <Layers size={14} />,    param: 'departmentId',  route: '/purchase-orders' },
-  { key: 'costCentre', label: 'Cost Centre', icon: <Landmark size={14} />,  param: 'costCentreId',  route: '/purchase-orders' },
-  { key: 'mainGroup',  label: 'Item Group',  icon: <Layers size={14} />,    param: 'mainGroupId',   route: '/purchase-orders' },
-  { key: 'poType',     label: 'PO Type',     icon: <PieIcon size={14} />,   param: 'poTypeId',      route: '/purchase-orders' },
-  { key: 'itemType',   label: 'Item Type',   icon: <Package size={14} />,   param: 'itemTypeId',    route: '/purchase-orders' },
-  { key: 'user',       label: 'Created By / User', icon: <User size={14} />, param: 'userId',      route: '/purchase-orders' },
-  { key: 'hod',        label: 'HOD',         icon: <UserCheck size={14} />, param: 'hodId',         route: '/purchase-orders' },
+  { key: 'supplier',   label: 'Supplier',    icon: <Building2 size={14} />, param: 'supplierId',    route: PO_LIST },
+  { key: 'item',       label: 'Item',        icon: <Package size={14} />,   param: 'itemId',        route: PO_LIST },
+  { key: 'department', label: 'Department',  icon: <Layers size={14} />,    param: 'departmentId',  route: PO_LIST },
+  { key: 'costCentre', label: 'Cost Centre', icon: <Landmark size={14} />,  param: 'costCentreId',  route: PO_LIST },
+  { key: 'mainGroup',  label: 'Item Group',  icon: <Layers size={14} />,    param: 'mainGroupId',   route: PO_LIST },
+  { key: 'poType',     label: 'PO Type',     icon: <PieIcon size={14} />,   param: 'poTypeId',      route: PO_LIST },
+  { key: 'itemType',   label: 'Item Type',   icon: <Package size={14} />,   param: 'itemTypeId',    route: PO_LIST },
+  { key: 'user',       label: 'Created By / User', icon: <User size={14} />, param: 'userId',      route: PO_LIST },
+  { key: 'hod',        label: 'HOD',         icon: <UserCheck size={14} />, param: 'hodId',         route: PO_LIST },
 ];
 
 interface ExceptionRow {
@@ -90,7 +98,7 @@ export default function Dashboard() {
 
   const breakdown = useQuery({
     queryKey: ['analytics', 'breakdown', dimension, query],
-    queryFn: () => api.getWithMeta<BreakdownRow[], { dimensionTitle: string; drilldownParam: string; grandTotalValue: string; groupCount: number; truncated: boolean }>(
+    queryFn: () => api.getWithMeta<BreakdownRow[], { dimensionTitle: string; drilldownParam: string; drilldown: string; grandTotalValue: string; groupCount: number; truncated: boolean }>(
       `/analytics/breakdown/${dimension}${query}${query ? '&' : '?'}limit=12`,
     ),
     enabled: canBreakdown,
@@ -121,11 +129,17 @@ export default function Dashboard() {
   const HEADLINE = ['po_value_total', 'po_pending_value', 'grn_value_total', 'indent_pending_approval', 'po_overdue_count', 'purchase_cycle_days'];
   const headline = HEADLINE.map((k) => byKey[k]).filter(Boolean) as MetricValue[];
   const secondary = metrics.filter((m) => !HEADLINE.includes(m.key));
+  const kpiState = kpiPanelState(kpis, metrics.length);
 
   const activeDim = DIMENSIONS.find((d) => d.key === dimension)!;
 
-  const drill = (extra: Record<string, unknown>, base = '/purchase-orders') =>
+  const drill = (extra: Record<string, unknown>, base = PO_LIST) =>
     navigate(drilldownLink(base, extra, filters));
+  // A bar opens the list the server names for it; a bar without a key opens nothing.
+  const drillBar = (key: string | null) => {
+    if (!isDrillable(key)) return;
+    drill({ [breakdown.data?.meta.drilldownParam ?? activeDim.param]: [key] }, breakdown.data?.meta.drilldown ?? activeDim.route);
+  };
 
   const filterSummary = [
     filters.dateFrom || filters.dateTo ? `${filters.dateFrom ?? 'start'} to ${filters.dateTo ?? 'today'}` : 'All time',
@@ -164,7 +178,14 @@ export default function Dashboard() {
       />
 
       {/* ── Headline KPIs ─────────────────────────────────────────────────── */}
-      {kpis.isLoading ? (
+      {/* A failed load is an error with Retry: it read 'You may not have analytics
+          permissions' while a slow query timed out (2026-10-17 E2E run, S1-D1). */}
+      {kpis.error && kpis.data && (
+        <Banner tone="danger" action={<Button variant="secondary" size="sm" onClick={() => void kpis.refetch()}>Try again</Button>}>
+          The indicators could not be refreshed; the figures below are from the last successful load.
+        </Banner>
+      )}
+      {kpiState === 'loading' ? (
         <KpiGrid>
           {Array.from({ length: 6 }).map((_, i) => (
             <div key={i} className="card" style={{ padding: 'var(--sp-5)' }}>
@@ -173,7 +194,11 @@ export default function Dashboard() {
             </div>
           ))}
         </KpiGrid>
-      ) : metrics.length === 0 ? (
+      ) : kpiState === 'error' ? (
+        <Card><CardBody>
+          <ErrorState error={kpis.error} onRetry={() => void kpis.refetch()} title="Could not load the indicators" />
+        </CardBody></Card>
+      ) : kpiState === 'empty' ? (
         <Card><CardBody><EmptyState title="No metrics available" message="You may not have analytics permissions for this data." /></CardBody></Card>
       ) : (
         <KpiGrid min={198}>
@@ -260,7 +285,8 @@ export default function Dashboard() {
               { key: 'receivedValue', name: 'Received value', type: 'area', color: '#1f9d5f' },
               { key: 'pendingValue', name: 'Pending value', type: 'line', color: '#d97a28' },
             ]}
-            onPointClick={(p) => drill({ dateFrom: String(p.period), dateTo: String(p.period) })}
+            // The whole period the point stands for: it opened only the period's first day.
+            onPointClick={(p) => drill(periodRange(String(p.period), granularity, filters))}
           />
         </ChartFrame>
 
@@ -282,7 +308,8 @@ export default function Dashboard() {
         >
           <AgeingChart
             data={ageing.data ?? []}
-            onBucketClick={() => drill({}, ageBasis === 'po' ? '/purchase-orders/pending' : '/indents')}
+            // The indent ageing counts approved quantity still to order: the indents holding it.
+            onBucketClick={() => drill({}, ageBasis === 'po' ? '/purchase-orders/pending' : '/indents?eligibleOnly=true')}
           />
         </ChartFrame>
       </div>
@@ -310,6 +337,8 @@ export default function Dashboard() {
           <CardBody>
             {breakdown.isLoading ? (
               <LoadingBlock height={320} />
+            ) : breakdown.error ? (
+              <ErrorState error={breakdown.error} onRetry={() => void breakdown.refetch()} />
             ) : (breakdown.data?.data ?? []).length === 0 ? (
               <EmptyState title="No purchase data for these filters" message="Widen the date range or clear some filters." />
             ) : (
@@ -318,26 +347,26 @@ export default function Dashboard() {
                   <RankBarChart
                     data={breakdown.data!.data}
                     height={Math.max(280, breakdown.data!.data.length * 27)}
-                    onBarClick={(row) => drill({ [activeDim.param]: [row.key] }, activeDim.route)}
+                    onBarClick={(row) => drillBar(row.key)}
                   />
                 </div>
 
                 <div>
                   <DonutChart
                     data={breakdown.data!.data.slice(0, 8).map((d) => ({
-                      key: d.key, label: d.label, value: Number(d.totalValue),
+                      key: d.key ?? '', label: d.label, value: Number(d.totalValue),
                     }))}
                     height={300}
                     centerLabel="Total"
                     centerValue={moneyCompact(breakdown.data!.meta.grandTotalValue)}
-                    onSliceClick={(key) => drill({ [activeDim.param]: [key] }, activeDim.route)}
+                    onSliceClick={(key) => drillBar(key)}
                   />
                 </div>
               </div>
             )}
           </CardBody>
 
-          {(breakdown.data?.data ?? []).length > 0 && (
+          {!breakdown.error && (breakdown.data?.data ?? []).length > 0 && (
             <CardBody flush>
               <div className="table-wrap" style={{ maxHeight: 380 }}>
                 <table className="table table-compact">
@@ -356,19 +385,20 @@ export default function Dashboard() {
                   <tbody>
                     {breakdown.data!.data.map((row) => (
                       <tr
-                        key={row.key}
-                        className="clickable"
-                        onClick={() => drill({ [activeDim.param]: [row.key] }, activeDim.route)}
+                        key={row.key ?? '∅'}
+                        className={isDrillable(row.key) ? 'clickable' : undefined}
+                        onClick={() => drillBar(row.key)}
+                        title={isDrillable(row.key) ? undefined : 'No list filter selects this group'}
                       >
                         <td className="cell-strong truncate" style={{ maxWidth: 300 }}>{row.label}</td>
-                        <td className="right num">{count(row.poCount)}</td>
+                        <td className="right num">{count(row.poCount ?? 0)}</td>
                         <td className="right num">{qty(row.totalQty)}</td>
                         <td className="right num cell-strong">{money(row.totalValue)}</td>
-                        <td className="right num" style={{ color: 'var(--success-600)' }}>{money(row.receivedValue)}</td>
+                        <td className="right num" style={{ color: 'var(--success-600)' }}>{money(row.receivedValue ?? 0)}</td>
                         <td className="right num" style={{ color: Number(row.pendingValue) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>
-                          {money(row.pendingValue)}
+                          {money(row.pendingValue ?? 0)}
                         </td>
-                        <td className="right num">{percent(row.avgDiscount)}</td>
+                        <td className="right num">{percent(row.avgDiscount ?? 0)}</td>
                         <td className="right num">
                           <div className="row" style={{ gap: 6, justifyContent: 'flex-end' }}>
                             <span style={{ minWidth: 42 }}>{percent(row.sharePct)}</span>
@@ -428,6 +458,7 @@ export default function Dashboard() {
                   </thead>
                   <tbody>
                     {(suppliers.data ?? []).map((s) => (
+                      // Supplier performance leaves cancelled orders out: PO_LIST, the default base.
                       <tr key={s.key} className="clickable" onClick={() => drill({ supplierId: [s.key] })}>
                         <td className="cell-strong truncate" style={{ maxWidth: 240 }}>{s.label}</td>
                         <td className="cell-muted">{[s.city, s.state].filter(Boolean).join(', ') || '—'}</td>

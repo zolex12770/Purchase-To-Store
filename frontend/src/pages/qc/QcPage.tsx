@@ -27,6 +27,8 @@ import {
   Modal, Field, Input, Textarea, Select,
 } from '../../components/ui';
 import { qty, formatDate, count, toShortUom } from '../../lib/format';
+import { qcDecisionToast, qcSplitProblem, qcRemainder, type QcDecisionResult } from '../../lib/grnQc';
+import { refreshAfterGrnChange } from '../../lib/grnRefresh';
 
 interface InspectionRow {
   id: number;
@@ -145,13 +147,15 @@ export default function QcPage() {
   /* ── Mutations ─────────────────────────────────────────────────────────── */
   const decideMutation = useMutation({
     mutationFn: ({ id, payload }: { id: number; payload: Record<string, unknown> }) =>
-      api.post(`/qc/inspections/${id}/decide`, payload),
-    onSuccess: () => {
-      toast.success('Inspection decision recorded and stock updated.');
+      api.post<QcDecisionResult>(`/qc/inspections/${id}/decide`, payload),
+    onSuccess: (res) => {
+      // Said 'stock updated' for every decision, a hold or a failure included, which
+      // moved no stock at all (2026-10-17 E2E run, S3-D7).
+      const t = qcDecisionToast(res);
+      toast.success(t.title, t.detail);
       setInspectingItem(null);
-      void qc.invalidateQueries({ queryKey: ['qc-inspections'] });
-      void qc.invalidateQueries({ queryKey: ['qc-stats'] });
-      void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
+      // The GRN screen shows the line's QC state and lot, the PO and stock screens what came in.
+      void refreshAfterGrnChange(qc);
     },
     onError: (err) => toast.fromError(err, 'Failed to record inspection decision'),
   });
@@ -170,15 +174,12 @@ export default function QcPage() {
     if (!inspectingItem) return;
     const acc = Number(acceptedQty || 0);
     const rej = Number(rejectedQty || 0);
-    const rec = Number(inspectingItem.received_qty);
 
-    if (acc + rej > rec) {
-      toast.error(`Total inspected quantity (${acc + rej}) cannot exceed received quantity (${rec}).`);
-      return;
-    }
-
-    if (FINAL_DECISIONS.includes(decisionStatus) && Math.abs(acc + rej - rec) > 0.00005) {
-      toast.error(`A final decision must account for all ${rec} received: accepted + rejected is ${acc + rej}.`);
+    // Compared as the server compares them, in stored units: as floats 0.1 + 0.2 of a
+    // 0.3 receipt exceeded it, and the split never reached the server.
+    const problem = qcSplitProblem(acceptedQty, rejectedQty, inspectingItem.received_qty, FINAL_DECISIONS.includes(decisionStatus));
+    if (problem) {
+      toast.error(problem);
       return;
     }
 
@@ -463,9 +464,8 @@ export default function QcPage() {
                 onChange={(e) => {
                   setAcceptedQty(e.target.value);
                   if (inspectingItem) {
-                    const rec = Number(inspectingItem.received_qty);
-                    const acc = Number(e.target.value || 0);
-                    if (rec >= acc) setRejectedQty(String(rec - acc));
+                    const left = qcRemainder(inspectingItem.received_qty, e.target.value);
+                    if (left !== null) setRejectedQty(left);
                   }
                 }}
               />

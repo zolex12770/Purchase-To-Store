@@ -22,7 +22,8 @@ import { useFilters, drilldownLink, type FilterState } from '../../lib/useFilter
 import { PageHeader, PrintHeader } from '../../layout/AppShell';
 import { FilterBar } from '../../components/FilterBar';
 import { KpiCard, KpiGrid, type MetricValue } from '../../components/KpiCard';
-import { Card, CardBody, Button, Tabs, EmptyState, LoadingBlock, ErrorState } from '../../components/ui';
+import { Card, CardBody, Button, Tabs, EmptyState, LoadingBlock, ErrorState, Banner } from '../../components/ui';
+import { periodRange, isDrillable, kpiPanelState } from '../../lib/analysis';
 import { ChartFrame, TrendChart, type TrendPoint } from '../../components/charts';
 import { qty, count } from '../../lib/format';
 
@@ -34,7 +35,8 @@ const METRIC_KEYS = [
 ];
 
 interface RequisitionBreakdownRow {
-  key: string;
+  /** NULL for the 'Unassigned' / 'Unspecified' group, which no list filter selects. */
+  key: string | null;
   label: string;
   requisitionCount: number;
   totalRequestedQty: string;
@@ -93,16 +95,24 @@ export default function RequisitionAnalysis() {
 
   const breakdown = useQuery({
     queryKey: ['analytics', 'requisition-breakdown', dimension, query],
-    queryFn: () => api.getWithMeta<RequisitionBreakdownRow[], { dimensionTitle: string; grandTotalRequestedQty: string; groupCount: number; truncated: boolean }>(
+    queryFn: () => api.getWithMeta<RequisitionBreakdownRow[], { dimensionTitle: string; drilldownParam: string; drilldown: string; grandTotalRequestedQty: string; groupCount: number; truncated: boolean }>(
       `/analytics/requisition-breakdown/${dimension}${query}${sep}limit=15`,
     ),
   });
 
   const allMetrics = kpis.data?.data.kpis.filter((m) => m.key.startsWith('requisition_')) ?? [];
   const featured = METRIC_KEYS.map((k) => allMetrics.find((m) => m.key === k)).filter(Boolean) as MetricValue[];
+  const kpiState = kpiPanelState(kpis, featured.length);
   const activeDim = DIMENSIONS.find((d) => d.key === dimension)!;
 
-  const drill = (extra: Record<string, unknown>) => navigate(drilldownLink('/requisitions', extra, filters as FilterState));
+  // Every requisition figure here leaves cancelled requisitions out, and so must the
+  // list a row or a period opens: '/requisitions' listed them.
+  const drill = (extra: Record<string, unknown>, base = '/requisitions?excludeCancelled=true') =>
+    navigate(drilldownLink(base, extra, filters as FilterState));
+  const drillRow = (key: string | null) => {
+    if (!isDrillable(key)) return;
+    drill({ [breakdown.data?.meta.drilldownParam ?? activeDim.param]: [key] }, breakdown.data?.meta.drilldown);
+  };
 
   const ageingPoints: TrendPoint[] = (ageing.data ?? []).map((b) => ({
     period: b.label, pendingQty: Number(b.pendingQty), documents: b.docCount,
@@ -142,7 +152,12 @@ export default function RequisitionAnalysis() {
         show={['dateRange', 'user', 'hod', 'department', 'costCentre', 'machine', 'item']}
       />
 
-      {kpis.isLoading ? (
+      {kpis.error && kpis.data && (
+        <Banner tone="danger" action={<Button variant="secondary" size="sm" onClick={() => void kpis.refetch()}>Try again</Button>}>
+          The indicators could not be refreshed; the figures below are from the last successful load.
+        </Banner>
+      )}
+      {kpiState === 'loading' ? (
         <KpiGrid>
           {Array.from({ length: METRIC_KEYS.length }).map((_, i) => (
             <div key={i} className="card" style={{ padding: 'var(--sp-5)' }}>
@@ -151,7 +166,12 @@ export default function RequisitionAnalysis() {
             </div>
           ))}
         </KpiGrid>
-      ) : featured.length > 0 ? (
+      ) : kpiState === 'error' ? (
+        // A failed load is an error with Retry, never a missing permission.
+        <Card><CardBody>
+          <ErrorState error={kpis.error} onRetry={() => void kpis.refetch()} title="Could not load the indicators" />
+        </CardBody></Card>
+      ) : kpiState === 'ready' ? (
         <KpiGrid min={200}>
           {featured.map((m) => (
             <KpiCard key={m.key} metric={m} onClick={m.drilldown ? () => navigate(drilldownLink(m.drilldown, {}, filters as FilterState)) : undefined} />
@@ -186,7 +206,8 @@ export default function RequisitionAnalysis() {
               { key: 'requisitionIssuedQty', name: 'Issued Qty', type: 'line', color: '#1f9d5f' },
             ]}
             valueKind="quantity"
-            onPointClick={(p) => drill({ dateFrom: String(p.period), dateTo: String(p.period) })}
+            // The whole period the point stands for: it opened only the period's first day.
+            onPointClick={(p) => drill(periodRange(String(p.period), granularity, filters))}
           />
         </ChartFrame>
 
@@ -244,7 +265,12 @@ export default function RequisitionAnalysis() {
                   </thead>
                   <tbody>
                     {breakdown.data!.data.map((row) => (
-                      <tr key={row.key} className="clickable" onClick={() => drill({ [activeDim.param]: [row.key] })}>
+                      <tr
+                        key={row.key ?? '∅'}
+                        className={isDrillable(row.key) ? 'clickable' : undefined}
+                        onClick={() => drillRow(row.key)}
+                        title={isDrillable(row.key) ? undefined : 'No list filter selects this group'}
+                      >
                         <td className="cell-strong truncate" style={{ maxWidth: 320 }}>{row.label}</td>
                         <td className="right num">{count(row.requisitionCount)}</td>
                         <td className="right num cell-strong">{qty(row.totalRequestedQty)}</td>

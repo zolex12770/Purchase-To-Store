@@ -2,6 +2,7 @@
  * Purchase Order — Analysis (SRS §11).
  */
 import { ModuleAnalysis } from '../../components/ModuleAnalysis';
+import { money, qty, count } from '../../lib/format';
 
 export default function PoAnalysis() {
   return (
@@ -34,7 +35,22 @@ export default function PoAnalysis() {
         { key: 'user', label: 'Created By / User', param: 'userId' },
         { key: 'hod', label: 'HOD', param: 'hodId' },
       ]}
-      drilldownRoute="/purchase-orders"
+      // The trend leaves cancelled orders out, and so does the list a period opens.
+      drilldownRoute="/purchase-orders?excludeCancelled=true"
+      breakdown={{
+        path: '/analytics/breakdown',
+        documents: 'Purchase orders',
+        columns: [
+          { header: 'POs', cell: (r) => count(r.documentCount ?? r.poCount ?? 0), total: 'documents' },
+          { header: 'Quantity', cell: (r) => qty(r.totalQty), total: 'qty' },
+          { header: 'Value', cell: (r) => <span className="cell-strong">{money(r.totalValue)}</span>, total: 'value' },
+          { header: 'Received', cell: (r) => <span style={{ color: 'var(--success-600)' }}>{money(r.receivedValue ?? 0)}</span> },
+          {
+            header: 'Pending',
+            cell: (r) => <span style={{ color: Number(r.pendingValue) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>{money(r.pendingValue ?? 0)}</span>,
+          },
+        ],
+      }}
       filterKeys={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'poType', 'mainGroup', 'status', 'item']}
       statusOptions={[
         { value: 'DRAFT', label: 'Draft' },

@@ -89,7 +89,9 @@ export const listSchema = listQuerySchema.extend({
  * A PO line still to be received: on an issued, open order (a DRAFT was never sent to
  * the supplier), not closed, with quantity outstanding. The Pending view, the overdue
  * filter and the pending KPIs (analytics) share this one rule, so a pending KPI opens
- * exactly the orders it counts. `alias` is a v_po_line_balance row.
+ * exactly the orders it counts. `alias` is a v_po_line_balance row, whose
+ * open_pending_qty / open_pending_amount are its pending figures under this same rule
+ * (migration 031) and are what every pending total adds up.
  */
 export const pendingLineSql = (alias: string): string =>
   `${alias}.is_receivable AND ${alias}.po_status IN ('OPEN', 'PARTIALLY_RECEIVED')`;
@@ -159,6 +161,16 @@ export const PO_FROM = `
   JOIN v_po_header_balance b ON b.po_id = h.id
   JOIN suppliers s ON s.id = h.supplier_id`;
 
+/**
+ * The same rows as PO_FROM (the balance view has one row per order) without the view, for
+ * a query that reads no balance column and would otherwise total every order's receipts
+ * just to filter: the KPI line filter (analytics poLineFilter) selects its orders through
+ * it. Not poListTotals: see there.
+ */
+export const PO_ROWS_FROM = `
+  FROM purchase_order_headers h
+  JOIN suppliers s ON s.id = h.supplier_id`;
+
 export interface PoListTotals {
   poCount: number;
   lineCount: number;
@@ -182,8 +194,19 @@ export interface PoListTotals {
  * `po_value_total` metric means (ADR-009 — one definition per KPI). Cancelled
  * value is reported separately so nothing is hidden from the user.
  *
+ * Pending adds up only what is still to be received on an issued, open order
+ * (open_pending_qty / open_pending_amount, migration 031: the pendingLineSql rule), as
+ * the rows above it now do. It added up every non-cancelled line, so a short-closed
+ * order's balance swelled 'Committed pending receipt' (2026-10-17 E2E run, S2-D1).
+ *
  * `db` is a transaction when several totals must come from one moment (the receipt
  * evidence summary's parts and their whole).
+ *
+ * The orders are read through PO_FROM although no balance column is used: without the
+ * view (PO_ROWS_FROM, commit 5ee235d) the planner adds up the Pending view's lines in a
+ * nested loop, order by order, and its totals took 36 -> 45 ms with no filter and 36 -> 43
+ * ms for one department on the 2026-10-17 copy (24,297 buffer hits against 1,027), on the
+ * Pending PO list and the pending KPI card alike (2026-10-18 measurement).
  */
 export async function poListTotals(q: PoListFilter, db?: Queryable): Promise<PoListTotals> {
   const b = buildPoFilter(q);
@@ -194,9 +217,9 @@ export async function poListTotals(q: PoListFilter, db?: Queryable): Promise<PoL
             (COUNT(tl.po_line_id) FILTER (WHERE h.status <> 'CANCELLED'))::int AS "lineCount",
             COALESCE(SUM(tl.po_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPoQty",
             COALESCE(SUM(tl.received_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalReceivedQty",
-            COALESCE(SUM(tl.pending_grn_qty) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS "totalPendingQty",
+            COALESCE(SUM(tl.open_pending_qty), 0) AS "totalPendingQty",
             COALESCE(SUM(tl.amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS value,
-            COALESCE(SUM(tl.pending_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS pending,
+            COALESCE(SUM(tl.open_pending_amount), 0) AS pending,
             COALESCE(SUM(tl.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
             COALESCE(SUM(tl.amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"
        ${PO_FROM}

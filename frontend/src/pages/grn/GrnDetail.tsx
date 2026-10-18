@@ -5,7 +5,7 @@
  * case), multi-PO (several purchase orders combined into one receipt, each
  * line still tracing its own PO), and Direct (no purchase order at all).
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Pencil, Send, Ban, Printer, Trash2, ShoppingCart, FileDown, Tag } from 'lucide-react';
@@ -20,6 +20,8 @@ import {
 import { StatTile } from '../../components/KpiCard';
 import { HelpStrip } from '../../components/simple';
 import { money, qty, formatDate, formatDateTime, count, text } from '../../lib/format';
+import { qcBadgeLabel, lineQc, hasLots, savedNote, type JustSaved } from '../../lib/grnQc';
+import { refreshAfterGrnChange } from '../../lib/grnRefresh';
 
 interface GrnLine {
   id: number;
@@ -52,6 +54,8 @@ interface GrnLine {
   po_line_no: number | null;
   mln_no: string | null;
   mln_sr_no: number | null;
+  /** The line's quality inspection; null when its item needs none (backend GET /grn/:id). */
+  qc_inspection_status: string | null;
 }
 
 interface GrnDoc {
@@ -60,6 +64,8 @@ interface GrnDoc {
   grn_date: string;
   grn_time: string;
   status: string;
+  /** NOT_APPLICABLE, or the least advanced status of its inspections (backend domain/qc.ts). */
+  qc_status: string;
   mode: 'PO' | 'DIRECT';
   poNumbers: string[];
   invoice_no: string;
@@ -97,9 +103,20 @@ type ActionKind = 'post' | 'cancel' | 'delete';
 export default function GrnDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  // Set only when arriving straight from the create screen (router state, so a
-  // refresh or a link to this page does not show the 'just saved' message again).
-  const justSaved = Boolean((useLocation().state as { justSaved?: string } | null)?.justSaved);
+  const location = useLocation();
+  // Set only when arriving straight from the GRN form. Taken from the router state
+  // once, and the state is cleared, so the note neither comes back on a refresh nor
+  // outlives a post or cancel made on this screen afterwards (2026-10-17 E2E run, S3-D1).
+  const [justSaved, setJustSaved] = useState<JustSaved | null>(
+    () => (location.state as { justSaved?: JustSaved } | null)?.justSaved ?? null,
+  );
+  useEffect(() => {
+    if ((location.state as { justSaved?: string } | null)?.justSaved) {
+      navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+    }
+    // Once, on arrival.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const { can } = useAuth();
   const toast = useToast();
   const qc = useQueryClient();
@@ -120,9 +137,9 @@ export default function GrnDetail() {
     onSuccess: (res, kind) => {
       toast.success('GRN updated', res.message);
       setAction(null); setReason('');
-      void qc.invalidateQueries({ queryKey: ['grn'] });
-      void qc.invalidateQueries({ queryKey: ['grn-doc', id] });
-      void qc.invalidateQueries({ queryKey: ['purchase-orders'] });
+      setJustSaved(null);
+      // The PO screen, the QC queue and the lists too: a post or a cancel moves them all.
+      void refreshAfterGrnChange(qc);
       if (kind === 'delete') navigate('/grn');
     },
     onError: (err) => toast.fromError(err),
@@ -136,6 +153,13 @@ export default function GrnDetail() {
   const isPosted = data.status === 'POSTED';
   const isDirect = data.mode === 'DIRECT';
   const isMultiPo = data.poNumbers.length > 1;
+  const qcLabel = qcBadgeLabel(data.qc_status);
+  // Some line was inspected: the table says, line by line, what QC holds or decided.
+  const inspected = data.lines.some((l) => lineQc(l).kind !== 'none');
+  const heldLines = data.lines.filter((l) => lineQc(l).kind === 'held').length;
+  const note = justSaved
+    ? savedNote({ justSaved, grnNo: data.grn_no, status: data.status, lines: data.lines, canPost: can('grn.approve') })
+    : null;
 
   const totalQty = data.lines.reduce((s, l) => s + Number(l.grn_qty), 0);
   const totalInvoiceQty = data.lines.reduce((s, l) => s + Number(l.invoice_qty ?? 0), 0);
@@ -150,6 +174,7 @@ export default function GrnDetail() {
           <span className="row" style={{ gap: 'var(--sp-3)', flexWrap: 'wrap' }}>
             {data.grn_no}
             <StatusBadge status={data.status} />
+            {qcLabel && <StatusBadge status={data.qc_status} label={qcLabel} />}
             {isDirect && <Badge tone="info" plain>Direct GRN</Badge>}
             {isMultiPo && <Badge tone="info" plain>{data.poNumbers.length} POs</Badge>}
           </span>
@@ -168,7 +193,9 @@ export default function GrnDetail() {
                     onClick={() => void downloadFile(`/grn/${id}/pdf`, `${data.grn_no}.pdf`)}>
               PDF
             </Button>
-            {isPosted && (
+            {/* A line held for QC gets its lot only when QC passes it: with no lot
+                yet there is no label to print. */}
+            {isPosted && hasLots(data.lines) && (
               <Button variant="secondary" size="sm" icon={<Tag size={13} />}
                       onClick={() => navigate(`/grn/labels?grnId=${id}`)}>
                 Print Labels
@@ -194,17 +221,17 @@ export default function GrnDetail() {
       />
 
       {/* Arriving straight from Receive Material: say what was saved, under which
-          number, and what the next step is. */}
-      {justSaved && (
+          number, where the material is now and what the next step is. Lines held for
+          quality inspection are not in stock: the note said they were. */}
+      {note && (
         <HelpStrip tone="success">
-          <strong>Saved. GRN number: {data.grn_no}.</strong>{' '}
-          {isDraft
-            ? (can('grn.approve')
-              ? 'It is a draft. Next step: press “Post GRN” to add this material to stock.'
-              : 'It is a draft. Next step: a person who can post GRNs must post it.')
-            : isPosted
-              ? 'It is posted and the material is added to stock. Next step: print the labels if you need them.'
-              : 'Nothing more is needed here.'}
+          <strong>{note.title}</strong>{' '}{note.text}
+        </HelpStrip>
+      )}
+      {!note && isPosted && heldLines > 0 && (
+        <HelpStrip>
+          <strong>{count(heldLines)} of {count(data.lines.length)} line(s) are held for quality inspection.</strong>{' '}
+          They are not in stock and have no lot number yet: they go into stock when QC passes them.
         </HelpStrip>
       )}
 
@@ -318,11 +345,14 @@ export default function GrnDetail() {
                   <th className="right">Rate</th>
                   <th className="right">Value</th>
                   <th>Batch / Location</th>
+                  {inspected && <th>Quality</th>}
                   {!isDirect && <th className="right">Pending GRN Qty</th>}
                 </tr>
               </thead>
               <tbody>
-                {data.lines.map((l) => (
+                {data.lines.map((l) => {
+                  const q = lineQc(l);
+                  return (
                   <tr key={l.id} className="clickable" onClick={() => navigate(`/masters/items/${l.item_id}`)}>
                     <td className="cell-muted num">{l.line_no}</td>
                     {!isDirect && (
@@ -345,7 +375,7 @@ export default function GrnDetail() {
                         <span className="cell-code" title={`MLN — Material Lot Number (Sr. ${l.mln_sr_no ?? '—'})`}>{l.mln_no}</span>
                       ) : (
                         <span className="cell-muted" style={{ fontSize: 'var(--text-2xs)' }}>
-                          {isDraft ? 'Assigned on post' : '—'}
+                          {isDraft ? 'Assigned on post' : q.kind === 'held' ? 'Assigned when QC passes' : '—'}
                         </span>
                       )}
                     </td>
@@ -357,13 +387,35 @@ export default function GrnDetail() {
                     <td style={{ fontSize: 'var(--text-2xs)' }} className="cell-muted">
                       {[l.batch_no, l.receipt_location].filter(Boolean).join(' · ') || '—'}
                     </td>
+                    {inspected && (
+                      <td style={{ fontSize: 'var(--text-2xs)' }}>
+                        {q.kind === 'held' ? (
+                          <>
+                            <StatusBadge status={q.status} label={qcBadgeLabel(q.status) ?? undefined} />
+                            <div className="cell-muted" style={{ marginTop: 2 }}>Held: not in stock</div>
+                          </>
+                        ) : q.kind === 'decided' ? (
+                          <>
+                            <StatusBadge status={q.status} label={qcBadgeLabel(q.status) ?? undefined} />
+                            <div className="num" style={{ marginTop: 2 }}>
+                              Accepted {qty(q.accepted)} · Rejected {qty(q.rejected)}
+                            </div>
+                          </>
+                        ) : q.kind === 'closed' ? (
+                          <span className="cell-muted">Inspection closed, nothing released</span>
+                        ) : (
+                          <span className="cell-muted">Not inspected</span>
+                        )}
+                      </td>
+                    )}
                     {!isDirect && (
                       <td className="right num" style={{ color: Number(l.pending_grn_qty ?? 0) > 0 ? 'var(--warning-600)' : 'var(--text-faint)', fontWeight: 600 }}>
                         {l.pending_grn_qty ? qty(l.pending_grn_qty) : '—'}
                       </td>
                     )}
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
               <tfoot>
                 <tr>
@@ -373,7 +425,7 @@ export default function GrnDetail() {
                   <td />
                   <td />
                   <td className="right num" style={{ fontSize: 'var(--text-md)' }}>{money(totalValue)}</td>
-                  <td colSpan={isDirect ? 1 : 2} />
+                  <td colSpan={(isDirect ? 1 : 2) + (inspected ? 1 : 0)} />
                 </tr>
               </tfoot>
             </table>

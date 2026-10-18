@@ -21,7 +21,7 @@ import { METRICS, METRIC_BY_KEY, AGEING_BUCKETS, ageingCase } from '../../domain
 import { dec, shareOf, pctChange } from '../../domain/money.js';
 import { ValidationError } from '../../core/errors.js';
 import {
-  buildPoFilter, poLineScope, poListTotals, pendingLineSql, PO_FROM, type PoListFilter,
+  buildPoFilter, poLineScope, poListTotals, pendingLineSql, PO_ROWS_FROM, type PoListFilter,
 } from '../purchase-order/routes.js';
 import { buildGrnFilter, grnLineScope, grnListTotals, GRN_FROM, type GrnListFilter } from '../grn/routes.js';
 import {
@@ -67,7 +67,7 @@ function linesOf(list: SqlBuilder, member: (where: string) => string, scopeOf: (
  */
 function poLineFilter(f: UniversalFilter): SqlBuilder {
   const q = poQuery(f, { excludeCancelled: 'true' });
-  return linesOf(buildPoFilter(q), (where) => `v.po_id IN (SELECT h.id ${PO_FROM} ${where})`, (b) => poLineScope(q, b, 'v'));
+  return linesOf(buildPoFilter(q), (where) => `v.po_id IN (SELECT h.id ${PO_ROWS_FROM} ${where})`, (b) => poLineScope(q, b, 'v'));
 }
 
 const PO_LINE_FROM = 'FROM v_po_line_balance v';
@@ -117,6 +117,9 @@ function requisitionHeaderFilter(f: UniversalFilter): SqlBuilder {
   b.addIn('h.status', f.status);
   b.addIn('h.requester_user_id', f.userId);
   b.addIn('h.hod_user_id', f.hodId);
+  // The machine is the requisition's own (the requisition list filters h.machine_id);
+  // purchase documents carry none, so no other figure reads it.
+  b.addIn('h.machine_id', f.machineId);
   if (f.itemId?.length) {
     const p = b.push(f.itemId);
     b.addRaw(`EXISTS (SELECT 1 FROM requisition_lines l WHERE l.requisition_id = h.id AND l.item_id = ANY(${p}))`);
@@ -449,16 +452,33 @@ router.get(
 
 /* ── GET /analytics/breakdown/:dimension ────────────────────────────────────── */
 
+/**
+ * A breakdown dimension: the group-by column (`id`), its label, the joins both need, and
+ * the parameter of the drilled list that selects one group. Every bar opens that list
+ * (the breakdown's `drilldown`) with `drill` set to its key and shows exactly its rows and
+ * totals, so a dimension is offered only where the list filters it the same way.
+ */
+interface BreakdownDimension { id: string; label: string; join: string; title: string; drill: string }
+
+/**
+ * Groups counted under one key, the 'Unassigned' group (a NULL key) included: COUNT
+ * (DISTINCT key) leaves NULL out, and the screen said 'top 12 of 12' with 13 groups.
+ */
+const groupCountSql = (id: string) => `COUNT(DISTINCT COALESCE((${id})::text, ''))::int`;
+
 /** Server-controlled dimension map — the ONLY place a group-by column is chosen. */
-const DIMENSIONS: Record<string, { id: string; label: string; join: string; title: string; drill: string }> = {
+const DIMENSIONS: Record<string, BreakdownDimension> = {
   supplier: {
     id: 'v.supplier_id', label: 's.supplier_name',
     join: 'JOIN suppliers s ON s.id = v.supplier_id',
     title: 'Supplier', drill: 'supplierId',
   },
+  // Labelled from the Item Master: one item's lines carry different code and description
+  // snapshots (the PO register wrote descriptions into the code column), and grouping by
+  // the snapshot split one item into several bars, each opening the same list of all.
   item: {
-    id: 'v.item_id', label: "v.item_code || ' — ' || v.item_description",
-    join: '', title: 'Item', drill: 'itemId',
+    id: 'v.item_id', label: "mi.item_code || ' — ' || mi.item_description",
+    join: 'JOIN items mi ON mi.id = v.item_id', title: 'Item', drill: 'itemId',
   },
   department: {
     id: 'i.department_id', label: "COALESCE(d.name, 'Unassigned')",
@@ -513,10 +533,10 @@ const breakdownSchema = universalFilterSchema.extend({
 
 router.get(
   '/breakdown/:dimension',
-  // The Indent and GRN Analysis screens draw this chart too (ModuleAnalysis),
-  // so their own analyse rights must open it — with only the dashboard / PO
-  // rights listed, a store user's GRN Analysis showed a permission error
-  // in place of the breakdown.
+  // The dashboard draws this chart for every analyse right (Dashboard.tsx canBreakdown):
+  // with only the dashboard / PO rights listed, a store user's screen showed a
+  // permission error in place of the breakdown. The Indent and GRN Analysis screens
+  // draw their own module's breakdown (/indent-breakdown, /grn-breakdown).
   requireAnyPermission('dashboard.analyze', 'po.analyze', 'indent.analyze', 'grn.analyze'),
   validateQuery(breakdownSchema),
   asyncHandler(async (req, res) => {
@@ -535,7 +555,7 @@ router.get(
 
     const sortColumn = {
       value: 'SUM(v.amount)', qty: 'SUM(v.po_qty)',
-      count: 'COUNT(DISTINCT v.po_id)', pending: 'SUM(v.pending_amount)',
+      count: 'COUNT(DISTINCT v.po_id)', pending: `SUM(v.pending_amount) FILTER (WHERE ${PENDING})`,
     }[f.sortBy];
 
     const limit = b.push(f.limit);
@@ -565,7 +585,7 @@ router.get(
     const tb = poLineFilter(f);
     const [totals] = await query<Record<string, string>>(
       `SELECT SUM(v.amount) AS total_value, SUM(v.po_qty) AS total_qty,
-              COUNT(DISTINCT v.po_id)::int AS po_count, COUNT(DISTINCT ${dim.id})::int AS group_count
+              COUNT(DISTINCT v.po_id)::int AS po_count, ${groupCountSql(dim.id)} AS group_count
          ${from} ${tb.where()}`,
       tb.params,
     );
@@ -575,6 +595,7 @@ router.get(
       key: r.key,
       label: r.label,
       poCount: Number(r.po_count),
+      documentCount: Number(r.po_count),
       lineCount: Number(r.line_count),
       totalQty: r.total_qty ?? '0',
       totalValue: r.total_value ?? '0',
@@ -591,11 +612,288 @@ router.get(
       dimension: key,
       dimensionTitle: dim.title,
       drilldownParam: dim.drill,
+      // The list a bar opens: the orders these lines are on, cancelled ones left out as
+      // poLineFilter leaves them out. The screens opened '/purchase-orders', which lists
+      // cancelled orders too (2026-10-17 E2E run, S1-D3).
+      drilldown: '/purchase-orders?excludeCancelled=true',
       grandTotalValue: grandTotal,
       grandTotalQty: totals?.total_qty ?? '0',
+      documentCount: Number(totals?.po_count ?? 0),
       groupCount: Number(totals?.group_count ?? 0),
       shown: data.length,
       truncated: Number(totals?.group_count ?? 0) > data.length,
+    }));
+  }),
+);
+
+/**
+ * One grouped breakdown of a module's own lines (indent, GRN), modelled on the
+ * requisition breakdown: `lines` selects the lines its list's tiles add up, `from` names
+ * them with the joins every dimension needs, and `measures` are the sums per group. The
+ * grand totals are taken over the lines once, without the dimension's joins, so a line
+ * that counts under two groups (an indent's two HODs) is still counted once in them.
+ */
+async function groupedBreakdown(opts: {
+  dim: BreakdownDimension;
+  lines: () => SqlBuilder;
+  /** A condition on the dimension's own joins, when the screen filters by the dimension itself. */
+  scope?: (b: SqlBuilder) => string;
+  from: string;
+  document: string;
+  measures: Record<string, string>;
+  valueSql: string;
+  qtySql: string;
+  sortSql: string;
+  limit: number;
+}): Promise<{ rows: Record<string, string>[]; totals: Record<string, string> }> {
+  const { dim } = opts;
+  const grouped = () => {
+    const b = opts.lines();
+    const scope = opts.scope?.(b);
+    if (scope) b.addRaw(scope);
+    return b;
+  };
+  const b = grouped();
+  const limit = b.push(opts.limit);
+  const measures = Object.entries(opts.measures).map(([alias, sql]) => `${sql} AS ${alias}`).join(',\n              ');
+  const rows = await query<Record<string, string>>(
+    `SELECT ${dim.id}::text AS key,
+            ${dim.label} AS label,
+            COUNT(DISTINCT ${opts.document})::int AS document_count,
+            COUNT(*)::int AS line_count,
+            ${measures}
+       ${opts.from} ${dim.join} ${b.where()}
+      GROUP BY ${dim.id}, ${dim.label}
+      ORDER BY ${opts.sortSql} DESC NULLS LAST, ${dim.label}
+      LIMIT ${limit}`,
+    b.params,
+  );
+  const tb = opts.lines();
+  const [totals] = await query<Record<string, string>>(
+    `SELECT ${opts.valueSql} AS total_value, ${opts.qtySql} AS total_qty, COUNT(DISTINCT ${opts.document})::int AS document_count
+       ${opts.from} ${tb.where()}`,
+    tb.params,
+  );
+  const gb = grouped();
+  const [groups] = await query<{ group_count: number }>(
+    `SELECT ${groupCountSql(dim.id)} AS group_count ${opts.from} ${dim.join} ${gb.where()}`,
+    gb.params,
+  );
+  return { rows, totals: { ...totals, group_count: String(groups?.group_count ?? 0) } };
+}
+
+const moduleBreakdownSchema = universalFilterSchema.extend({
+  limit: z.coerce.number().int().min(1).max(100).default(15),
+  sortBy: z.enum(['value', 'qty', 'count']).default('value'),
+});
+
+function dimensionOf(map: Record<string, BreakdownDimension>, key: string, what: string): BreakdownDimension {
+  const dim = map[key];
+  if (!dim) {
+    throw ValidationError(
+      `Unknown ${what} analysis dimension "${key}".`,
+      [{ field: 'dimension', message: `Supported: ${Object.keys(map).join(', ')}.` }],
+    );
+  }
+  return dim;
+}
+
+/* ── GET /analytics/indent-breakdown/:dimension ─────────────────────────────────
+   The Indent Analysis breakdown grouped purchase order lines (/breakdown) while its
+   bars opened the indent list, so a department's bar counted POs and the list showed
+   its indents (2026-10-17 E2E run, S1-D2). This groups the indent list's own lines
+   (indentLineFilter), and a bar opens '/indents?excludeCancelled=true' showing exactly
+   its indents and tile totals. Each dimension is a filter that list applies, read as
+   the list reads it: the department and cost centre are the indent's own, not its
+   items' (2026-10-17 review). */
+
+const INDENT_DIMENSIONS: Record<string, BreakdownDimension> = {
+  department: {
+    id: 'ih.department_id', label: "COALESCE(d.name, 'Unassigned')",
+    join: 'LEFT JOIN lookups d ON d.id = ih.department_id', title: 'Department', drill: 'departmentId',
+  },
+  costCentre: {
+    id: 'ih.cost_centre_id', label: "COALESCE(cc.name, 'Unassigned')",
+    join: 'LEFT JOIN lookups cc ON cc.id = ih.cost_centre_id', title: 'Cost Centre', drill: 'costCentreId',
+  },
+  item: {
+    id: 'v.item_id', label: "mi.item_code || ' — ' || mi.item_description",
+    join: 'JOIN items mi ON mi.id = v.item_id', title: 'Item', drill: 'itemId',
+  },
+  indentType: {
+    id: 'ih.indent_type_id', label: "COALESCE(it.name, 'Unspecified')",
+    join: 'LEFT JOIN lookups it ON it.id = ih.indent_type_id', title: 'Indent Type', drill: 'indentTypeId',
+  },
+  supplier: {
+    id: 'ih.suggested_supplier_id', label: "COALESCE(s.supplier_name, 'No supplier suggested')",
+    join: 'LEFT JOIN suppliers s ON s.id = ih.suggested_supplier_id', title: 'Suggested Supplier', drill: 'supplierId',
+  },
+  status: { id: 'ih.status', label: 'ih.status', join: '', title: 'Status', drill: 'status' },
+  user: {
+    id: 'ih.requested_by_user_id', label: "COALESCE(u.employee_name, 'Unknown')",
+    join: 'LEFT JOIN users u ON u.id = ih.requested_by_user_id', title: 'Requested By / User', drill: 'userId',
+  },
+  // The list keeps an indent for an HOD who approved it OR who heads its department, so
+  // an indent counts under each of its two (buildIndentFilter); the shares may then add
+  // up to more than 100 %.
+  hod: {
+    id: 'hk.hod_id', label: "COALESCE(hu.employee_name, 'Unassigned')",
+    join: `LEFT JOIN lookups hd ON hd.id = ih.department_id
+           LEFT JOIN LATERAL (
+             SELECT DISTINCT x AS hod_id FROM unnest(ARRAY[ih.approved_by, (hd.extra->>'hodUserId')::bigint]) AS x WHERE x IS NOT NULL
+           ) hk ON TRUE
+           LEFT JOIN users hu ON hu.id = hk.hod_id`,
+    title: 'HOD', drill: 'hodId',
+  },
+};
+
+router.get(
+  '/indent-breakdown/:dimension',
+  requireAnyPermission('dashboard.analyze', 'indent.analyze'),
+  validateQuery(moduleBreakdownSchema),
+  asyncHandler(async (req, res) => {
+    const key = req.params.dimension ?? '';
+    const dim = dimensionOf(INDENT_DIMENSIONS, key, 'indent');
+    const f = parsedQuery<z.infer<typeof moduleBreakdownSchema>>(res);
+    const { rows, totals } = await groupedBreakdown({
+      dim,
+      lines: () => indentLineFilter(f),
+      // Filtered to an HOD, an indent that HOD approved also counts under its department's
+      // HOD, whose bar would open that HOD's list instead of this one: only the HODs
+      // filtered to have bars.
+      scope: key === 'hod' && f.hodId?.length ? (b) => `hk.hod_id = ANY(${b.push(f.hodId)})` : undefined,
+      from: 'FROM v_indent_line_balance v JOIN purchase_indent_headers ih ON ih.id = v.indent_id',
+      document: 'v.indent_id',
+      // The indent list's tiles (indentListTotals) over the same lines.
+      measures: {
+        total_qty: 'SUM(v.indent_qty)', total_value: 'SUM(v.estimated_value)',
+        ordered_qty: 'SUM(v.ordered_qty)', pending_qty: 'SUM(v.pending_qty)',
+      },
+      valueSql: 'SUM(v.estimated_value)',
+      qtySql: 'SUM(v.indent_qty)',
+      sortSql: { value: 'SUM(v.estimated_value)', qty: 'SUM(v.indent_qty)', count: 'COUNT(DISTINCT v.indent_id)' }[f.sortBy],
+      limit: f.limit,
+    });
+    const grandTotal = totals.total_value ?? '0';
+    const data = rows.map((r) => ({
+      key: r.key,
+      label: r.label,
+      documentCount: Number(r.document_count),
+      lineCount: Number(r.line_count),
+      totalQty: r.total_qty ?? '0',
+      totalValue: r.total_value ?? '0',
+      orderedQty: r.ordered_qty ?? '0',
+      pendingQty: r.pending_qty ?? '0',
+      sharePct: shareOf(r.total_value ?? 0, grandTotal),
+    }));
+    sendOk(res, data, meta(f, {
+      dimension: key,
+      dimensionTitle: dim.title,
+      drilldownParam: dim.drill,
+      drilldown: '/indents?excludeCancelled=true',
+      grandTotalValue: grandTotal,
+      grandTotalQty: totals.total_qty ?? '0',
+      documentCount: Number(totals.document_count ?? 0),
+      groupCount: Number(totals.group_count ?? 0),
+      shown: data.length,
+      truncated: Number(totals.group_count ?? 0) > data.length,
+    }));
+  }),
+);
+
+/* ── GET /analytics/grn-breakdown/:dimension ────────────────────────────────────
+   The GRN Analysis breakdown grouped purchase order lines too, so its bars left out
+   every direct receipt (2,716 of the 2,718 GRNs) and opened a GRN list that held them
+   (2026-10-17 E2E run, S1-D2). This groups the posted receipt lines the GRN KPIs count
+   (grnLineFilter), and a bar opens '/grn?status=POSTED' showing exactly its receipts
+   and tile totals. Item-level dimensions are read from the Item Master, as the list's
+   item-level filters read them (domain/item-scope.ts). */
+
+const GRN_DIMENSIONS: Record<string, BreakdownDimension> = {
+  supplier: {
+    id: 'g.supplier_id', label: 's.supplier_name',
+    join: 'JOIN suppliers s ON s.id = g.supplier_id', title: 'Supplier', drill: 'supplierId',
+  },
+  item: {
+    id: 'gl.item_id', label: "mi.item_code || ' — ' || mi.item_description",
+    join: 'JOIN items mi ON mi.id = gl.item_id', title: 'Item', drill: 'itemId',
+  },
+  department: {
+    id: 'mi.department_id', label: "COALESCE(d.name, 'Unassigned')",
+    join: 'JOIN items mi ON mi.id = gl.item_id LEFT JOIN lookups d ON d.id = mi.department_id',
+    title: 'Department', drill: 'departmentId',
+  },
+  costCentre: {
+    id: 'mi.cost_centre_id', label: "COALESCE(cc.name, 'Unassigned')",
+    join: 'JOIN items mi ON mi.id = gl.item_id LEFT JOIN lookups cc ON cc.id = mi.cost_centre_id',
+    title: 'Cost Centre', drill: 'costCentreId',
+  },
+  mainGroup: {
+    id: 'mi.main_group_id', label: "COALESCE(mg.name, 'Ungrouped')",
+    join: 'JOIN items mi ON mi.id = gl.item_id LEFT JOIN lookups mg ON mg.id = mi.main_group_id',
+    title: 'Main Group', drill: 'mainGroupId',
+  },
+  itemType: {
+    id: 'mi.item_type_id', label: "COALESCE(it.name, 'Unclassified')",
+    join: 'JOIN items mi ON mi.id = gl.item_id LEFT JOIN lookups it ON it.id = mi.item_type_id',
+    title: 'Item Type', drill: 'itemTypeId',
+  },
+  grnType: {
+    id: 'g.grn_type_id', label: "COALESCE(gt.name, 'Unspecified')",
+    join: 'LEFT JOIN lookups gt ON gt.id = g.grn_type_id', title: 'GRN Type', drill: 'grnTypeId',
+  },
+  user: {
+    id: 'g.received_by_user_id', label: "COALESCE(u.employee_name, 'Unassigned')",
+    join: 'LEFT JOIN users u ON u.id = g.received_by_user_id', title: 'Received By / User', drill: 'userId',
+  },
+  hod: {
+    id: "d.extra->>'hodUserId'", label: "COALESCE(hod_u.employee_name, 'Unassigned')",
+    join: "JOIN items mi ON mi.id = gl.item_id LEFT JOIN lookups d ON d.id = mi.department_id LEFT JOIN users hod_u ON hod_u.id = (d.extra->>'hodUserId')::bigint",
+    title: 'HOD', drill: 'hodId',
+  },
+};
+
+router.get(
+  '/grn-breakdown/:dimension',
+  requireAnyPermission('dashboard.analyze', 'grn.analyze'),
+  validateQuery(moduleBreakdownSchema),
+  asyncHandler(async (req, res) => {
+    const key = req.params.dimension ?? '';
+    const dim = dimensionOf(GRN_DIMENSIONS, key, 'GRN');
+    const f = parsedQuery<z.infer<typeof moduleBreakdownSchema>>(res);
+    const { rows, totals } = await groupedBreakdown({
+      dim,
+      lines: () => grnLineFilter(f),
+      from: 'FROM grn_lines gl JOIN grn_headers g ON g.id = gl.grn_id',
+      document: 'gl.grn_id',
+      // The GRN list's tiles (grnListTotals) over the same lines.
+      measures: { total_qty: 'SUM(gl.grn_qty)', total_value: 'SUM(gl.amount)' },
+      valueSql: 'SUM(gl.amount)',
+      qtySql: 'SUM(gl.grn_qty)',
+      sortSql: { value: 'SUM(gl.amount)', qty: 'SUM(gl.grn_qty)', count: 'COUNT(DISTINCT gl.grn_id)' }[f.sortBy],
+      limit: f.limit,
+    });
+    const grandTotal = totals.total_value ?? '0';
+    const data = rows.map((r) => ({
+      key: r.key,
+      label: r.label,
+      documentCount: Number(r.document_count),
+      lineCount: Number(r.line_count),
+      totalQty: r.total_qty ?? '0',
+      totalValue: r.total_value ?? '0',
+      sharePct: shareOf(r.total_value ?? 0, grandTotal),
+    }));
+    sendOk(res, data, meta(f, {
+      dimension: key,
+      dimensionTitle: dim.title,
+      drilldownParam: dim.drill,
+      drilldown: '/grn?status=POSTED',
+      grandTotalValue: grandTotal,
+      grandTotalQty: totals.total_qty ?? '0',
+      documentCount: Number(totals.document_count ?? 0),
+      groupCount: Number(totals.group_count ?? 0),
+      shown: data.length,
+      truncated: Number(totals.group_count ?? 0) > data.length,
     }));
   }),
 );
@@ -609,22 +907,25 @@ router.get(
    computed over the same filter — just a quantity vocabulary instead of a
    currency one. */
 
-const REQUISITION_DIMENSIONS: Record<string, { id: string; label: string; join: string; title: string; drill: string }> = {
+// Labels come from the masters, keyed as the group is: the header's copies of a name
+// (department_name, employee_name, hod_name) and a line's item snapshot can differ
+// between requisitions of one key, and each spelling made a bar of its own.
+const REQUISITION_DIMENSIONS: Record<string, BreakdownDimension> = {
   item: {
-    id: 'l.item_id', label: "l.item_code || ' — ' || l.item_description",
-    join: 'JOIN requisition_lines l ON l.requisition_id = h.id', title: 'Item', drill: 'itemId',
+    id: 'l.item_id', label: "mi.item_code || ' — ' || mi.item_description",
+    join: 'JOIN requisition_lines l ON l.requisition_id = h.id JOIN items mi ON mi.id = l.item_id', title: 'Item', drill: 'itemId',
   },
   department: {
-    id: 'h.department_id', label: "COALESCE(h.department_name, 'Unassigned')",
-    join: '', title: 'Department', drill: 'departmentId',
+    id: 'h.department_id', label: "COALESCE(d.name, 'Unassigned')",
+    join: 'LEFT JOIN lookups d ON d.id = h.department_id', title: 'Department', drill: 'departmentId',
   },
   requester: {
-    id: 'h.requester_user_id', label: "COALESCE(h.employee_name, 'Unknown')",
-    join: '', title: 'Requester', drill: 'requesterId',
+    id: 'h.requester_user_id', label: "COALESCE(ru.employee_name, 'Unknown')",
+    join: 'LEFT JOIN users ru ON ru.id = h.requester_user_id', title: 'Requester', drill: 'requesterId',
   },
   hod: {
-    id: 'h.hod_user_id', label: "COALESCE(h.hod_name, 'Unassigned')",
-    join: '', title: 'HOD', drill: 'hodId',
+    id: 'h.hod_user_id', label: "COALESCE(hu.employee_name, 'Unassigned')",
+    join: 'LEFT JOIN users hu ON hu.id = h.hod_user_id', title: 'HOD', drill: 'hodId',
   },
   machine: {
     id: 'h.machine_id', label: "COALESCE(m.name, 'Unspecified')",
@@ -635,8 +936,8 @@ const REQUISITION_DIMENSIONS: Record<string, { id: string; label: string; join: 
     join: 'LEFT JOIN lookups cc ON cc.id = h.cost_centre_id', title: 'Cost Centre', drill: 'costCentreId',
   },
   user: {
-    id: 'h.requester_user_id', label: "COALESCE(h.employee_name, 'Unknown')",
-    join: '', title: 'User / Requester', drill: 'userId',
+    id: 'h.requester_user_id', label: "COALESCE(ru.employee_name, 'Unknown')",
+    join: 'LEFT JOIN users ru ON ru.id = h.requester_user_id', title: 'User / Requester', drill: 'userId',
   },
 };
 
@@ -660,38 +961,52 @@ router.get(
     }
     const f = parsedQuery<z.infer<typeof requisitionBreakdownSchema>>(res);
 
-    const b = requisitionHeaderFilter(f);
-    const from = `FROM requisition_headers h JOIN v_requisition_header_balance bal ON bal.requisition_id = h.id ${dim.join}`;
+    // One row per requisition and key, then the requisition's own totals: joined to its
+    // lines, a requisition holding the item twice counted its totals twice, and under an
+    // item filter its other items got bars of their own whose rows opened another list.
+    // The grand total counts each requisition once.
+    const pairs = (b: SqlBuilder) => {
+      if (key === 'item' && f.itemId?.length) b.addRaw(`l.item_id = ANY(${b.push(f.itemId)})`);
+      return `SELECT DISTINCT h.id AS requisition_id, ${dim.id} AS key, ${dim.label} AS label
+                FROM requisition_headers h ${dim.join} ${b.where()}`;
+    };
 
     const sortColumn = {
       requestedQty: 'SUM(bal.total_requested_qty)', issuedQty: 'SUM(bal.total_issued_qty)',
-      count: 'COUNT(DISTINCT h.id)', pending: 'SUM(bal.total_pending_qty)',
+      count: 'COUNT(*)', pending: 'SUM(bal.total_pending_qty)',
     }[f.sortBy];
+    const b = requisitionHeaderFilter(f);
+    const pairSql = pairs(b);
     const limit = b.push(f.limit);
 
     const rows = await query<Record<string, string>>(
-      `SELECT ${dim.id}::text                        AS key,
-              ${dim.label}                            AS label,
-              COUNT(DISTINCT h.id)::int                AS requisition_count,
+      `SELECT k.key::text                             AS key,
+              k.label                                  AS label,
+              COUNT(*)::int                            AS requisition_count,
               SUM(bal.total_requested_qty)             AS total_requested_qty,
               SUM(bal.total_issued_qty)                AS total_issued_qty,
               SUM(bal.total_pending_qty)                AS total_pending_qty,
               SUM(bal.total_excess_qty)                 AS total_excess_qty
-         ${from} ${b.where()}
-        GROUP BY ${dim.id}, ${dim.label}
-        ORDER BY ${sortColumn} DESC NULLS LAST
+         FROM (${pairSql}) k
+         JOIN v_requisition_header_balance bal ON bal.requisition_id = k.requisition_id
+        GROUP BY k.key, k.label
+        ORDER BY ${sortColumn} DESC NULLS LAST, k.label
         LIMIT ${limit}`,
       b.params,
     );
 
     const tb = requisitionHeaderFilter(f);
     const [totals] = await query<Record<string, string>>(
-      `SELECT SUM(bal.total_requested_qty) AS total_requested_qty, COUNT(DISTINCT h.id)::int AS requisition_count,
-              COUNT(DISTINCT ${dim.id})::int AS group_count
-         FROM requisition_headers h JOIN v_requisition_header_balance bal ON bal.requisition_id = h.id ${dim.join}
+      `SELECT SUM(bal.total_requested_qty) AS total_requested_qty, COUNT(*)::int AS requisition_count
+         FROM requisition_headers h JOIN v_requisition_header_balance bal ON bal.requisition_id = h.id
          ${tb.where()}`,
       tb.params,
     );
+    const gb = requisitionHeaderFilter(f);
+    const [groups] = await query<{ group_count: number }>(
+      `SELECT ${groupCountSql('k.key')} AS group_count FROM (${pairs(gb)}) k`, gb.params,
+    );
+    const groupCount = Number(groups?.group_count ?? 0);
 
     const grandTotalQty = totals?.total_requested_qty ?? '0';
     const data = rows.map((r) => ({
@@ -709,11 +1024,13 @@ router.get(
       dimension: key,
       dimensionTitle: dim.title,
       drilldownParam: dim.drill,
+      // requisitionHeaderFilter leaves cancelled requisitions out, and so must the list a row opens.
+      drilldown: '/requisitions?excludeCancelled=true',
       grandTotalRequestedQty: grandTotalQty,
       requisitionCount: Number(totals?.requisition_count ?? 0),
-      groupCount: Number(totals?.group_count ?? 0),
+      groupCount,
       shown: data.length,
-      truncated: Number(totals?.group_count ?? 0) > data.length,
+      truncated: groupCount > data.length,
     }));
   }),
 );

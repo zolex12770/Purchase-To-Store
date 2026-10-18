@@ -20,13 +20,18 @@ import { toRate } from '../../domain/money.js';
 
 const router = Router();
 
-/** Shared projection: an item plus every resolved master label. */
+/**
+ * Shared projection: an item plus every resolved master label. Its pending GRN quantity
+ * is what issued, open orders still have to deliver (open_pending_qty, the Pending PO
+ * list's rule): a draft was counted, though no supplier has seen it (2026-10-17 E2E run,
+ * S2-D2).
+ */
 const ITEM_SELECT = `
   SELECT i.id, i.item_code, i.item_description, i.item_description AS item_name, i.hsn_code, i.item_specification,
          '' AS rack_id,
          i.standard_rate, i.reorder_level, i.min_stock, i.max_stock, i.reorder_qty, i.gst_rate,
          i.live_stock_qty, i.qc_required,
-         COALESCE((SELECT SUM(pending_grn_qty) FROM v_po_line_balance plb WHERE plb.item_id = i.id AND plb.is_receivable), 0) AS pending_grn_qty,
+         COALESCE((SELECT SUM(plb.open_pending_qty) FROM v_po_line_balance plb WHERE plb.item_id = i.id), 0) AS pending_grn_qty,
          i.is_active, i.created_at, i.updated_at,
          i.item_type_id,      it.name  AS item_type_name,
          i.department_id,     d.name   AS department_name,
@@ -287,13 +292,14 @@ router.get(
     if (!item) throw NotFoundError('Item');
 
     // "Live quantity" and "pending GRN quantity" the indent screen shows for an item
-    // (SRS §10) — derived from the authoritative balance views, never stored.
+    // (SRS §10) — derived from the authoritative balance views, never stored. Pending GRN
+    // is what issued, open orders still have to deliver, as on the Pending PO list.
     const [live] = await query<Record<string, unknown>>(
       `SELECT
          COALESCE((SELECT SUM(pending_qty) FROM v_indent_line_balance
                     WHERE item_id = $1 AND is_eligible_for_po), 0)          AS open_indent_qty,
-         COALESCE((SELECT SUM(pending_grn_qty) FROM v_po_line_balance
-                    WHERE item_id = $1 AND is_receivable), 0)               AS pending_grn_qty,
+         COALESCE((SELECT SUM(open_pending_qty) FROM v_po_line_balance
+                    WHERE item_id = $1), 0)                                 AS pending_grn_qty,
          COALESCE((SELECT SUM(received_qty) FROM v_po_line_balance
                     WHERE item_id = $1), 0)                                 AS total_received_qty,
          (SELECT final_rate FROM v_po_line_balance
