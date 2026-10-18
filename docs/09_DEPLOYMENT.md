@@ -277,3 +277,65 @@ systemctl restart zolex-erp
 
 Migrations are additive and checksum-verified. Editing an applied migration is a hard
 error — add a new one instead. Always back up before upgrading.
+
+---
+
+## 11. This server: Windows + pm2 — deploy, verify, roll back
+
+The production ERP runs on one Windows server under pm2: `zolex-purchase-backend`
+(`backend/dist/index.js`, port 4001) and `zolex-purchase-frontend` (`vite preview` of
+`frontend/dist`, port 8080, which also proxies `/api` to 4001). The same pm2 runs other
+systems (`sales-module` on 4100, `erp-sales-planning-production` on 4200, and a planning
+server on 5200). **Never** stop, restart or reconfigure those, and never run
+`pm2 restart all`, `pm2 delete all` or `pm2 save` as part of a Purchase deploy.
+
+The scripts are in `deploy/windows/` (pure ASCII: Windows PowerShell 5.1 reads `.ps1`
+files in the ANSI code page).
+
+### 11.1 Build
+
+```powershell
+cd backend
+npx tsc -p tsconfig.json --outDir dist-next
+node -e "require('fs').cpSync('src/db/migrations','dist-next/db/migrations',{recursive:true}); require('fs').cpSync('src/assets','dist-next/assets',{recursive:true})"
+cd ..\frontend
+npx tsc -b
+npx vite build --outDir dist-next
+```
+
+### 11.2 Rehearse on an isolated copy first
+
+1. Restore the latest backup into a scratch folder (the live database is never opened):
+   `cd backend; npx tsx src\db\cli-verify-restore.ts <backup file> --keep`.
+2. Build a second time with `--outDir dist-staging` and start the copy:
+   `deploy\windows\staging-instance.ps1 start -Root <kept folder>` (API 4012, UI 8092, no Google access).
+3. Exercise the changed workflows there; stop it with `staging-instance.ps1 stop`.
+
+### 11.3 Deploy
+
+1. **Backup:** Admin › Backup & Restore › Create backup, then Verify.
+2. **Backend:** `deploy\windows\deploy-backend.ps1 -Migration <newest migration file>`. It
+   checks the backup is less than 30 minutes old, waits for a moment outside the 15-minute
+   sheet sync, stops only `zolex-purchase-backend`, copies the whole data folder to
+   `<data root>\backups\data-copy-<stamp>` and compares it, swaps `dist` → `dist-prev-<stamp>`
+   and `dist-next` → `dist`, starts the app and waits for `/api/v1/health`. If the new
+   build does not come up it puts the previous build back by itself.
+3. **Frontend:** `deploy\windows\deploy-frontend.ps1` swaps the folders without stopping the
+   preview and keeps the previous build's assets reachable for open tabs.
+4. **Verify:** health on 4001 and through 8080, sign in, open the changed screens, check
+   `pm2 logs zolex-purchase-backend --lines 50` for errors, and that 4100, 4200 and 5200
+   still answer.
+
+### 11.4 Roll back
+
+- **Code only (normal):** `deploy\windows\rollback-backend.ps1 -PrevBuild dist-prev-<stamp>`
+  (the stamp is in `deploy\windows\deploy-backend-last.json`). Migrations are additive, so a
+  previous build runs on a newer schema; this was tested on 2026-10-18 with the `1a21b6d`
+  build on a copy at schema 030 (every module read and a write round trip succeeded).
+  Frontend: rename `frontend\dist` to `dist-rolledback-<stamp>` and
+  `frontend\dist-prev-<stamp>` back to `dist`.
+- **Data (exceptional):** prefer the application's audited undo endpoints, or Admin ›
+  Backup › Restore of a verified backup. As a last resort,
+  `rollback-backend.ps1 -PrevBuild <...> -RestoreDataCopy <data-copy folder> -AcceptLosingChangesAfterTheCopy`
+  moves the live data folder aside (never deletes it) and copies the pre-deploy copy in;
+  everything entered after the copy is then absent from the live database.
