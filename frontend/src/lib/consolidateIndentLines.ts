@@ -76,6 +76,26 @@ export function reallocateSources(fullSources: ConsolidatedSource[], newQty: num
   return result;
 }
 
+/** A saved PO line's source as GET /purchase-orders/:id returns it (v_po_line_sources). */
+export interface SavedSource {
+  indent_line_id: number | string;
+  indent_qty: number | string | null;
+}
+
+/**
+ * The indent quantity behind a saved PO line: the indent quantity of each indent line it
+ * draws from, each counted once, as consolidateEligibleLines adds it up when the PO is
+ * made. Null for a line no indent is behind. The edit form showed '—' for every line,
+ * though the PO carries its sources (2026-10-17 E2E run, S2-D4). Summed in
+ * ten-thousandths, as stored, so 0.1 + 0.2 stays 0.3.
+ */
+export function indentQtyOfSources(sources: readonly SavedSource[]): string | null {
+  if (sources.length === 0) return null;
+  const byLine = new Map<string, number>();
+  for (const s of sources) byLine.set(String(s.indent_line_id), Math.round(Number(s.indent_qty ?? 0) * 10_000));
+  return String([...byLine.values()].reduce((a, b) => a + b, 0) / 10_000);
+}
+
 export function consolidateEligibleLines(rows: EligibleIndentLine[]): ConsolidatedLine[] {
   const byItem = new Map<number, ConsolidatedLine>();
   for (const e of rows) {

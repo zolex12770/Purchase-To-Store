@@ -3,6 +3,7 @@
  * Configures the shared analysis engine for indent-side questions.
  */
 import { ModuleAnalysis } from '../../components/ModuleAnalysis';
+import { money, qty, count } from '../../lib/format';
 
 export default function IndentAnalysis() {
   return (
@@ -25,16 +26,36 @@ export default function IndentAnalysis() {
         { key: 'pendingCount', name: 'Awaiting approval', type: 'line', color: '#e0940f' },
       ]}
       trendValueKind="count"
+      // Filters the indent list applies, as it applies them: the department and cost
+      // centre are the indent's own. Item group and item type, which the list cannot
+      // filter, are left out: their bars opened every indent.
       dimensions={[
         { key: 'department', label: 'Department', param: 'departmentId' },
         { key: 'costCentre', label: 'Cost Centre', param: 'costCentreId' },
         { key: 'item', label: 'Item', param: 'itemId' },
-        { key: 'mainGroup', label: 'Item Group', param: 'mainGroupId' },
-        { key: 'itemType', label: 'Item Type', param: 'itemTypeId' },
+        { key: 'indentType', label: 'Indent Type', param: 'indentTypeId' },
+        { key: 'status', label: 'Status', param: 'status' },
+        { key: 'supplier', label: 'Suggested Supplier', param: 'supplierId' },
         { key: 'user', label: 'Requested By / User', param: 'userId' },
         { key: 'hod', label: 'HOD', param: 'hodId' },
       ]}
-      drilldownRoute="/indents"
+      // The trend leaves cancelled indents out, and so does the list a period opens.
+      drilldownRoute="/indents?excludeCancelled=true"
+      // The indents' own lines (/analytics/indent-breakdown): it drew purchase order lines.
+      breakdown={{
+        path: '/analytics/indent-breakdown',
+        documents: 'Indents',
+        columns: [
+          { header: 'Indents', cell: (r) => count(r.documentCount ?? 0), total: 'documents' },
+          { header: 'Indent qty', cell: (r) => qty(r.totalQty), total: 'qty' },
+          { header: 'Estimated value', cell: (r) => <span className="cell-strong">{money(r.totalValue)}</span>, total: 'value' },
+          { header: 'Ordered qty', cell: (r) => qty(r.orderedQty ?? 0) },
+          {
+            header: 'Not yet ordered',
+            cell: (r) => <span style={{ color: Number(r.pendingQty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>{qty(r.pendingQty ?? 0)}</span>,
+          },
+        ],
+      }}
       filterKeys={['dateRange', 'user', 'hod', 'department', 'costCentre', 'indentType', 'supplier', 'status', 'item']}
       statusOptions={[
         { value: 'DRAFT', label: 'Draft' },

@@ -46,6 +46,8 @@ interface PoLine {
   po_qty: string;
   received_qty: string;
   pending_grn_qty: string;
+  /** Still to be received: 0 on a short-closed, cancelled or draft order and on a closed line (migration 031). */
+  open_pending_qty: string;
   rate: string;
   discount_pct: string;
   final_rate: string;
@@ -453,8 +455,10 @@ export default function PoDetail() {
                     <td className="right num">{Number(l.gst_pct) > 0 ? percent(l.gst_pct, 2) : '—'}</td>
                     <td className="right num cell-muted">{money(l.gst_amount)}</td>
                     <td className="right num" style={{ color: 'var(--success-600)' }}>{qty(l.received_qty)}</td>
-                    <td className="right num" style={{ color: Number(l.pending_grn_qty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)', fontWeight: 600 }}>
-                      {qty(l.pending_grn_qty)}
+                    {/* What the order still expects, as the tiles and the total below count it:
+                        a short-closed order's lines said 6 pending under a total of 0. */}
+                    <td className="right num" style={{ color: Number(l.open_pending_qty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)', fontWeight: 600 }}>
+                      {qty(l.open_pending_qty)}
                     </td>
                     <td className="center"><StatusBadge status={l.line_status} /></td>
                   </tr>

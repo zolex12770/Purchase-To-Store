@@ -50,6 +50,8 @@ import { qty, money, today, text, formatDate, count } from '../../lib/format';
 import {
   groupRows, groupState, toggleOne, toggleGroup, documentCount, lockedSupplier,
 } from '../../lib/pickSelection';
+import { grnSaveOutcome } from '../../lib/grnQc';
+import { refreshAfterGrnChange } from '../../lib/grnRefresh';
 
 type Mode = 'choose' | 'PO' | 'DIRECT';
 
@@ -508,18 +510,16 @@ export default function GrnForm() {
     },
     onSuccess: (res, vars) => {
       setReview(null);
-      // Items that need quality inspection are held out of stock until QC passes them.
-      const held = vars.post && res.qc_status === 'PENDING_QC';
-      toast.success(
-        vars.post ? 'GRN posted' : 'GRN saved as draft',
-        held ? `${res.grn_no} — items that need quality inspection are held until QC passes them.` : res.grn_no,
-      );
-      void qc.invalidateQueries({ queryKey: ['grn'] });
-      void qc.invalidateQueries({ queryKey: ['grn-po-items-pending'] });
-      void qc.invalidateQueries({ queryKey: ['purchase-orders'] });
-      void qc.invalidateQueries({ queryKey: ['home-work'] });
+      // 'Save changes' on a posted GRN also sends post: true; it was announced as 'GRN
+      // posted'. Items that need quality inspection are held out of stock until QC
+      // passes them.
+      const outcome = grnSaveOutcome({ postedEdit: isPostedEdit, post: vars.post, qcStatus: res.qc_status, grnNo: res.grn_no });
+      toast.success(outcome.title, outcome.detail);
+      // The GRN screen, the PO screen and the QC queue as well as the lists: the GRN
+      // screen showed its copy from before the save (2026-10-17 E2E run, S3-D8).
+      void refreshAfterGrnChange(qc);
       // The GRN screen opens with its number, its status and what can be done next.
-      navigate(`/grn/${res.id}`, { state: { justSaved: vars.post ? 'posted' : 'draft' } });
+      navigate(`/grn/${res.id}`, { state: { justSaved: outcome.justSaved } });
     },
     onError: (err) => {
       setReview(null);

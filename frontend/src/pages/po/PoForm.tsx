@@ -51,7 +51,8 @@ import {
 } from '../../components/simple';
 import { money, qty, today, text, count, formatDate } from '../../lib/format';
 import { type Charge, type ChargeMode, emptyCharge, chargePercentOf, computePoTotals, lineGstAmount } from '../../lib/poCalc';
-import { consolidateEligibleLines, reallocateSources } from '../../lib/consolidateIndentLines';
+import { consolidateEligibleLines, reallocateSources, indentQtyOfSources, type SavedSource } from '../../lib/consolidateIndentLines';
+import { choicesKeeping } from '../../lib/choices';
 import { groupRows, groupState, toggleOne, toggleGroup, documentCount } from '../../lib/pickSelection';
 
 interface SourceRef {
@@ -472,7 +473,7 @@ export default function PoForm() {
         itemCode: String(l.item_code ?? ''),
         itemDescription: String(l.item_description ?? ''),
         itemSpecification: String(l.item_specification ?? ''),
-        indentQty: null,
+        indentQty: indentQtyOfSources((l.sources ?? []) as unknown as SavedSource[]),
         poQty: String(l.po_qty ?? ''),
         uomId: l.uom_id ? Number(l.uom_id) : null,
         rate: String(l.rate ?? ''),
@@ -573,6 +574,9 @@ export default function PoForm() {
       setReview(null);
       toast.success(vars.issue ? 'Purchase order issued' : 'Purchase order saved', res.po_no);
       void qc.invalidateQueries({ queryKey: ['purchase-orders'] });
+      // The PO screen and this form read ['purchase-order', id], which ['purchase-orders']
+      // does not cover: after an edit the PO screen showed the copy from before it.
+      void qc.invalidateQueries({ queryKey: ['purchase-order'] });
       void qc.invalidateQueries({ queryKey: ['indents'] });
       void qc.invalidateQueries({ queryKey: ['home-work'] });
       // The PO screen opens with its number and what can be done next.
@@ -910,7 +914,9 @@ export default function PoForm() {
                 onChange={(e) => { paymentTermsManualRef.current = true; setPaymentTerms(e.target.value); }}
                 placeholder="Select terms"
               >
-                {paymentTermsOptions.map((o) => <option key={o.value} value={o.label}>{o.label}</option>)}
+                {choicesKeeping(paymentTermsOptions.map((o) => o.label), paymentTerms).map((label, i) => (
+                  <option key={`${i}-${label}`} value={label}>{label}</option>
+                ))}
               </Select>
             </Field>
             {selectedSupplier && (

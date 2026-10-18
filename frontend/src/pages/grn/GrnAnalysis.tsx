@@ -2,6 +2,7 @@
  * GRN — Analysis (SRS §12).
  */
 import { ModuleAnalysis } from '../../components/ModuleAnalysis';
+import { money, qty, count } from '../../lib/format';
 
 export default function GrnAnalysis() {
   return (
@@ -31,7 +32,20 @@ export default function GrnAnalysis() {
         { key: 'user', label: 'Received By / User', param: 'userId' },
         { key: 'hod', label: 'HOD', param: 'hodId' },
       ]}
-      drilldownRoute="/grn"
+      // The trend counts posted receipts, direct ones included: the list a period opens.
+      drilldownRoute="/grn?status=POSTED"
+      // Posted receipt lines, direct ones included (/analytics/grn-breakdown): the PO
+      // breakdown it drew left out 2,716 of the 2,718 GRNs.
+      breakdown={{
+        path: '/analytics/grn-breakdown',
+        documents: 'Goods receipts',
+        columns: [
+          { header: 'GRNs', cell: (r) => count(r.documentCount ?? 0), total: 'documents' },
+          { header: 'Lines', cell: (r) => count(r.lineCount) },
+          { header: 'Received qty', cell: (r) => qty(r.totalQty), total: 'qty' },
+          { header: 'Received value', cell: (r) => <span className="cell-strong">{money(r.totalValue)}</span>, total: 'value' },
+        ],
+      }}
       filterKeys={['dateRange', 'user', 'hod', 'department', 'costCentre', 'supplier', 'mainGroup', 'item']}
       ageingBasis="po"
       ageingTitle="Ordered value awaiting goods receipt"

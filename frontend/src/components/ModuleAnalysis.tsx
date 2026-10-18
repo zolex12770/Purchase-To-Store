@@ -4,17 +4,23 @@
  * Indent, Purchase Order and GRN each require an Analysis view. They ask the same
  * questions of the same authoritative data, so they share ONE implementation
  * configured per module rather than three near-identical copies (build brief §54).
+ *
+ * Each module's breakdown groups its own records (`breakdown.path`): the Indent and
+ * GRN screens drew the PO breakdown and opened the indent and GRN lists, so a bar
+ * counted purchase orders and the list it opened showed something else (2026-10-17
+ * E2E run, S1-D2). A bar opens the list the server names for it (meta.drilldown).
  */
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Printer, Download } from 'lucide-react';
 import { api, qs, downloadFile } from '../lib/api';
 import { useFilters, drilldownLink, type FilterState } from '../lib/useFilters';
+import { periodRange, isDrillable, kpiPanelState } from '../lib/analysis';
 import { PageHeader, PrintHeader } from '../layout/AppShell';
 import { FilterBar, type FilterKey } from './FilterBar';
 import { KpiCard, KpiGrid, type MetricValue } from './KpiCard';
-import { Card, CardBody, Button, Tabs, EmptyState, LoadingBlock } from './ui';
+import { Card, CardBody, Button, Tabs, EmptyState, ErrorState, LoadingBlock, Banner } from './ui';
 import { ChartFrame, TrendChart, RankBarChart, DonutChart, AgeingChart, type BreakdownRow, type AgeingBucket, type TrendPoint } from './charts';
 import { money, qty, count, percent, moneyCompact } from '../lib/format';
 
@@ -23,6 +29,25 @@ export interface AnalysisDimension {
   label: string;
   /** Query param used when drilling into the list. */
   param: string;
+}
+
+/** A column of the breakdown table after the group's label; `total` picks the footer figure. */
+export interface BreakdownColumn {
+  header: string;
+  cell: (row: BreakdownRow) => ReactNode;
+  total?: 'documents' | 'qty' | 'value';
+}
+
+interface BreakdownMeta {
+  dimensionTitle: string;
+  drilldownParam: string;
+  /** The list each bar opens, its key under drilldownParam (backend analytics/routes.ts). */
+  drilldown: string;
+  grandTotalValue: string;
+  grandTotalQty: string;
+  documentCount: number;
+  groupCount: number;
+  truncated: boolean;
 }
 
 export interface ModuleAnalysisProps {
@@ -35,8 +60,13 @@ export interface ModuleAnalysisProps {
   trendSeries: { key: string; name: string; type: 'bar' | 'line' | 'area'; color: string }[];
   trendValueKind: 'currency' | 'count' | 'quantity';
   dimensions: AnalysisDimension[];
-  /** Route the drill-down lands on. */
+  /**
+   * The list a trend point opens, scoped as the trend counts: '/purchase-orders' listed
+   * the cancelled orders the trend leaves out (2026-10-17 E2E run, S1-D3).
+   */
   drilldownRoute: string;
+  /** This module's own breakdown: its endpoint, what it counts, and its table's columns. */
+  breakdown: { path: string; documents: string; columns: BreakdownColumn[] };
   filterKeys: FilterKey[];
   statusOptions?: { value: string; label: string }[];
   /** Ageing basis, or omit to hide the ageing panel. */
@@ -45,9 +75,15 @@ export interface ModuleAnalysisProps {
   exportDataset?: string;
 }
 
+/** The list an ageing bucket opens: what the ageing counts, still to be received or ordered. */
+const AGEING_DRILL: Record<'po' | 'indent', string> = {
+  po: '/purchase-orders/pending',
+  indent: '/indents?eligibleOnly=true',
+};
+
 export function ModuleAnalysis({
   title, subtitle, breadcrumbs, metricKeys, trendSeries, trendValueKind,
-  dimensions, drilldownRoute, filterKeys, statusOptions, ageingBasis, ageingTitle, exportDataset,
+  dimensions, drilldownRoute, breakdown: config, filterKeys, statusOptions, ageingBasis, ageingTitle, exportDataset,
 }: ModuleAnalysisProps) {
   const navigate = useNavigate();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
@@ -76,10 +112,8 @@ export function ModuleAnalysis({
   });
 
   const breakdown = useQuery({
-    queryKey: ['analytics', 'breakdown', dimension, query],
-    queryFn: () => api.getWithMeta<BreakdownRow[], { dimensionTitle: string; grandTotalValue: string; groupCount: number; truncated: boolean }>(
-      `/analytics/breakdown/${dimension}${query}${sep}limit=12`,
-    ),
+    queryKey: ['analytics', config.path, dimension, query],
+    queryFn: () => api.getWithMeta<BreakdownRow[], BreakdownMeta>(`${config.path}/${dimension}${query}${sep}limit=12`),
   });
 
   const ageing = useQuery({
@@ -92,10 +126,22 @@ export function ModuleAnalysis({
   const featured = metricKeys
     .map((k) => allMetrics.find((m) => m.key === k))
     .filter(Boolean) as MetricValue[];
+  const kpiState = kpiPanelState(kpis, featured.length);
 
   const activeDim = dimensions.find((d) => d.key === dimension)!;
-  const drill = (extra: Record<string, unknown>) =>
-    navigate(drilldownLink(drilldownRoute, extra, filters as FilterState));
+  const drill = (extra: Record<string, unknown>, base = drilldownRoute) =>
+    navigate(drilldownLink(base, extra, filters as FilterState));
+  // A bar opens the list the server says it counts; a bar without a key opens nothing.
+  const drillBar = (key: string | null) => {
+    if (!isDrillable(key)) return;
+    const meta = breakdown.data?.meta;
+    drill({ [meta?.drilldownParam ?? activeDim.param]: [key] }, meta?.drilldown ?? drilldownRoute);
+  };
+  const footerTotal = (total: BreakdownColumn['total'], meta: BreakdownMeta) =>
+    total === 'value' ? money(meta.grandTotalValue)
+      : total === 'qty' ? qty(meta.grandTotalQty)
+        : total === 'documents' ? count(meta.documentCount)
+          : null;
 
   const filterSummary = [
     filters.dateFrom || filters.dateTo ? `${filters.dateFrom ?? 'start'} to ${filters.dateTo ?? 'today'}` : 'All time',
@@ -131,7 +177,12 @@ export function ModuleAnalysis({
         show={filterKeys} statusOptions={statusOptions}
       />
 
-      {kpis.isLoading ? (
+      {kpis.error && kpis.data && (
+        <Banner tone="danger" action={<Button variant="secondary" size="sm" onClick={() => void kpis.refetch()}>Try again</Button>}>
+          The indicators could not be refreshed; the figures below are from the last successful load.
+        </Banner>
+      )}
+      {kpiState === 'loading' ? (
         <KpiGrid>
           {Array.from({ length: metricKeys.length }).map((_, i) => (
             <div key={i} className="card" style={{ padding: 'var(--sp-5)' }}>
@@ -140,7 +191,11 @@ export function ModuleAnalysis({
             </div>
           ))}
         </KpiGrid>
-      ) : featured.length > 0 ? (
+      ) : kpiState === 'error' ? (
+        <Card><CardBody>
+          <ErrorState error={kpis.error} onRetry={() => void kpis.refetch()} title="Could not load the indicators" />
+        </CardBody></Card>
+      ) : kpiState === 'ready' ? (
         <KpiGrid min={215}>
           {featured.map((m) => (
             <KpiCard key={m.key} metric={m} onClick={m.drilldown ? () => navigate(drilldownLink(m.drilldown, {}, filters as FilterState)) : undefined} />
@@ -171,7 +226,8 @@ export function ModuleAnalysis({
             data={trends.data ?? []}
             series={trendSeries}
             valueKind={trendValueKind}
-            onPointClick={(p) => drill({ dateFrom: String(p.period), dateTo: String(p.period) })}
+            // The whole period the point stands for: it opened only the period's first day.
+            onPointClick={(p) => drill(periodRange(String(p.period), granularity, filters))}
           />
         </ChartFrame>
 
@@ -185,7 +241,7 @@ export function ModuleAnalysis({
             isEmpty={(ageing.data ?? []).every((b) => b.lineCount === 0)}
             onRetry={() => void ageing.refetch()}
           >
-            <AgeingChart data={ageing.data ?? []} onBucketClick={() => drill({})} />
+            <AgeingChart data={ageing.data ?? []} onBucketClick={() => drill({}, AGEING_DRILL[ageingBasis])} />
           </ChartFrame>
         )}
       </div>
@@ -194,9 +250,9 @@ export function ModuleAnalysis({
         <Card>
           <div className="card-header" style={{ flexWrap: 'wrap' }}>
             <div className="grow" style={{ minWidth: 200 }}>
-              <div className="card-title">Analysis by {activeDim.label.toLowerCase()}</div>
+              <div className="card-title">{config.documents} by {activeDim.label.toLowerCase()}</div>
               <div className="card-subtitle">
-                Click any bar, slice or row to open the underlying records
+                Click any bar, slice or row to open the {config.documents.toLowerCase()} it counts
                 {breakdown.data?.meta.truncated && ` · top 12 of ${breakdown.data.meta.groupCount}`}
               </div>
             </div>
@@ -210,6 +266,8 @@ export function ModuleAnalysis({
           <CardBody>
             {breakdown.isLoading ? (
               <LoadingBlock height={300} />
+            ) : breakdown.error ? (
+              <ErrorState error={breakdown.error} onRetry={() => void breakdown.refetch()} />
             ) : (breakdown.data?.data ?? []).length === 0 ? (
               <EmptyState title="No data for these filters" message="Widen the date range or clear some filters." />
             ) : (
@@ -217,45 +275,41 @@ export function ModuleAnalysis({
                 <RankBarChart
                   data={breakdown.data!.data}
                   height={Math.max(270, breakdown.data!.data.length * 26)}
-                  onBarClick={(row) => drill({ [activeDim.param]: [row.key] })}
+                  documentsLabel={config.documents}
+                  onBarClick={(row) => drillBar(row.key)}
                 />
                 <DonutChart
-                  data={breakdown.data!.data.slice(0, 8).map((d) => ({ key: d.key, label: d.label, value: Number(d.totalValue) }))}
+                  data={breakdown.data!.data.slice(0, 8).map((d) => ({ key: d.key ?? '', label: d.label, value: Number(d.totalValue) }))}
                   height={290}
                   centerLabel="Total"
                   centerValue={moneyCompact(breakdown.data!.meta.grandTotalValue)}
-                  onSliceClick={(key) => drill({ [activeDim.param]: [key] })}
+                  onSliceClick={(key) => drillBar(key)}
                 />
               </div>
             )}
           </CardBody>
 
-          {(breakdown.data?.data ?? []).length > 0 && (
+          {!breakdown.error && (breakdown.data?.data ?? []).length > 0 && (
             <CardBody flush>
               <div className="table-wrap" style={{ maxHeight: 400 }}>
                 <table className="table table-compact">
                   <thead>
                     <tr>
                       <th>{activeDim.label}</th>
-                      <th className="right">Documents</th>
-                      <th className="right">Quantity</th>
-                      <th className="right">Value</th>
-                      <th className="right">Received</th>
-                      <th className="right">Pending</th>
+                      {config.columns.map((c) => <th key={c.header} className="right">{c.header}</th>)}
                       <th className="right">Share</th>
                     </tr>
                   </thead>
                   <tbody>
                     {breakdown.data!.data.map((row) => (
-                      <tr key={row.key} className="clickable" onClick={() => drill({ [activeDim.param]: [row.key] })}>
+                      <tr
+                        key={row.key ?? '∅'}
+                        className={isDrillable(row.key) ? 'clickable' : undefined}
+                        onClick={() => drillBar(row.key)}
+                        title={isDrillable(row.key) ? undefined : 'No list filter selects this group'}
+                      >
                         <td className="cell-strong truncate" style={{ maxWidth: 300 }}>{row.label}</td>
-                        <td className="right num">{count(row.poCount)}</td>
-                        <td className="right num">{qty(row.totalQty)}</td>
-                        <td className="right num cell-strong">{money(row.totalValue)}</td>
-                        <td className="right num" style={{ color: 'var(--success-600)' }}>{money(row.receivedValue)}</td>
-                        <td className="right num" style={{ color: Number(row.pendingValue) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>
-                          {money(row.pendingValue)}
-                        </td>
+                        {config.columns.map((c) => <td key={c.header} className="right num">{c.cell(row)}</td>)}
                         <td className="right num">{percent(row.sharePct)}</td>
                       </tr>
                     ))}
@@ -263,9 +317,10 @@ export function ModuleAnalysis({
                   <tfoot>
                     <tr>
                       <td>Total ({breakdown.data!.meta.groupCount})</td>
-                      <td colSpan={2} />
-                      <td className="right num">{money(breakdown.data!.meta.grandTotalValue)}</td>
-                      <td colSpan={3} />
+                      {config.columns.map((c) => (
+                        <td key={c.header} className="right num">{footerTotal(c.total, breakdown.data!.meta)}</td>
+                      ))}
+                      <td />
                     </tr>
                   </tfoot>
                 </table>

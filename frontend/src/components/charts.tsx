@@ -325,30 +325,42 @@ export function TrendChart({
 
 /* ── Horizontal ranking bars ─────────────────────────────────────────────── */
 
+/**
+ * One bar of an analytics breakdown (backend analytics/routes.ts). Every breakdown has
+ * the counted documents, lines, quantity and value; the PO breakdown adds receipts and
+ * pending, the indent breakdown what is ordered and still to order. A NULL key is the
+ * 'Unassigned' group.
+ */
 export interface BreakdownRow {
-  key: string;
+  key: string | null;
   label: string;
-  poCount: number;
+  /** Documents counted: purchase orders, indents or goods receipts. */
+  documentCount?: number;
+  /** The PO breakdown's documents (the same as documentCount there). */
+  poCount?: number;
   lineCount: number;
   totalQty: string;
   totalValue: string;
-  receivedQty: string;
-  receivedValue: string;
-  pendingQty: string;
-  pendingValue: string;
-  avgRate: string;
-  avgDiscount: string;
+  receivedQty?: string;
+  receivedValue?: string;
+  orderedQty?: string;
+  pendingQty?: string;
+  pendingValue?: string;
+  avgRate?: string;
+  avgDiscount?: string;
   sharePct: number;
 }
 
 /** One measure, one colour: rank is position, not hue. */
 export function RankBarChart({
-  data, height = 320, onBarClick, valueKey = 'totalValue',
+  data, height = 320, onBarClick, valueKey = 'totalValue', documentsLabel = 'Purchase orders',
 }: {
   data: BreakdownRow[];
   height?: number;
   onBarClick?: (row: BreakdownRow) => void;
   valueKey?: 'totalValue' | 'totalQty' | 'pendingValue';
+  /** What the counted documents are called in the tooltip. */
+  documentsLabel?: string;
 }) {
   const { t, tick, grid, cursor } = useChrome();
   const fill = valueKey === 'pendingValue' ? t['--chart-2'] : t['--chart-1'];
@@ -375,8 +387,8 @@ export function RankBarChart({
                 <div style={{ fontWeight: 600, marginBottom: 5 }}>{row.label}</div>
                 <Line2 label="Value" value={money(row.totalValue)} />
                 <Line2 label="Quantity" value={fmtQty(row.totalQty)} />
-                <Line2 label="Purchase orders" value={String(row.poCount)} />
-                <Line2 label="Pending value" value={money(row.pendingValue)} />
+                <Line2 label={documentsLabel} value={String(row.documentCount ?? row.poCount ?? 0)} />
+                {row.pendingValue !== undefined && <Line2 label="Pending value" value={money(row.pendingValue)} />}
                 <Line2 label="Share" value={percent(row.sharePct)} />
                 {onBarClick && (
                   <div style={{ marginTop: 5, paddingTop: 4, borderTop: '1px solid var(--border-subtle)', color: 'var(--text-link)', fontWeight: 600 }}>
