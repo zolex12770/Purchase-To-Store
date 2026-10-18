@@ -874,8 +874,9 @@ function StoreIssueModal({
     >
       {figuresMoved && (
         <Banner tone="warning" block>
-          Another issue was posted or reversed on this requisition while this dialog was open. The figures below are
-          current and the quantities start again from what is pending: check them before issuing.
+          The issued quantities changed while this dialog was open: an issue was posted or reversed on this
+          requisition. The figures below are current and the quantities start again from what is pending. Check them
+          before issuing.
         </Banner>
       )}
       <div className="table-wrap">
