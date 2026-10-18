@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   KNOWN_STATUSES, statusMeta, stockStatusKey, movementMeta, categoryIdentity, severityTone, sentenceCase,
+  LEDGER_TXN_TYPES,
 } from './status';
 
 const TONES = ['neutral', 'pending', 'attention', 'info', 'progress', 'success', 'danger', 'closed', 'void', 'warning'];
@@ -95,6 +96,25 @@ describe('movementMeta', () => {
     expect(m.direction).toBe('in');
     expect(m.label).toBe('Opening stock');
     expect(movementMeta(null).label).toBe('—');
+  });
+
+  // The ledger filter offered four types and its badges named four; INVENTORY_IN, INVENTORY_OUT,
+  // INVENTORY_REVERSAL and STOCK_ADJUSTMENT_REVERSAL showed as raw codes (E2E S5-15b).
+  it('lists every type the stock ledger records, each with a label of its own', () => {
+    expect([...LEDGER_TXN_TYPES].sort()).toEqual([
+      'DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL', 'GRN_INWARD', 'GRN_REVERSAL', 'INVENTORY_ADJUST', 'INVENTORY_IN',
+      'INVENTORY_OUT', 'INVENTORY_REVERSAL', 'REQUISITION_ISSUE', 'REQUISITION_REVERSAL', 'SHEET_SYNC',
+      'STOCK_ADJUSTMENT', 'STOCK_ADJUSTMENT_REVERSAL', 'STOCK_ALIGNMENT',
+    ]);
+    const labels = LEDGER_TXN_TYPES.map((t) => movementMeta(t).label);
+    LEDGER_TXN_TYPES.forEach((t, i) => expect(labels[i], t).not.toMatch(/_|^[A-Z_]+$/));
+    // GRN_INWARD and GRN_RECEIPT are one movement; no two ledger types share a label.
+    expect(new Set(labels).size).toBe(labels.length);
+    expect(movementMeta('INVENTORY_IN', 'IN')).toMatchObject({ label: 'Receipt entered in ERP', direction: 'in' });
+    expect(movementMeta('INVENTORY_OUT', 'OUT')).toMatchObject({ label: 'Issue entered in ERP', direction: 'out' });
+    expect(movementMeta('INVENTORY_REVERSAL', 'IN')).toMatchObject({ label: 'ERP entry reversal', direction: 'in' });
+    expect(movementMeta('REQUISITION_REVERSAL', 'IN')).toMatchObject({ label: 'Requisition issue reversal', direction: 'in' });
+    expect(movementMeta('STOCK_ADJUSTMENT_REVERSAL', 'OUT')).toMatchObject({ label: 'Count adjustment reversal', direction: 'adjust' });
   });
 });
 

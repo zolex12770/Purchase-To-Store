@@ -9,7 +9,7 @@
  * 5. Requisition Issue Queue: Approved requisitions awaiting store issue with live stock check
  * 6. Auto Indent Replenishment: Min/Max/Reorder threshold analysis & 1-click PO Indent conversion
  */
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useNavigate, useSearchParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -27,10 +27,11 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { StatTile } from '../../components/KpiCard';
 import {
-  Button, Card, CardBody, CardHeader, Badge, StatusBadge,
+  Button, Card, CardBody, CardHeader, Badge, StatusBadge, MovementChip,
   Modal, Field, Textarea, Select, Input,
 } from '../../components/ui';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
+import { LEDGER_TXN_TYPES, movementMeta } from '../../lib/status';
 import { CategoryWorkspaceView, describeSync, type InventoryCategoryKey } from './CategoryWorkspaceView';
 
 /* ── Type Interfaces ────────────────────────────────────────────────────────── */
@@ -215,7 +216,11 @@ interface AutoIndentRow {
   approver_name: string | null;
   approved_at: string | null;
   rejection_reason: string | null;
-  generated_indent_id: number | null;
+  /** The indent a converted suggestion became (auto_indents.indent_id; null once that indent is deleted). */
+  indent_id: number | null;
+  indent_no: string;
+  /** The server's own approve rule for this user and status (backend inventory/routes.ts). */
+  can_approve: boolean;
   created_at: string;
 }
 
@@ -331,13 +336,15 @@ export default function InventoryStockPage() {
   const [adjSearch, setAdjSearch] = useState('');
   const [isAdjModalOpen, setIsAdjModalOpen] = useState(false);
   const [adjItemSearch, setAdjItemSearch] = useState('');
+  // The item only: its book stock is loaded when the modal opens (adjBookStock below).
   const [selectedAdjItem, setSelectedAdjItem] = useState<{
     id: number;
     code: string;
     description: string;
     category: string;
-    currentStock: number;
     uom: string;
+    /** The category workspace's own (sheet) figure, when the count was opened from a workspace row. */
+    sheetStock?: number;
   } | null>(null);
   const [adjActualCount, setAdjActualCount] = useState<string>('');
   const [adjReason, setAdjReason] = useState<string>('Cycle Count Reconciliation');
@@ -451,6 +458,29 @@ export default function InventoryStockPage() {
     enabled: isAdjModalOpen && adjItemSearch.length >= 2,
   });
 
+  // The book stock the count is posted against: the item's ERP stock, read fresh whenever the
+  // modal opens on an item, from whichever screen. A category workspace passed its own sheet
+  // figure instead, so the modal showed 6 as the book stock while the server posted against 26,
+  // and the pre-filled count took the stock from 26 to 6 (E2E S5-18).
+  const adjItemId = isAdjModalOpen ? selectedAdjItem?.id : undefined;
+  const adjBookQuery = useQuery({
+    queryKey: ['inventory-adj-book-stock', adjItemId],
+    queryFn: () => api.getWithMeta<StockRow[], PageMeta>(`/inventory/stock${qs({ itemId: adjItemId, pageSize: 1 })}`),
+    enabled: adjItemId !== undefined,
+    // Never an earlier read: a count reopened later must not be pre-filled with an old figure.
+    staleTime: 0,
+    gcTime: 0,
+  });
+  const adjBookRow = adjBookQuery.data?.data?.find((r) => r.item_id === adjItemId);
+  const adjBookStock = adjBookRow ? Number(adjBookRow.live_stock_qty || 0) : null;
+  const adjBookMissing = adjItemId !== undefined && adjBookQuery.isSuccess && !adjBookRow;
+
+  // Pre-fill the count with the book stock once it is known, as before, never over a typed figure.
+  useEffect(() => {
+    if (adjItemId === undefined || adjBookStock === null) return;
+    setAdjActualCount((c) => (c === '' ? String(adjBookStock) : c));
+  }, [adjItemId, adjBookStock]);
+
   // 5. Requisition Queue
   const { data: reqQueueData, isLoading: reqQueueLoading } = useQuery({
     queryKey: ['inventory-requisition-queue'],
@@ -488,7 +518,9 @@ export default function InventoryStockPage() {
 
   // Stock Adjustment Submit
   const adjustmentMutation = useMutation({
-    mutationFn: (payload: { itemId: number; actualStockQty: number; reason: string; findings: string; remarks: string }) =>
+    mutationFn: (payload: {
+      itemId: number; actualStockQty: number; expectedSystemQty: number; reason: string; findings: string; remarks: string;
+    }) =>
       api.post<{ adjustmentNo: string; deltaQty: string; message: string }>('/inventory/adjustments', payload),
     onSuccess: (res) => {
       toast.success(res.message);
@@ -502,7 +534,11 @@ export default function InventoryStockPage() {
       void qc.invalidateQueries({ queryKey: ['inventory-adjustments'] });
       void qc.invalidateQueries({ queryKey: ['inventory-overview'] });
     },
-    onError: (err) => toast.fromError(err, 'Failed to post physical stock adjustment'),
+    onError: (err) => {
+      toast.fromError(err, 'Failed to post physical stock adjustment');
+      // A refused count (the book stock moved since it was read) shows the current figure.
+      void qc.invalidateQueries({ queryKey: ['inventory-adj-book-stock'] });
+    },
   });
 
   // Stock Adjustment Reverse — undoes the count through its own reversal ledger entry
@@ -620,28 +656,24 @@ export default function InventoryStockPage() {
 
   /* ── Stock Adjustment Helper ────────────────────────────────────────────── */
 
-  const openAdjustmentForItem = (r: StockRow) => {
-    setSelectedAdjItem({
-      id: r.item_id,
-      code: r.item_code,
-      description: r.item_description,
-      category: r.category,
-      currentStock: Number(r.live_stock_qty || 0),
-      uom: r.uom_code,
-    });
-    setAdjActualCount(String(r.live_stock_qty || 0));
+  const openAdjustment = (item: NonNullable<typeof selectedAdjItem>) => {
+    setSelectedAdjItem(item);
+    setAdjActualCount(''); // pre-filled with the book stock once it is loaded
     setAdjReason('Cycle Count Reconciliation');
     setAdjFindings('');
     setAdjRemarks('');
     setIsAdjModalOpen(true);
   };
 
+  const openAdjustmentForItem = (r: StockRow) =>
+    openAdjustment({ id: r.item_id, code: r.item_code, description: r.item_description, category: r.category, uom: r.uom_code });
+
   const computedDelta = useMemo(() => {
-    if (!selectedAdjItem || adjActualCount === '') return 0;
+    if (adjBookStock === null || adjActualCount === '') return 0;
     const actual = Number(adjActualCount);
     if (isNaN(actual)) return 0;
-    return actual - selectedAdjItem.currentStock;
-  }, [selectedAdjItem, adjActualCount]);
+    return actual - adjBookStock;
+  }, [adjBookStock, adjActualCount]);
 
   /* ── Tab Columns ────────────────────────────────────────────────────────── */
 
@@ -817,13 +849,8 @@ export default function InventoryStockPage() {
       key: 'txn_type',
       header: 'Movement Type',
       align: 'center',
-      render: (r) => {
-        if (r.txn_type === 'GRN_INWARD') return <Badge tone="success">GRN Inward</Badge>;
-        if (r.txn_type === 'REQUISITION_ISSUE') return <Badge tone="warning">Requisition Issue</Badge>;
-        if (r.txn_type === 'DIRECT_ISSUE') return <Badge tone="info">Direct Store Issue</Badge>;
-        if (r.txn_type === 'STOCK_ADJUSTMENT') return <Badge tone="info">Stock Adjustment</Badge>;
-        return <Badge tone="neutral">{r.txn_type}</Badge>;
-      },
+      // Every ledger type in words (lib/status.ts): four were mapped and the rest showed raw codes (E2E S5-15b).
+      render: (r) => <MovementChip type={r.txn_type} direction={Number(r.inward_qty || 0) > 0 ? 'IN' : 'OUT'} />,
     },
     {
       key: 'reference_no',
@@ -1125,12 +1152,17 @@ export default function InventoryStockPage() {
       align: 'center',
       render: (r) => {
         if (r.status === 'CONVERTED') {
+          // The indent it became, by its number. The link read generated_indent_id, a column the
+          // API does not send, and opened /indents/undefined (E2E S5-11b).
           return (
-            <Link to={`/indents/${r.generated_indent_id}`} className="row" style={{ gap: 4, textDecoration: 'none' }}>
-              <Badge tone="success">
-                <CheckCircle2 size={11} style={{ marginRight: 3 }} /> Converted
-              </Badge>
-            </Link>
+            <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+              <StatusBadge status="CONVERTED" />
+              {r.indent_id !== null ? (
+                <Link to={`/indents/${r.indent_id}`} className="cell-code">{r.indent_no || `Indent ${r.indent_id}`}</Link>
+              ) : (
+                <span className="cell-muted" title="The indent it became has since been deleted">{r.indent_no || 'Indent deleted'}</span>
+              )}
+            </div>
           );
         }
         return <StatusBadge status={r.status} />;
@@ -1160,13 +1192,11 @@ export default function InventoryStockPage() {
       locked: true,
       render: (r) => {
         if (r.status === 'CONVERTED') {
-          return (
-            <Link to={`/indents/${r.generated_indent_id}`}>
-              <Button variant="ghost" size="sm" icon={<FileText size={13} />}>
-                View Indent
-              </Button>
+          return r.indent_id !== null ? (
+            <Link to={`/indents/${r.indent_id}`} className="btn btn-ghost btn-sm">
+              <FileText size={13} aria-hidden /> View Indent
             </Link>
-          );
+          ) : null;
         }
 
         if (r.status === 'REJECTED') {
@@ -1179,7 +1209,9 @@ export default function InventoryStockPage() {
 
         return (
           <div className="row" style={{ gap: 4, justifyContent: 'flex-end' }}>
-            {canApprove && !isApproved && (
+            {/* The server's own rule for this user (can_approve): a store user approves a pending
+                suggestion, not one the store already approved, which the server refused (E2E S5-09b). */}
+            {r.can_approve && (
               <Button
                 variant="success"
                 size="sm"
@@ -1588,21 +1620,14 @@ export default function InventoryStockPage() {
       {['rm', 'fg', 'wip', 'trading', 'general'].includes(currentTab) && (
         <CategoryWorkspaceView
           category={currentTab.toUpperCase() as InventoryCategoryKey}
-          onOpenAdjustment={(item) => {
-            setSelectedAdjItem({
-              id: item.id,
-              code: item.code,
-              description: item.description,
-              category: item.category,
-              currentStock: item.currentStock,
-              uom: item.uom,
-            });
-            setAdjActualCount(String(item.currentStock));
-            setAdjReason('Cycle Count Reconciliation');
-            setAdjFindings('');
-            setAdjRemarks('');
-            setIsAdjModalOpen(true);
-          }}
+          onOpenAdjustment={(item) => openAdjustment({
+            id: item.id,
+            code: item.code,
+            description: item.description,
+            category: item.category,
+            uom: item.uom,
+            sheetStock: item.sheetStock,
+          })}
         />
       )}
 
@@ -1848,13 +1873,13 @@ export default function InventoryStockPage() {
                       setLedgerTxnType(e.target.value);
                       setLedgerPage(1);
                     }}
-                    style={{ width: 175 }}
+                    style={{ width: 200 }}
+                    aria-label="Movement type"
                   >
                     <option value="">All Movement Types</option>
-                    <option value="GRN_INWARD">GRN Inward</option>
-                    <option value="REQUISITION_ISSUE">Requisition Issue</option>
-                    <option value="DIRECT_ISSUE">Direct Store Issue</option>
-                    <option value="STOCK_ADJUSTMENT">Stock Adjustment</option>
+                    {LEDGER_TXN_TYPES.map((t) => (
+                      <option key={t} value={t}>{movementMeta(t).label}</option>
+                    ))}
                   </Select>
                 </div>
               }
@@ -2164,13 +2189,15 @@ export default function InventoryStockPage() {
               </Button>
               <Button
                 variant="primary"
-                disabled={!selectedAdjItem || adjActualCount === '' || Number(adjActualCount) < 0 || !adjReason.trim()}
+                disabled={!selectedAdjItem || adjBookStock === null || adjActualCount === '' || Number(adjActualCount) < 0 || !adjReason.trim()}
                 loading={adjustmentMutation.isPending}
                 onClick={() => {
-                  if (!selectedAdjItem) return;
+                  if (!selectedAdjItem || adjBookStock === null) return;
                   adjustmentMutation.mutate({
                     itemId: selectedAdjItem.id,
                     actualStockQty: Number(adjActualCount),
+                    // The figure shown: the server refuses the count if the stock is no longer it.
+                    expectedSystemQty: adjBookStock,
                     reason: adjReason,
                     findings: adjFindings,
                     remarks: adjRemarks,
@@ -2213,10 +2240,9 @@ export default function InventoryStockPage() {
                             code: item.item_code,
                             description: item.item_description,
                             category: item.category,
-                            currentStock: Number(item.live_stock_qty || 0),
                             uom: item.uom_code,
                           });
-                          setAdjActualCount(String(item.live_stock_qty || 0));
+                          setAdjActualCount('');
                         }}
                         style={{
                           padding: '8px 12px',
@@ -2265,14 +2291,31 @@ export default function InventoryStockPage() {
                 <div className="cell-strong" style={{ marginTop: 4 }}>
                   {selectedAdjItem.description}
                 </div>
-                <div className="row" style={{ gap: 16, marginTop: 8, fontSize: 'var(--text-sm)' }}>
-                  <div>
-                    <span style={{ color: 'var(--text-muted)' }}>Current Book Stock: </span>
-                    <span className="num cell-strong">
-                      {qty(selectedAdjItem.currentStock)} {toShortUom(selectedAdjItem.uom)}
-                    </span>
-                  </div>
+                <div className="row" style={{ gap: 16, marginTop: 8, fontSize: 'var(--text-sm)', flexWrap: 'wrap' }}>
+                  {adjBookStock !== null ? (
+                    <div>
+                      <span style={{ color: 'var(--text-muted)' }}>Current Book Stock: </span>
+                      <span className="num cell-strong">
+                        {qty(adjBookStock)} {toShortUom(selectedAdjItem.uom)}
+                      </span>
+                    </div>
+                  ) : !adjBookQuery.isError && !adjBookMissing && (
+                    <div style={{ color: 'var(--text-muted)' }}>Loading the book stock…</div>
+                  )}
+                  {selectedAdjItem.sheetStock !== undefined && (
+                    <div title="The category workspace's own figure. The count is posted against the book stock, not this figure.">
+                      <span style={{ color: 'var(--text-muted)' }}>{selectedAdjItem.category} sheet figure: </span>
+                      <span className="num">{qty(selectedAdjItem.sheetStock)} {toShortUom(selectedAdjItem.uom)}</span>
+                    </div>
+                  )}
                 </div>
+                {(adjBookQuery.isError || adjBookMissing) && (
+                  <div role="alert" style={{ marginTop: 8, fontSize: 'var(--text-xs)', color: 'var(--danger-700)' }}>
+                    {adjBookMissing
+                      ? `${selectedAdjItem.code} is not an active item in the stock register, so its book stock cannot be counted here.`
+                      : 'The book stock could not be loaded. Close the count and try again.'}
+                  </div>
+                )}
               </div>
             )}
 
@@ -2289,7 +2332,7 @@ export default function InventoryStockPage() {
                   />
                 </Field>
 
-                {adjActualCount !== '' && (
+                {adjActualCount !== '' && adjBookStock !== null && (
                   <div
                     style={{
                       padding: '8px 12px',

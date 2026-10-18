@@ -189,16 +189,38 @@ export interface MovementMeta {
 const MOVEMENT_LABEL: Record<string, string> = {
   GRN_INWARD: 'GRN receipt',
   GRN_RECEIPT: 'GRN receipt',
+  GRN_REVERSAL: 'GRN reversal',
   REQUISITION_ISSUE: 'Requisition issue',
+  REQUISITION_REVERSAL: 'Requisition issue reversal',
   DIRECT_ISSUE: 'Direct issue',
   DIRECT_ISSUE_REVERSAL: 'Direct issue reversal',
   STOCK_ADJUSTMENT: 'Count adjustment',
+  STOCK_ADJUSTMENT_REVERSAL: 'Count adjustment reversal',
+  // Movements entered on the category workspaces (backend domain/inventory.ts).
+  INVENTORY_IN: 'Receipt entered in ERP',
+  INVENTORY_OUT: 'Issue entered in ERP',
+  INVENTORY_ADJUST: 'Stock set in ERP',
+  INVENTORY_REVERSAL: 'ERP entry reversal',
+  STOCK_ALIGNMENT: 'Stock alignment',
   ADJUSTMENT: 'Adjustment',
   SHEET_SYNC: 'Sheet sync',
   RETURN: 'Return',
   REVERSAL: 'Reversal',
   OPENING: 'Opening balance',
 };
+
+/**
+ * Every entry type the stock ledger records (its CHECK, backend migration 028), in the order
+ * the Movement Ledger's type filter offers them. The filter offered four, so the receipts and
+ * issues entered on the inventory screens and every reversal could not be chosen, and their
+ * rows showed raw codes (E2E S5-15b).
+ */
+export const LEDGER_TXN_TYPES = [
+  'GRN_INWARD', 'GRN_REVERSAL', 'REQUISITION_ISSUE', 'REQUISITION_REVERSAL',
+  'DIRECT_ISSUE', 'DIRECT_ISSUE_REVERSAL', 'STOCK_ADJUSTMENT', 'STOCK_ADJUSTMENT_REVERSAL',
+  'INVENTORY_IN', 'INVENTORY_OUT', 'INVENTORY_ADJUST', 'INVENTORY_REVERSAL',
+  'SHEET_SYNC', 'STOCK_ALIGNMENT',
+] as const;
 
 /** Inward = ↓ emerald icon, outward = ↑ stone icon, adjustment = ± plum icon. */
 export function movementMeta(type: string | null | undefined, direction?: string | null): MovementMeta {
