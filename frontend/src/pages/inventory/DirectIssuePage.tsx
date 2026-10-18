@@ -14,6 +14,7 @@ import {
   Plus, Printer, Eye, Search, Trash2,
 } from 'lucide-react';
 import { api, qs, fetchHtml, type PageMeta } from '../../lib/api';
+import { latestOnly } from '../../lib/latestOnly';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
@@ -164,22 +165,29 @@ export default function DirectIssuePage() {
   const [slipHtml, setSlipHtml] = useState<string | null>(null);
   const [slipLoading, setSlipLoading] = useState(false);
   const slipFrameRef = useRef<HTMLIFrameElement>(null);
+  // Only the latest slip asked for is shown: closed while one slip was loading and
+  // opened on another, the preview showed the first slip's late answer under the
+  // second's title, ready to print (review of track T1, 2026-10-18).
+  const [slipLoads] = useState(latestOnly);
 
   const openSlip = async (issue: { id: number; issue_no: string; status?: string }) => {
     setSlip({ id: issue.id, issueNo: issue.issue_no, cancelled: issue.status === 'CANCELLED' });
     setSlipHtml(null);
     setSlipLoading(true);
-    try {
-      setSlipHtml(await fetchHtml(`/inventory/direct-issues/${issue.id}/print`));
-    } catch (err) {
-      toast.fromError(err, 'Could not load the issue slip');
-      setSlip(null);
-    } finally {
-      setSlipLoading(false);
-    }
+    await slipLoads.run(() => fetchHtml(`/inventory/direct-issues/${issue.id}/print`), {
+      done: setSlipHtml,
+      failed: (err) => {
+        toast.fromError(err, 'Could not load the issue slip');
+        setSlip(null);
+      },
+      settled: () => setSlipLoading(false),
+    });
   };
 
-  const closeSlip = () => { setSlip(null); setSlipHtml(null); };
+  const closeSlip = () => {
+    slipLoads.cancel();
+    setSlip(null); setSlipHtml(null); setSlipLoading(false);
+  };
 
   const printSlip = () => {
     const win = slipFrameRef.current?.contentWindow;

@@ -21,11 +21,13 @@ import {
 import { api, ApiError, downloadFile, fetchHtml } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { mayChangeRequisition, maySubmitRequisition } from '../../lib/requisitionAccess';
+import { defaultIssueQuantities, issueFiguresKey, issueRows, summariseIssue } from '../../lib/storeIssue';
+import { latestOnly } from '../../lib/latestOnly';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
 import {
   Button, Card, CardBody, CardHeader, StatusBadge, Badge, ConfirmDialog, Modal, DetailItem, DetailGrid,
-  LoadingBlock, ErrorState, Input, Checkbox, Field, Textarea,
+  LoadingBlock, ErrorState, Input, Checkbox, Field, Textarea, Banner,
 } from '../../components/ui';
 import { StatTile } from '../../components/KpiCard';
 import { qty, money, formatDate, formatDateTime, count, text, statusLabel } from '../../lib/format';
@@ -106,8 +108,12 @@ export default function RequisitionDetail() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const previewFrameRef = useRef<HTMLIFrameElement>(null);
+  // Each preview shows only the answer to its latest load (lib/latestOnly.ts): a
+  // late answer for a slip already closed replaced the one open now.
+  const [previewLoads] = useState(latestOnly);
+  const [issuePreviewLoads] = useState(latestOnly);
 
-  const { data, isLoading, error, refetch } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['requisition', id],
     queryFn: () => api.get<RequisitionDoc>(`/requisitions/${id}`),
   });
@@ -115,15 +121,19 @@ export default function RequisitionDetail() {
   const openPreview = async () => {
     setPreviewOpen(true);
     setPreviewLoading(true);
-    try {
-      const html = await fetchHtml(`/requisitions/${id}/print-view`);
-      setPreviewHtml(html);
-    } catch (err) {
-      toast.fromError(err, 'Could not load the requisition preview');
-      setPreviewOpen(false);
-    } finally {
-      setPreviewLoading(false);
-    }
+    await previewLoads.run(() => fetchHtml(`/requisitions/${id}/print-view`), {
+      done: setPreviewHtml,
+      failed: (err) => {
+        toast.fromError(err, 'Could not load the requisition preview');
+        setPreviewOpen(false);
+      },
+      settled: () => setPreviewLoading(false),
+    });
+  };
+
+  const closePreview = () => {
+    previewLoads.cancel();
+    setPreviewOpen(false); setPreviewHtml(null); setPreviewLoading(false);
   };
 
   const printFromPreview = () => {
@@ -152,16 +162,21 @@ export default function RequisitionDetail() {
 
   const openIssuePreview = async (issueId: number, slipNo: string) => {
     setIssuePreview({ id: issueId, slipNo });
+    setIssuePreviewHtml(null);
     setIssuePreviewLoading(true);
-    try {
-      const html = await fetchHtml(`/requisitions/issues/${issueId}/print-view`);
-      setIssuePreviewHtml(html);
-    } catch (err) {
-      toast.fromError(err, 'Could not load the issue slip preview');
-      setIssuePreview(null);
-    } finally {
-      setIssuePreviewLoading(false);
-    }
+    await issuePreviewLoads.run(() => fetchHtml(`/requisitions/issues/${issueId}/print-view`), {
+      done: setIssuePreviewHtml,
+      failed: (err) => {
+        toast.fromError(err, 'Could not load the issue slip preview');
+        setIssuePreview(null);
+      },
+      settled: () => setIssuePreviewLoading(false),
+    });
+  };
+
+  const closeIssuePreview = () => {
+    issuePreviewLoads.cancel();
+    setIssuePreview(null); setIssuePreviewHtml(null); setIssuePreviewLoading(false);
   };
 
   const printIssueFromPreview = () => {
@@ -692,6 +707,7 @@ export default function RequisitionDetail() {
         open={issueOpen}
         onClose={() => setIssueOpen(false)}
         requisition={data}
+        refreshing={isFetching}
         onIssued={() => {
           setIssueOpen(false);
           void qc.invalidateQueries({ queryKey: ['requisitions'] });
@@ -704,13 +720,13 @@ export default function RequisitionDetail() {
 
       <Modal
         open={previewOpen}
-        onClose={() => { setPreviewOpen(false); setPreviewHtml(null); }}
+        onClose={closePreview}
         title={`Requisition Slip — ${data.requisition_no}`}
         subtitle="This is the same document generated as a PDF"
         size="xl"
         footer={
           <>
-            <Button variant="ghost" onClick={() => { setPreviewOpen(false); setPreviewHtml(null); }}>Close</Button>
+            <Button variant="ghost" onClick={closePreview}>Close</Button>
             <Button variant="secondary" icon={<Printer size={14} />} onClick={printFromPreview} disabled={!previewHtml}>Print</Button>
             <Button variant="primary" icon={<Download size={14} />} loading={downloading} onClick={() => void downloadPdf()}>Download PDF</Button>
           </>
@@ -733,13 +749,13 @@ export default function RequisitionDetail() {
 
       <Modal
         open={issuePreview !== null}
-        onClose={() => { setIssuePreview(null); setIssuePreviewHtml(null); }}
+        onClose={closeIssuePreview}
         title={`Issue Slip — ${issuePreview?.slipNo ?? ''}`}
         subtitle="This is the same document generated as a PDF"
         size="xl"
         footer={
           <>
-            <Button variant="ghost" onClick={() => { setIssuePreview(null); setIssuePreviewHtml(null); }}>Close</Button>
+            <Button variant="ghost" onClick={closeIssuePreview}>Close</Button>
             <Button variant="secondary" icon={<Printer size={14} />} onClick={printIssueFromPreview} disabled={!issuePreviewHtml}>Print</Button>
             <Button variant="primary" icon={<Download size={14} />} loading={issueDownloading} onClick={() => void downloadIssuePdf()}>Download PDF</Button>
           </>
@@ -764,12 +780,18 @@ export default function RequisitionDetail() {
 /* ── Store Issue modal ────────────────────────────────────────────────────── */
 
 function StoreIssueModal({
-  open, onClose, requisition, onIssued, onStale,
-}: { open: boolean; onClose: () => void; requisition: RequisitionDoc; onIssued: () => void; onStale: () => void }) {
+  open, onClose, requisition, refreshing, onIssued, onStale,
+}: {
+  open: boolean; onClose: () => void; requisition: RequisitionDoc;
+  /** The requisition is being fetched again: Issue waits for the figures it will be checked against. */
+  refreshing: boolean;
+  onIssued: () => void; onStale: () => void;
+}) {
   const toast = useToast();
   const [qtyByLine, setQtyByLine] = useState<Record<number, string>>({});
   const [remarks, setRemarks] = useState('');
   const [confirmedExcess, setConfirmedExcess] = useState(false);
+  const [figuresMoved, setFiguresMoved] = useState(false);
   // A double click posted two slips and deducted the stock twice (E2E S4-12):
   // `loading` disables the button only after the next render. This ref is set
   // before the request goes, so the second click of a double click finds it set.
@@ -796,8 +818,14 @@ function StoreIssueModal({
     },
     onError: (err) => {
       toast.fromError(err);
-      // The figures changed under the dialog: show the current ones before anyone issues again.
-      if (err instanceof ApiError && err.status === 409) onStale();
+      // The figures changed under the dialog. The tick was given for the extra it
+      // showed then, so it goes at once: it stood after a 409, and one more click
+      // issued an extra 3 where it had confirmed 1 (review case RV-C02c). The
+      // current figures are fetched, and the quantities start again from them (below).
+      if (err instanceof ApiError && err.status === 409) {
+        setConfirmedExcess(false);
+        onStale();
+      }
     },
     onSettled: () => { inFlight.current = false; },
   });
@@ -811,26 +839,21 @@ function StoreIssueModal({
   // Suggested Issue Qty defaults to the pending (requested - issued) quantity
   // when the modal opens, but stays fully editable in both directions — Store
   // may reduce it, or raise it above what remains requested (Rule: issue qty
-  // is dynamic, never capped at requested/pending).
+  // is dynamic, never capped at requested/pending). It starts again the same way
+  // whenever the issued figures move while it is open (lib/storeIssue.ts).
+  const figuresKey = issueFiguresKey(requisition.lines);
+  const shownFigures = useRef<string | null>(null);
   useEffect(() => {
-    if (!open) return;
-    setQtyByLine(Object.fromEntries(
-      requisition.lines.filter((l) => Number(l.pending_qty) > 0).map((l) => [l.requisition_line_id, l.pending_qty]),
-    ));
+    if (!open) { shownFigures.current = null; return; }
+    setFiguresMoved(shownFigures.current !== null && shownFigures.current !== figuresKey);
+    shownFigures.current = figuresKey;
+    setQtyByLine(defaultIssueQuantities(requisition.lines));
     setConfirmedExcess(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, requisition.id]);
+  }, [open, requisition.id, figuresKey]);
 
-  const rows = requisition.lines.map((l) => {
-    const enteredQty = Number(qtyByLine[l.requisition_line_id] ?? 0);
-    const excess = enteredQty > Number(l.requested_qty) - Number(l.issued_qty)
-      ? enteredQty - Math.max(0, Number(l.requested_qty) - Number(l.issued_qty))
-      : 0;
-    return { line: l, enteredQty, excess };
-  });
-  const anyEntered = rows.some((r) => r.enteredQty > 0);
-  const anyExcess = rows.some((r) => r.excess > 0);
-  const canSubmit = anyEntered && (!anyExcess || confirmedExcess);
+  const rows = issueRows(requisition.lines, qtyByLine);
+  const { anyExcess, canSubmit } = summariseIssue(rows, confirmedExcess);
 
   return (
     <Modal
@@ -843,12 +866,18 @@ function StoreIssueModal({
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={issue.isPending}>Cancel</Button>
-          <Button variant="primary" loading={issue.isPending} disabled={!canSubmit} onClick={submit}>
+          <Button variant="primary" loading={issue.isPending} disabled={!canSubmit || refreshing} onClick={submit}>
             Issue material
           </Button>
         </>
       }
     >
+      {figuresMoved && (
+        <Banner tone="warning" block>
+          Another issue was posted or reversed on this requisition while this dialog was open. The figures below are
+          current and the quantities start again from what is pending: check them before issuing.
+        </Banner>
+      )}
       <div className="table-wrap">
         <table className="table table-compact">
           <thead>
