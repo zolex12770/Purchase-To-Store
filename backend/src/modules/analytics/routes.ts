@@ -636,6 +636,8 @@ router.get(
 async function groupedBreakdown(opts: {
   dim: BreakdownDimension;
   lines: () => SqlBuilder;
+  /** A condition on the dimension's own joins, when the screen filters by the dimension itself. */
+  scope?: (b: SqlBuilder) => string;
   from: string;
   document: string;
   measures: Record<string, string>;
@@ -645,7 +647,13 @@ async function groupedBreakdown(opts: {
   limit: number;
 }): Promise<{ rows: Record<string, string>[]; totals: Record<string, string> }> {
   const { dim } = opts;
-  const b = opts.lines();
+  const grouped = () => {
+    const b = opts.lines();
+    const scope = opts.scope?.(b);
+    if (scope) b.addRaw(scope);
+    return b;
+  };
+  const b = grouped();
   const limit = b.push(opts.limit);
   const measures = Object.entries(opts.measures).map(([alias, sql]) => `${sql} AS ${alias}`).join(',\n              ');
   const rows = await query<Record<string, string>>(
@@ -666,7 +674,7 @@ async function groupedBreakdown(opts: {
        ${opts.from} ${tb.where()}`,
     tb.params,
   );
-  const gb = opts.lines();
+  const gb = grouped();
   const [groups] = await query<{ group_count: number }>(
     `SELECT ${groupCountSql(dim.id)} AS group_count ${opts.from} ${dim.join} ${gb.where()}`,
     gb.params,
@@ -750,6 +758,10 @@ router.get(
     const { rows, totals } = await groupedBreakdown({
       dim,
       lines: () => indentLineFilter(f),
+      // Filtered to an HOD, an indent that HOD approved also counts under its department's
+      // HOD, whose bar would open that HOD's list instead of this one: only the HODs
+      // filtered to have bars.
+      scope: key === 'hod' && f.hodId?.length ? (b) => `hk.hod_id = ANY(${b.push(f.hodId)})` : undefined,
       from: 'FROM v_indent_line_balance v JOIN purchase_indent_headers ih ON ih.id = v.indent_id',
       document: 'v.indent_id',
       // The indent list's tiles (indentListTotals) over the same lines.
@@ -895,22 +907,25 @@ router.get(
    computed over the same filter — just a quantity vocabulary instead of a
    currency one. */
 
-const REQUISITION_DIMENSIONS: Record<string, { id: string; label: string; join: string; title: string; drill: string }> = {
+// Labels come from the masters, keyed as the group is: the header's copies of a name
+// (department_name, employee_name, hod_name) and a line's item snapshot can differ
+// between requisitions of one key, and each spelling made a bar of its own.
+const REQUISITION_DIMENSIONS: Record<string, BreakdownDimension> = {
   item: {
-    id: 'l.item_id', label: "l.item_code || ' — ' || l.item_description",
-    join: 'JOIN requisition_lines l ON l.requisition_id = h.id', title: 'Item', drill: 'itemId',
+    id: 'l.item_id', label: "mi.item_code || ' — ' || mi.item_description",
+    join: 'JOIN requisition_lines l ON l.requisition_id = h.id JOIN items mi ON mi.id = l.item_id', title: 'Item', drill: 'itemId',
   },
   department: {
-    id: 'h.department_id', label: "COALESCE(h.department_name, 'Unassigned')",
-    join: '', title: 'Department', drill: 'departmentId',
+    id: 'h.department_id', label: "COALESCE(d.name, 'Unassigned')",
+    join: 'LEFT JOIN lookups d ON d.id = h.department_id', title: 'Department', drill: 'departmentId',
   },
   requester: {
-    id: 'h.requester_user_id', label: "COALESCE(h.employee_name, 'Unknown')",
-    join: '', title: 'Requester', drill: 'requesterId',
+    id: 'h.requester_user_id', label: "COALESCE(ru.employee_name, 'Unknown')",
+    join: 'LEFT JOIN users ru ON ru.id = h.requester_user_id', title: 'Requester', drill: 'requesterId',
   },
   hod: {
-    id: 'h.hod_user_id', label: "COALESCE(h.hod_name, 'Unassigned')",
-    join: '', title: 'HOD', drill: 'hodId',
+    id: 'h.hod_user_id', label: "COALESCE(hu.employee_name, 'Unassigned')",
+    join: 'LEFT JOIN users hu ON hu.id = h.hod_user_id', title: 'HOD', drill: 'hodId',
   },
   machine: {
     id: 'h.machine_id', label: "COALESCE(m.name, 'Unspecified')",
@@ -921,8 +936,8 @@ const REQUISITION_DIMENSIONS: Record<string, { id: string; label: string; join: 
     join: 'LEFT JOIN lookups cc ON cc.id = h.cost_centre_id', title: 'Cost Centre', drill: 'costCentreId',
   },
   user: {
-    id: 'h.requester_user_id', label: "COALESCE(h.employee_name, 'Unknown')",
-    join: '', title: 'User / Requester', drill: 'userId',
+    id: 'h.requester_user_id', label: "COALESCE(ru.employee_name, 'Unknown')",
+    join: 'LEFT JOIN users ru ON ru.id = h.requester_user_id', title: 'User / Requester', drill: 'userId',
   },
 };
 
@@ -946,38 +961,52 @@ router.get(
     }
     const f = parsedQuery<z.infer<typeof requisitionBreakdownSchema>>(res);
 
-    const b = requisitionHeaderFilter(f);
-    const from = `FROM requisition_headers h JOIN v_requisition_header_balance bal ON bal.requisition_id = h.id ${dim.join}`;
+    // One row per requisition and key, then the requisition's own totals: joined to its
+    // lines, a requisition holding the item twice counted its totals twice, and under an
+    // item filter its other items got bars of their own whose rows opened another list.
+    // The grand total counts each requisition once.
+    const pairs = (b: SqlBuilder) => {
+      if (key === 'item' && f.itemId?.length) b.addRaw(`l.item_id = ANY(${b.push(f.itemId)})`);
+      return `SELECT DISTINCT h.id AS requisition_id, ${dim.id} AS key, ${dim.label} AS label
+                FROM requisition_headers h ${dim.join} ${b.where()}`;
+    };
 
     const sortColumn = {
       requestedQty: 'SUM(bal.total_requested_qty)', issuedQty: 'SUM(bal.total_issued_qty)',
-      count: 'COUNT(DISTINCT h.id)', pending: 'SUM(bal.total_pending_qty)',
+      count: 'COUNT(*)', pending: 'SUM(bal.total_pending_qty)',
     }[f.sortBy];
+    const b = requisitionHeaderFilter(f);
+    const pairSql = pairs(b);
     const limit = b.push(f.limit);
 
     const rows = await query<Record<string, string>>(
-      `SELECT ${dim.id}::text                        AS key,
-              ${dim.label}                            AS label,
-              COUNT(DISTINCT h.id)::int                AS requisition_count,
+      `SELECT k.key::text                             AS key,
+              k.label                                  AS label,
+              COUNT(*)::int                            AS requisition_count,
               SUM(bal.total_requested_qty)             AS total_requested_qty,
               SUM(bal.total_issued_qty)                AS total_issued_qty,
               SUM(bal.total_pending_qty)                AS total_pending_qty,
               SUM(bal.total_excess_qty)                 AS total_excess_qty
-         ${from} ${b.where()}
-        GROUP BY ${dim.id}, ${dim.label}
-        ORDER BY ${sortColumn} DESC NULLS LAST
+         FROM (${pairSql}) k
+         JOIN v_requisition_header_balance bal ON bal.requisition_id = k.requisition_id
+        GROUP BY k.key, k.label
+        ORDER BY ${sortColumn} DESC NULLS LAST, k.label
         LIMIT ${limit}`,
       b.params,
     );
 
     const tb = requisitionHeaderFilter(f);
     const [totals] = await query<Record<string, string>>(
-      `SELECT SUM(bal.total_requested_qty) AS total_requested_qty, COUNT(DISTINCT h.id)::int AS requisition_count,
-              ${groupCountSql(dim.id)} AS group_count
-         FROM requisition_headers h JOIN v_requisition_header_balance bal ON bal.requisition_id = h.id ${dim.join}
+      `SELECT SUM(bal.total_requested_qty) AS total_requested_qty, COUNT(*)::int AS requisition_count
+         FROM requisition_headers h JOIN v_requisition_header_balance bal ON bal.requisition_id = h.id
          ${tb.where()}`,
       tb.params,
     );
+    const gb = requisitionHeaderFilter(f);
+    const [groups] = await query<{ group_count: number }>(
+      `SELECT ${groupCountSql('k.key')} AS group_count FROM (${pairs(gb)}) k`, gb.params,
+    );
+    const groupCount = Number(groups?.group_count ?? 0);
 
     const grandTotalQty = totals?.total_requested_qty ?? '0';
     const data = rows.map((r) => ({
@@ -999,9 +1028,9 @@ router.get(
       drilldown: '/requisitions?excludeCancelled=true',
       grandTotalRequestedQty: grandTotalQty,
       requisitionCount: Number(totals?.requisition_count ?? 0),
-      groupCount: Number(totals?.group_count ?? 0),
+      groupCount,
       shown: data.length,
-      truncated: Number(totals?.group_count ?? 0) > data.length,
+      truncated: groupCount > data.length,
     }));
   }),
 );

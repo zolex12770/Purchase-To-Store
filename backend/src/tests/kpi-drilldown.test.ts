@@ -32,8 +32,11 @@ process.env.NODE_ENV = 'test';
 process.env.SEED_DEMO_DATA = 'false';
 process.env.LOG_LEVEL = 'silent';
 
+type Q = <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T[]>;
+
 let app: Express;
 let closeDb: () => Promise<void>;
+let query: Q;
 let adminToken = '';
 let headToken = '';
 let hodToken = '';
@@ -98,11 +101,13 @@ beforeAll(async () => {
   const { runMigrations } = await import('../db/migrate.js');
   const { seedSystem } = await import('../db/seed.js');
   const { getDatabase, closeDatabase } = await import('../db/driver.js');
+  const db = await import('../db/index.js');
   const { createApp } = await import('../app.js');
 
   ensureStorageDirs();
   const conn = await getDatabase();
   closeDb = closeDatabase;
+  query = db.query as Q;
   await conn.query('DROP SCHEMA IF EXISTS public CASCADE');
   await conn.query('CREATE SCHEMA public');
   await runMigrations({ silent: true });
@@ -453,5 +458,139 @@ describe('Item-level filters count lines (2026-10-17 review)', () => {
     const ctx = { departmentId: String(ids.dept2), mainGroupId: String(ids.mg) };
     expect((await drill('/purchase-orders?excludeCancelled=true', ctx)).meta.total).toBe(0);
     expect(Number((await kpis(ctx)).get('po_count')!.value)).toBe(0);
+  });
+});
+
+/* ── Breakdown bars and trend points (2026-10-17 E2E run, S1-D2, S1-D3) ──────────
+   The Indent and GRN Analysis breakdowns grouped PO lines and opened the indent and
+   GRN lists, and every PO bar opened a list that also held cancelled orders. Each bar
+   now names the list it opens (meta.drilldown, its key under meta.drilldownParam), and
+   shows that list's row count and total tiles; a trend point shows the list over its
+   period. A bar with no key ('Unassigned') opens nothing: no list filter selects it. */
+
+interface Bar { key: string | null; label: string; poCount?: number; documentCount?: number; requisitionCount?: number; [k: string]: unknown }
+interface BarMeta { drilldown: string; drilldownParam: string }
+
+async function bars(endpoint: string, dimension: string, context: Record<string, string>) {
+  const res = await request(app).get(`/api/v1/analytics/${endpoint}/${dimension}`).query({ ...context, limit: 100 }).set(auth(adminToken));
+  expect(res.status, `${endpoint}/${dimension}`).toBe(200);
+  return res.body as { data: Bar[]; meta: BarMeta };
+}
+
+/** The list a bar opens, as drilldownLink builds it: the target's own parameters, the
+    screen's filters it does not name, and the bar's key over both. */
+async function drillBar(target: string, context: Record<string, string>, param: string, key: string) {
+  const sp = new URLSearchParams(target.split('?')[1] ?? '');
+  const merged = { ...Object.fromEntries(Object.entries(context).filter(([k]) => !sp.has(k))), [param]: key };
+  return drill(`${target.split('?')[0]}?${new URLSearchParams({ ...Object.fromEntries(sp), ...merged }).toString()}`);
+}
+
+/** The last day of the period a trend point starts (date_trunc of day, week or month). */
+function periodEnd(start: string, granularity: 'day' | 'week' | 'month'): string {
+  const d = new Date(`${start}T00:00:00Z`);
+  if (granularity === 'week') d.setUTCDate(d.getUTCDate() + 6);
+  if (granularity === 'month') { d.setUTCMonth(d.getUTCMonth() + 1, 1); d.setUTCDate(0); }
+  return d.toISOString().slice(0, 10);
+}
+
+describe('Each breakdown bar and trend point equals the list it opens', () => {
+  const contexts: Array<[string, Record<string, string>]> = [
+    ['no filter', {}],
+    ['a supplier and a period', { supplierId: '__s1__', dateFrom: day(-2), dateTo: day(2) }],
+    ['a department', { departmentId: '__dept__' }],
+    ['an item', { itemId: '__a__' }],
+    ['an HOD', { hodId: '__hod__' }],
+    ['a machine', { machineId: '__machine__' }],
+  ];
+  const resolve = (raw: Record<string, string>) =>
+    Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, /^__\w+__$/.test(v) ? String(ids[v.slice(2, -2)]) : v]));
+
+  beforeAll(async () => {
+    // The PO register wrote an item's description into a line's code column: grouped by
+    // that snapshot, one item gave two bars, each opening the list of both.
+    await query(`UPDATE purchase_order_lines SET item_code = 'Copper cable as the PO register wrote it' WHERE po_id = $1`, [ids.poOverdue]);
+  });
+
+  /** Every bar with a key, against the list it opens: its count and its own measures. */
+  async function expectBars(endpoint: string, dims: string[], target: string, ctx: Record<string, string>,
+    measures: (bar: Bar, totals: Record<string, string | number>, total: number) => void) {
+    for (const dim of dims) {
+      const b = await bars(endpoint, dim, ctx);
+      expect(b.meta.drilldown, `${endpoint}/${dim}`).toBe(target);
+      const keys = b.data.map((r) => r.key);
+      expect(new Set(keys).size, `${endpoint}/${dim}: one bar per key`).toBe(keys.length);
+      for (const bar of b.data) {
+        if (bar.key == null) continue;
+        const list = await drillBar(b.meta.drilldown, ctx, b.meta.drilldownParam, bar.key);
+        measures(bar, list.meta.totals, list.meta.total);
+      }
+    }
+  }
+
+  for (const [name, raw] of contexts) {
+    describe(name, () => {
+      it('purchase orders: every bar opens the non-cancelled orders it counts', async () => {
+        await expectBars('breakdown', ['supplier', 'item', 'department', 'costCentre', 'mainGroup', 'subMainGroup', 'itemType', 'poType', 'status', 'user', 'hod'],
+          '/purchase-orders?excludeCancelled=true', resolve(raw), (bar, totals, total) => {
+            expect([bar.poCount, Number(bar.totalValue), Number(bar.totalQty)], `${bar.label}`)
+              .toEqual([total, Number(totals.value), Number(totals.totalPoQty)]);
+          });
+      });
+
+      it('indents: every bar opens the indents it counts, with their tiles', async () => {
+        await expectBars('indent-breakdown', ['department', 'costCentre', 'item', 'indentType', 'supplier', 'status', 'user', 'hod'],
+          '/indents?excludeCancelled=true', resolve(raw), (bar, totals, total) => {
+            expect([bar.documentCount, bar.lineCount, Number(bar.totalQty), Number(bar.totalValue), Number(bar.orderedQty), Number(bar.pendingQty)], `${bar.label}`)
+              .toEqual([total, Number(totals.lineCount), Number(totals.totalIndentQty), Number(totals.totalEstimatedValue), Number(totals.totalOrderedQty), Number(totals.totalPendingQty)]);
+          });
+      });
+
+      it('goods receipts: every bar opens the posted receipts it counts, direct ones included', async () => {
+        await expectBars('grn-breakdown', ['supplier', 'item', 'department', 'costCentre', 'mainGroup', 'itemType', 'grnType', 'user', 'hod'],
+          '/grn?status=POSTED', resolve(raw), (bar, totals, total) => {
+            expect([bar.documentCount, bar.lineCount, Number(bar.totalQty), Number(bar.totalValue)], `${bar.label}`)
+              .toEqual([total, Number(totals.lineCount), Number(totals.totalQty), Number(totals.totalAmount)]);
+          });
+      });
+
+      it('requisitions: every row opens the requisitions it counts, cancelled ones left out', async () => {
+        await expectBars('requisition-breakdown', ['item', 'department', 'requester', 'hod', 'machine', 'costCentre', 'user'],
+          '/requisitions?excludeCancelled=true', resolve(raw), (bar, totals, total) => {
+            expect([bar.requisitionCount, Number(bar.totalRequestedQty), Number(bar.totalIssuedQty)], `${bar.label}`)
+              .toEqual([total, Number(totals.totalRequestedQty), Number(totals.totalIssuedQty)]);
+          });
+      });
+
+      it('trend points: the period opens each module\'s list over it', async () => {
+        const ctx = resolve(raw);
+        for (const granularity of ['day', 'week', 'month'] as const) {
+          const res = await request(app).get('/api/v1/analytics/trends').query({ ...ctx, granularity }).set(auth(adminToken));
+          expect(res.status).toBe(200);
+          for (const p of res.body.data as Array<Record<string, string | number>>) {
+            // The point's days within the screen's own period.
+            const from = [String(p.period), ctx.dateFrom].filter(Boolean).sort().at(-1)!;
+            const to = [periodEnd(String(p.period), granularity), ctx.dateTo].filter(Boolean).sort()[0]!;
+            const period = { ...ctx, dateFrom: from, dateTo: to };
+            const pos = await drill('/purchase-orders?excludeCancelled=true', period);
+            expect([Number(p.poCount), Number(p.poValue)], `${granularity} ${p.period}`).toEqual([pos.meta.total, Number(pos.meta.totals.value)]);
+            expect(Number(p.indentCount)).toBe((await drill('/indents?excludeCancelled=true', period)).meta.total);
+            const grns = await drill('/grn?status=POSTED', period);
+            expect([Number(p.grnCount), Number(p.grnValue)]).toEqual([grns.meta.total, Number(grns.meta.totals.totalAmount)]);
+            expect(Number(p.requisitionCount)).toBe((await drill('/requisitions?excludeCancelled=true', period)).meta.total);
+          }
+        }
+      });
+    });
+  }
+
+  it('the PO list a bar opens leaves out the cancelled order the breakdown never counted', async () => {
+    const b = await bars('breakdown', 'supplier', {});
+    const s2 = b.data.find((r) => Number(r.key) === ids.s2)!;
+    const opened = await drillBar(b.meta.drilldown, {}, 'supplierId', String(ids.s2));
+    const plain = await drill(`/purchase-orders?supplierId=${ids.s2}`);
+    // Supplier Two's cancelled order: the bare list the screens opened showed it.
+    expect(plain.data.map((r) => Number(r.id))).toContain(ids.poCancelled);
+    expect(opened.data.map((r) => Number(r.id))).not.toContain(ids.poCancelled);
+    expect(s2.poCount).toBe(opened.meta.total);
   });
 });
