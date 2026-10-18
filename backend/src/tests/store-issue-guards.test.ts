@@ -17,6 +17,10 @@
  *   5. Review case RV-C09b (2026-10-18): a requisition submitted from the detail page
  *      (POST /:id/submit) goes to its department's HOD as mapped now, as the edit
  *      form's resubmit does; it waited on the former HOD.
+ *   6. C06 follow-up (2026-10-17 E2E review of T1): a line over-issued under Rule 24
+ *      held negative demand in the stock figures, so it lowered its item's allocated
+ *      stock and raised the stock shown available for every other line. The register,
+ *      its export, the Overview and the stock scan count each open line at zero or more.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
@@ -46,9 +50,9 @@ const stockOf = async (itemId: number) =>
 const ledgerRowsOf = async (itemId: number) =>
   Number((await query<{ n: string }>('SELECT COUNT(*) AS n FROM stock_ledger WHERE item_id = $1', [itemId]))[0]!.n);
 
-async function mkItem(code: string, description = `Store issue test ${code}`): Promise<number> {
+async function mkItem(code: string, description = `Store issue test ${code}`, extra: Record<string, unknown> = {}): Promise<number> {
   const r = await request(app).post(api('/items')).set(auth(adminToken))
-    .send({ itemCode: code, itemDescription: description, uomId, standardRate: '10' });
+    .send({ itemCode: code, itemDescription: description, uomId, standardRate: '10', ...extra });
   expect(r.status).toBe(201);
   return r.body.data.id as number;
 }
@@ -253,6 +257,85 @@ describe('the store requisition queue gives each line the stock left for it (S4-
     // 1 on hand cannot cover 2. The old figure was 1 - ((1 - 4) + 2) = 2: "Sufficient".
     expect(Number(row.available_stock_qty)).toBe(1);
     expect(covered(row)).toBe(false);
+  });
+});
+
+describe('an over-issued line holds no stock in the stock figures (C06 follow-up, 2026-10-17 E2E review of T1)', () => {
+  // Live stock 10 and min stock 1. Requisition A asks 6 and is issued 8 (Rule 24); its
+  // other line, for another item and not issued, keeps it PARTIALLY_ISSUED, so it stays
+  // among the requisitions the stock figures sum. Requisition B asks 3 and is not issued.
+  // That leaves 2 on hand against B's 3. The figures summed A's line as 6 - 8 = -2:
+  // 1 allocated and 1 available, so the item read NORMAL.
+  type Kpis = Record<string, number>;
+  const get = async (path: string) => {
+    const r = await request(app).get(api(path)).set(auth(adminToken));
+    expect(r.status, path).toBe(200);
+    return r;
+  };
+  const overview = async () => (await get('/inventory/overview')).body.data.kpis as Kpis;
+  let itemId = 0;
+  let reqA = { id: 0, lineIds: [] as number[] };
+  let before: Kpis = {};
+
+  beforeAll(async () => {
+    itemId = await mkItem('TSIG-ALLOC', undefined, { minStock: '1' });
+    const otherId = await mkItem('TSIG-ALLOC-OTHER');
+    await stockUp(itemId, '10');
+    before = await overview();
+
+    reqA = await approvedRequisition([{ itemId, qty: '6' }, { itemId: otherId, qty: '10' }]);
+    expect((await issue(reqA.id, [{ requisitionLineId: reqA.lineIds[0]!, issueQty: '8', expectedIssuedQty: '0' }])).status).toBe(201);
+    expect((await requisition(reqA.id)).status).toBe('PARTIALLY_ISSUED');
+    await approvedRequisition([{ itemId, qty: '3' }]);
+    expect(await stockOf(itemId)).toBe(2);
+  });
+
+  it('the register allocates B\'s 3, not 1, and leaves nothing available: CRITICAL', async () => {
+    const row = (await get(`/inventory/stock?itemId=${itemId}`)).body.data[0];
+    expect([Number(row.live_stock_qty), Number(row.allocated_stock_qty), Number(row.available_stock_qty)]).toEqual([2, 3, 0]);
+    expect(row.stock_status).toBe('CRITICAL');
+    const critical = (await get(`/inventory/stock?itemId=${itemId}&stockStatus=CRITICAL`)).body.data as { item_id: number }[];
+    expect(critical.map((r) => Number(r.item_id))).toEqual([itemId]);
+  });
+
+  it('its export says the same', async () => {
+    const [head, line] = (await get(`/inventory/stock/export?itemId=${itemId}`)).text.split('\r\n');
+    const headers = head!.split(',');
+    const cells = line!.split(',');
+    const cell = (h: string) => cells[headers.indexOf(h)];
+    expect([Number(cell('Live Stock')), Number(cell('Allocated Stock')), Number(cell('Available Stock')), cell('Status')])
+      .toEqual([2, 3, 0, 'CRITICAL']);
+  });
+
+  it('the Overview counts the item CRITICAL and the open requisitions at 0 + 10 + 3, as the register and the requisition list do', async () => {
+    const after = await overview();
+    expect(after.criticalStock - before.criticalStock).toBe(1);
+    expect(after.normalStock - before.normalStock).toBe(-1);
+    expect([after.belowReorder, after.excessStock]).toEqual([before.belowReorder, before.excessStock]);
+    expect(after.pendingRequisitionsCount - before.pendingRequisitionsCount).toBe(2);
+    expect(after.pendingRequisitionsQty - before.pendingRequisitionsQty).toBe(13); // was 11: -2 + 10 + 3
+
+    const register = (await get('/inventory/stock')).body.meta.summary as Kpis;
+    expect([after.criticalStock, after.belowReorder, after.normalStock, after.excessStock])
+      .toEqual([register.criticalStock, register.belowReorder, register.normalStock, register.excessStock]);
+    // The store queue's requisitions as the requisition list totals them (v_requisition_line_balance
+    // counts each line's pending at zero or more). The earlier over-issue in this file (S4-07b) is
+    // among them, so the Overview read 5 less.
+    const open = (await get('/requisitions?view=store-queue')).body.meta.totals as Kpis;
+    expect([after.pendingRequisitionsCount, after.pendingRequisitionsQty]).toEqual([open.requisitionCount, open.totalPendingQty]);
+  });
+
+  it('the stock scan suggests the item, nothing being left for it under its min stock', async () => {
+    expect((await request(app).post(api('/inventory/auto-indent/generate')).set(auth(adminToken)).send({})).status).toBe(200);
+    const suggested = await query<{ eligible_stock: string; reason: string; suggested_qty: string }>(
+      'SELECT eligible_stock, reason, suggested_qty FROM auto_indents WHERE item_id = $1', [itemId],
+    );
+    expect(suggested.map((s) => [Number(s.eligible_stock), s.reason, Number(s.suggested_qty)])).toEqual([[0, 'Below Minimum Stock', 1]]);
+  });
+
+  it('the requisition itself still shows the over-issue', async () => {
+    const line = (await requisition(reqA.id)).lines[0] as Record<string, string>;
+    expect([Number(line.issued_qty), Number(line.pending_qty), Number(line.excess_qty)]).toEqual([8, 0, 2]);
   });
 });
 
