@@ -20,11 +20,14 @@ import {
 } from 'lucide-react';
 import { api, ApiError, downloadFile, fetchHtml } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
+import { mayChangeRequisition, maySubmitRequisition } from '../../lib/requisitionAccess';
+import { defaultIssueQuantities, issueFiguresKey, issueRows, summariseIssue } from '../../lib/storeIssue';
+import { latestOnly } from '../../lib/latestOnly';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
 import {
   Button, Card, CardBody, CardHeader, StatusBadge, Badge, ConfirmDialog, Modal, DetailItem, DetailGrid,
-  LoadingBlock, ErrorState, Input, Checkbox, Field, Textarea,
+  LoadingBlock, ErrorState, Input, Checkbox, Field, Textarea, Banner,
 } from '../../components/ui';
 import { StatTile } from '../../components/KpiCard';
 import { qty, money, formatDate, formatDateTime, count, text, statusLabel } from '../../lib/format';
@@ -105,8 +108,12 @@ export default function RequisitionDetail() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const previewFrameRef = useRef<HTMLIFrameElement>(null);
+  // Each preview shows only the answer to its latest load (lib/latestOnly.ts): a
+  // late answer for a slip already closed replaced the one open now.
+  const [previewLoads] = useState(latestOnly);
+  const [issuePreviewLoads] = useState(latestOnly);
 
-  const { data, isLoading, error, refetch } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['requisition', id],
     queryFn: () => api.get<RequisitionDoc>(`/requisitions/${id}`),
   });
@@ -114,15 +121,19 @@ export default function RequisitionDetail() {
   const openPreview = async () => {
     setPreviewOpen(true);
     setPreviewLoading(true);
-    try {
-      const html = await fetchHtml(`/requisitions/${id}/print-view`);
-      setPreviewHtml(html);
-    } catch (err) {
-      toast.fromError(err, 'Could not load the requisition preview');
-      setPreviewOpen(false);
-    } finally {
-      setPreviewLoading(false);
-    }
+    await previewLoads.run(() => fetchHtml(`/requisitions/${id}/print-view`), {
+      done: setPreviewHtml,
+      failed: (err) => {
+        toast.fromError(err, 'Could not load the requisition preview');
+        setPreviewOpen(false);
+      },
+      settled: () => setPreviewLoading(false),
+    });
+  };
+
+  const closePreview = () => {
+    previewLoads.cancel();
+    setPreviewOpen(false); setPreviewHtml(null); setPreviewLoading(false);
   };
 
   const printFromPreview = () => {
@@ -151,16 +162,21 @@ export default function RequisitionDetail() {
 
   const openIssuePreview = async (issueId: number, slipNo: string) => {
     setIssuePreview({ id: issueId, slipNo });
+    setIssuePreviewHtml(null);
     setIssuePreviewLoading(true);
-    try {
-      const html = await fetchHtml(`/requisitions/issues/${issueId}/print-view`);
-      setIssuePreviewHtml(html);
-    } catch (err) {
-      toast.fromError(err, 'Could not load the issue slip preview');
-      setIssuePreview(null);
-    } finally {
-      setIssuePreviewLoading(false);
-    }
+    await issuePreviewLoads.run(() => fetchHtml(`/requisitions/issues/${issueId}/print-view`), {
+      done: setIssuePreviewHtml,
+      failed: (err) => {
+        toast.fromError(err, 'Could not load the issue slip preview');
+        setIssuePreview(null);
+      },
+      settled: () => setIssuePreviewLoading(false),
+    });
+  };
+
+  const closeIssuePreview = () => {
+    issuePreviewLoads.cancel();
+    setIssuePreview(null); setIssuePreviewHtml(null); setIssuePreviewLoading(false);
   };
 
   const printIssueFromPreview = () => {
@@ -224,6 +240,13 @@ export default function RequisitionDetail() {
   const isIssuable = data.status === 'APPROVED' || data.status === 'PARTIALLY_ISSUED' || data.status === 'FULLY_ISSUED';
   const editable = isDraft || isPending || isReturned;
 
+  // Edit, Submit, Delete, Reopen and Cancel also need the server's owner check
+  // (assertOwnRequisition): the permission alone showed them to colleagues, who
+  // got 403 (E2E S1-06; a wrong HOD saw Edit, S4).
+  const viewer = { id: user?.id, isSuperAdmin };
+  const mayChange = mayChangeRequisition(data, viewer);
+  const maySubmit = maySubmitRequisition(data, viewer);
+
   const ownRequisition = data.requester_user_id === user?.id;
   const blockedBySelfApproval = ownRequisition && !isSuperAdmin;
   const wrongHod = data.hod_user_id !== null && data.hod_user_id !== user?.id && !isSuperAdmin;
@@ -269,13 +292,17 @@ export default function RequisitionDetail() {
             <Button variant="secondary" size="sm" icon={<Eye size={13} />} onClick={() => void openPreview()}>Preview</Button>
             <Button variant="secondary" size="sm" icon={<Download size={13} />} loading={downloading} onClick={() => void downloadPdf()}>Download PDF</Button>
 
-            {editable && (can('requisition.edit') || can('requisition.approve')) && (
+            {editable && (can('requisition.edit') || can('requisition.approve')) && mayChange && (
               <Button variant="secondary" size="sm" icon={<Pencil size={13} />} onClick={() => navigate(`/requisitions/${id}/edit`)}>Edit</Button>
             )}
-            {isDraft && can('requisition.create') && (
-              <Button variant="primary" size="sm" icon={<Send size={13} />} onClick={() => setAction('submit')}>Submit</Button>
+            {/* A RETURNED requisition goes back to the HOD from here too; it offered no
+                Submit at all (E2E S4-05). */}
+            {(isDraft || isReturned) && can('requisition.create') && maySubmit && (
+              <Button variant="primary" size="sm" icon={<Send size={13} />} onClick={() => setAction('submit')}>
+                {isReturned ? 'Resubmit' : 'Submit'}
+              </Button>
             )}
-            {isDraft && can('requisition.delete') && (
+            {isDraft && can('requisition.delete') && mayChange && (
               <Button variant="ghost" size="sm" icon={<Trash2 size={13} />} onClick={() => setAction('delete')}>Delete</Button>
             )}
 
@@ -310,7 +337,7 @@ export default function RequisitionDetail() {
               </Button>
             )}
 
-            {isRejected && can('requisition.edit') && (
+            {isRejected && can('requisition.edit') && mayChange && (
               <Button variant="secondary" size="sm" icon={<RotateCcw size={13} />} onClick={() => setAction('reopen')}>
                 Reopen as draft
               </Button>
@@ -322,7 +349,7 @@ export default function RequisitionDetail() {
               </Button>
             )}
 
-            {(isDraft || (data.status === 'APPROVED' && !hasAnyIssue)) && can('requisition.edit') && (
+            {(isDraft || (data.status === 'APPROVED' && !hasAnyIssue)) && can('requisition.edit') && mayChange && (
               <Button variant="ghost" size="sm" icon={<Ban size={13} />} onClick={() => { setReason(''); setAction('cancel'); }}>
                 Cancel
               </Button>
@@ -607,7 +634,7 @@ export default function RequisitionDetail() {
         onConfirm={() => action && run.mutate(action)}
         loading={run.isPending}
         title={
-          action === 'submit' ? 'Submit for HOD approval?'
+          action === 'submit' ? (isReturned ? 'Resubmit for HOD approval?' : 'Submit for HOD approval?')
             : action === 'approve' ? 'Approve this requisition?'
             : action === 'reject' ? 'Reject this requisition?'
             : action === 'return' ? 'Return for correction?'
@@ -616,7 +643,7 @@ export default function RequisitionDetail() {
             : 'Delete this draft?'
         }
         confirmLabel={
-          action === 'submit' ? 'Submit'
+          action === 'submit' ? (isReturned ? 'Resubmit' : 'Submit')
             : action === 'approve' ? 'Approve'
             : action === 'reject' ? 'Reject'
             : action === 'return' ? 'Return'
@@ -630,7 +657,9 @@ export default function RequisitionDetail() {
         reasonValue={reason}
         onReasonChange={setReason}
         message={
-          action === 'submit' ? <>Requisition <strong>{data.requisition_no}</strong> will go to your department's HOD and can no longer be freely edited.</>
+          action === 'submit' ? (isReturned
+            ? <>Requisition <strong>{data.requisition_no}</strong> goes back to the HOD as it stands now. To correct it first, use <strong>Edit</strong>.</>
+            : <>Requisition <strong>{data.requisition_no}</strong> will go to your department's HOD and can no longer be freely edited.</>)
             : action === 'approve' ? <>It moves to the Store Issue Queue, ready for material to be issued.</>
             : action === 'reject' ? <>The reason is recorded on the document and in the audit trail.</>
             : action === 'return' ? <>The requester can edit and resubmit it — the reason is recorded in the audit trail.</>
@@ -678,22 +707,26 @@ export default function RequisitionDetail() {
         open={issueOpen}
         onClose={() => setIssueOpen(false)}
         requisition={data}
+        refreshing={isFetching}
         onIssued={() => {
           setIssueOpen(false);
           void qc.invalidateQueries({ queryKey: ['requisitions'] });
           void qc.invalidateQueries({ queryKey: ['requisition', id] });
+          void qc.invalidateQueries({ queryKey: ['inventory-requisition-queue'] });
+          void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
         }}
+        onStale={() => void qc.invalidateQueries({ queryKey: ['requisition', id] })}
       />
 
       <Modal
         open={previewOpen}
-        onClose={() => { setPreviewOpen(false); setPreviewHtml(null); }}
+        onClose={closePreview}
         title={`Requisition Slip — ${data.requisition_no}`}
         subtitle="This is the same document generated as a PDF"
         size="xl"
         footer={
           <>
-            <Button variant="ghost" onClick={() => { setPreviewOpen(false); setPreviewHtml(null); }}>Close</Button>
+            <Button variant="ghost" onClick={closePreview}>Close</Button>
             <Button variant="secondary" icon={<Printer size={14} />} onClick={printFromPreview} disabled={!previewHtml}>Print</Button>
             <Button variant="primary" icon={<Download size={14} />} loading={downloading} onClick={() => void downloadPdf()}>Download PDF</Button>
           </>
@@ -705,6 +738,9 @@ export default function RequisitionDetail() {
           <iframe
             ref={previewFrameRef}
             title={`Requisition ${data.requisition_no} preview`}
+            // No allow-scripts: the document never runs anything, whatever it holds.
+            // Same origin so Print can reach it; modals so it may open the print dialog.
+            sandbox="allow-same-origin allow-modals"
             srcDoc={previewHtml ?? ''}
             style={{ width: '100%', height: '72vh', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', background: '#fff' }}
           />
@@ -713,13 +749,13 @@ export default function RequisitionDetail() {
 
       <Modal
         open={issuePreview !== null}
-        onClose={() => { setIssuePreview(null); setIssuePreviewHtml(null); }}
+        onClose={closeIssuePreview}
         title={`Issue Slip — ${issuePreview?.slipNo ?? ''}`}
         subtitle="This is the same document generated as a PDF"
         size="xl"
         footer={
           <>
-            <Button variant="ghost" onClick={() => { setIssuePreview(null); setIssuePreviewHtml(null); }}>Close</Button>
+            <Button variant="ghost" onClick={closeIssuePreview}>Close</Button>
             <Button variant="secondary" icon={<Printer size={14} />} onClick={printIssueFromPreview} disabled={!issuePreviewHtml}>Print</Button>
             <Button variant="primary" icon={<Download size={14} />} loading={issueDownloading} onClick={() => void downloadIssuePdf()}>Download PDF</Button>
           </>
@@ -731,6 +767,7 @@ export default function RequisitionDetail() {
           <iframe
             ref={issuePreviewFrameRef}
             title={`Issue slip ${issuePreview?.slipNo ?? ''} preview`}
+            sandbox="allow-same-origin allow-modals"
             srcDoc={issuePreviewHtml ?? ''}
             style={{ width: '100%', height: '72vh', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', background: '#fff' }}
           />
@@ -743,17 +780,34 @@ export default function RequisitionDetail() {
 /* ── Store Issue modal ────────────────────────────────────────────────────── */
 
 function StoreIssueModal({
-  open, onClose, requisition, onIssued,
-}: { open: boolean; onClose: () => void; requisition: RequisitionDoc; onIssued: () => void }) {
+  open, onClose, requisition, refreshing, onIssued, onStale,
+}: {
+  open: boolean; onClose: () => void; requisition: RequisitionDoc;
+  /** The requisition is being fetched again: Issue waits for the figures it will be checked against. */
+  refreshing: boolean;
+  onIssued: () => void; onStale: () => void;
+}) {
   const toast = useToast();
   const [qtyByLine, setQtyByLine] = useState<Record<number, string>>({});
   const [remarks, setRemarks] = useState('');
   const [confirmedExcess, setConfirmedExcess] = useState(false);
+  const [figuresMoved, setFiguresMoved] = useState(false);
+  // A double click posted two slips and deducted the stock twice (E2E S4-12):
+  // `loading` disables the button only after the next render. This ref is set
+  // before the request goes, so the second click of a double click finds it set.
+  const inFlight = useRef(false);
 
   const issue = useMutation({
     mutationFn: () => {
+      // expectedIssuedQty is the issued quantity this dialog shows; the server
+      // refuses the issue (409) if it has moved since, so a repeat or a stale
+      // dialog cannot issue twice.
       const lines = requisition.lines
-        .map((l) => ({ requisitionLineId: l.requisition_line_id, issueQty: qtyByLine[l.requisition_line_id] ?? '' }))
+        .map((l) => ({
+          requisitionLineId: l.requisition_line_id,
+          issueQty: qtyByLine[l.requisition_line_id] ?? '',
+          expectedIssuedQty: l.issued_qty,
+        }))
         .filter((l) => Number(l.issueQty) > 0);
       return api.post<{ issueSlipNo: string; status: string; message: string }>(`/requisitions/${requisition.id}/issue`, { lines, remarks });
     },
@@ -763,50 +817,68 @@ function StoreIssueModal({
       onIssued();
     },
     onError: (err) => {
-      toast.fromError(err instanceof ApiError ? err : err);
+      toast.fromError(err);
+      // The figures changed under the dialog. The tick was given for the extra it
+      // showed then, so it goes at once: it stood after a 409, and one more click
+      // issued an extra 3 where it had confirmed 1 (review case RV-C02c). The
+      // current figures are fetched, and the quantities start again from them (below).
+      if (err instanceof ApiError && err.status === 409) {
+        setConfirmedExcess(false);
+        onStale();
+      }
     },
+    onSettled: () => { inFlight.current = false; },
   });
+
+  const submit = () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    issue.mutate();
+  };
 
   // Suggested Issue Qty defaults to the pending (requested - issued) quantity
   // when the modal opens, but stays fully editable in both directions — Store
   // may reduce it, or raise it above what remains requested (Rule: issue qty
-  // is dynamic, never capped at requested/pending).
+  // is dynamic, never capped at requested/pending). It starts again the same way
+  // whenever the issued figures move while it is open (lib/storeIssue.ts).
+  const figuresKey = issueFiguresKey(requisition.lines);
+  const shownFigures = useRef<string | null>(null);
   useEffect(() => {
-    if (!open) return;
-    setQtyByLine(Object.fromEntries(
-      requisition.lines.filter((l) => Number(l.pending_qty) > 0).map((l) => [l.requisition_line_id, l.pending_qty]),
-    ));
+    if (!open) { shownFigures.current = null; return; }
+    setFiguresMoved(shownFigures.current !== null && shownFigures.current !== figuresKey);
+    shownFigures.current = figuresKey;
+    setQtyByLine(defaultIssueQuantities(requisition.lines));
     setConfirmedExcess(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, requisition.id]);
+  }, [open, requisition.id, figuresKey]);
 
-  const rows = requisition.lines.map((l) => {
-    const enteredQty = Number(qtyByLine[l.requisition_line_id] ?? 0);
-    const excess = enteredQty > Number(l.requested_qty) - Number(l.issued_qty)
-      ? enteredQty - Math.max(0, Number(l.requested_qty) - Number(l.issued_qty))
-      : 0;
-    return { line: l, enteredQty, excess };
-  });
-  const anyEntered = rows.some((r) => r.enteredQty > 0);
-  const anyExcess = rows.some((r) => r.excess > 0);
-  const canSubmit = anyEntered && (!anyExcess || confirmedExcess);
+  const rows = issueRows(requisition.lines, qtyByLine);
+  const { anyExcess, canSubmit } = summariseIssue(rows, confirmedExcess);
 
   return (
     <Modal
       open={open}
       onClose={onClose}
+      busy={issue.isPending}
       title="Issue material"
       subtitle={`${requisition.requisition_no} · Stock availability is checked when you confirm — over-issue against the requested quantity is allowed, over-issue beyond current stock is not.`}
       size="lg"
       footer={
         <>
-          <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" loading={issue.isPending} disabled={!canSubmit} onClick={() => issue.mutate()}>
+          <Button variant="ghost" onClick={onClose} disabled={issue.isPending}>Cancel</Button>
+          <Button variant="primary" loading={issue.isPending} disabled={!canSubmit || refreshing} onClick={submit}>
             Issue material
           </Button>
         </>
       }
     >
+      {figuresMoved && (
+        <Banner tone="warning" block>
+          The issued quantities changed while this dialog was open: an issue was posted or reversed on this
+          requisition. The figures below are current and the quantities start again from what is pending. Check them
+          before issuing.
+        </Banner>
+      )}
       <div className="table-wrap">
         <table className="table table-compact">
           <thead>

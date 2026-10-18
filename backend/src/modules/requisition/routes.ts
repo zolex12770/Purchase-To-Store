@@ -16,9 +16,10 @@ import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery,
   parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray, attachmentDisposition,
 } from '../../core/http.js';
-import { NotFoundError, BusinessRuleError, ValidationError, AuthorizationError } from '../../core/errors.js';
+import { NotFoundError, BusinessRuleError, ValidationError, AuthorizationError, ConflictError } from '../../core/errors.js';
 import { requirePermission, requireAnyPermission } from '../../auth/middleware.js';
 import { auditIn, audit, actorFrom } from '../../core/audit.js';
+import { sendPrintDocument } from '../../core/html.js';
 import { nextDocumentNumber, dateStamp, timeStamp, toDateOnly } from '../../domain/numbering.js';
 import {
   assertRequisitionTransition, assertRequisitionEditable, assertNotAlready, REQUISITION_ISSUABLE, type RequisitionStatus,
@@ -251,6 +252,7 @@ router.get(
     const rows = await query(
       `SELECT h.id, h.requisition_no, h.requisition_date, h.status,
               h.employee_name, h.employee_code, h.department_name, h.hod_name, h.machine_id, h.cost_centre_id,
+              h.requester_user_id, h.hod_user_id,
               cc.name AS cost_centre_name, m.name AS machine_name,
               b.hod_status, b.store_status,
               b.line_count, b.total_requested_qty, b.total_issued_qty, b.total_pending_qty, b.total_excess_qty,
@@ -681,9 +683,9 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
       const result = await withTransaction(async (tx) => {
         const header = await txQueryOne<{
           id: number; requisition_no: string; status: RequisitionStatus;
-          requester_user_id: number; hod_user_id: number | null;
+          requester_user_id: number; hod_user_id: number | null; department_id: number | null;
         }>(
-          tx, 'SELECT id, requisition_no, status, requester_user_id, hod_user_id FROM requisition_headers WHERE id = $1 FOR UPDATE', [id],
+          tx, 'SELECT id, requisition_no, status, requester_user_id, hod_user_id, department_id FROM requisition_headers WHERE id = $1 FOR UPDATE', [id],
         );
         if (!header) throw NotFoundError('Requisition');
         // Submit / reopen / cancel are the raiser's own actions (the HOD-only
@@ -730,6 +732,13 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
           }
         }
 
+        // A submit goes to the department's HOD as mapped now, as the edit form's
+        // resubmit (PUT with submit) does. It kept the HOD stored when the
+        // requisition was raised, so once the department's HOD changed, a RETURNED
+        // requisition resubmitted from the detail page waited on the former HOD and
+        // the new one was refused (review case RV-C09b, 2026-10-18).
+        const hod = opts.action === 'SUBMIT' ? await resolveHod(tx, header.department_id) : null;
+
         const now = new Date().toISOString();
         const setters: Record<string, string> = {
           APPROVE: 'hod_decided_at = $3, hod_decided_by = $4, hod_decision_reason = NULL',
@@ -737,11 +746,12 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
           RETURN: 'hod_decided_at = $3, hod_decided_by = $4, hod_decision_reason = $5',
           REOPEN: 'hod_decided_at = NULL, hod_decided_by = NULL, hod_decision_reason = NULL, submitted_at = NULL, submitted_by = NULL',
           CANCEL: 'closed_at = $3, closed_by = $4, close_reason = $5',
-          SUBMIT: 'submitted_at = $3, submitted_by = $4',
+          SUBMIT: 'submitted_at = $3, submitted_by = $4, hod_user_id = $5, hod_name = $6',
         };
         const setClause = setters[opts.action]!;
         const params: unknown[] = [id, opts.to, now, userId];
         if (['REJECT', 'RETURN', 'CANCEL'].includes(opts.action)) params.push(reason ?? null);
+        if (hod) params.push(hod.hodUserId, hod.hodName);
 
         await tx.query(
           `UPDATE requisition_headers SET status = $2, ${setClause}, updated_at = $3, updated_by = $4 WHERE id = $1`,
@@ -756,8 +766,11 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
         await auditIn(tx, {
           actor: actorFrom(req), action: opts.action,
           entity: 'requisition', entityId: id, entityLabel: header.requisition_no,
-          before: { status: header.status },
-          after: { status: opts.to, actorUserId: userId, requesterUserId: header.requester_user_id, selfApproval: isSelfApproval },
+          before: { status: header.status, ...(hod ? { hodUserId: header.hod_user_id } : {}) },
+          after: {
+            status: opts.to, actorUserId: userId, requesterUserId: header.requester_user_id, selfApproval: isSelfApproval,
+            ...(hod ? { hodUserId: hod.hodUserId } : {}),
+          },
           message: reason ?? (isSelfApproval ? 'Self-approved by an authorised Super Admin.' : null),
         });
 
@@ -806,6 +819,17 @@ router.delete(
 const issueLineSchema = z.object({
   requisitionLineId: z.coerce.number().int().positive(),
   issueQty: z.union([z.number(), z.string()]).refine((v) => Number(v) > 0, 'Issue quantity must be greater than zero.'),
+  /**
+   * The line's issued quantity as the issue dialog showed it. When it no longer
+   * matches, the issue is refused with 409: the dialog was stale, or this is the
+   * same issue sent twice. A double click on "Issue material" posted two slips and
+   * deducted the stock twice (2026-10-17 E2E S4-12), and nothing else can tell a
+   * repeat from a deliberate over-issue, which Rule 24 allows. Optional, so a
+   * caller that does not send it keeps the old behaviour.
+   */
+  expectedIssuedQty: z.union([z.number(), z.string()])
+    .refine((v) => String(v).trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= 0, 'Must be a quantity of zero or more.')
+    .optional(),
 });
 
 const issueSchema = z.object({
@@ -864,6 +888,17 @@ router.post(
         );
         if (!bal) {
           throw ValidationError(`Line ${i + 1}: not a valid line on this requisition.`, [{ field: `lines.${i}.requisitionLineId`, message: 'Not found.' }]);
+        }
+        // A stale or repeated issue (expectedIssuedQty, issueLineSchema). Checked
+        // under the line lock and inside the transaction, so the slip and any line
+        // already deducted above roll back with it: nothing is issued.
+        if (line.expectedIssuedQty !== undefined && !dec(line.expectedIssuedQty).eq(dec(bal.issued_qty))) {
+          throw ConflictError(
+            `Line ${i + 1} (${bal.item_code}) now has ${toQty(bal.issued_qty)} issued, not the ${toQty(line.expectedIssuedQty)} ` +
+            'shown when this issue was prepared: another issue was posted or reversed in the meantime, or this one was sent twice. ' +
+            'Nothing was issued. Check the quantities again before issuing.',
+            { requisitionLineId: line.requisitionLineId, expectedIssuedQty: toQty(line.expectedIssuedQty), issuedQty: toQty(bal.issued_qty) },
+          );
         }
 
         const issueQty = toQty(line.issueQty);
@@ -983,6 +1018,7 @@ router.post(
 );
 
 /* ── Print — one document, two ways to consume it (mirrors PO/GRN) ──────────── */
+/* The HTML goes out with a policy that lets it run and load nothing (core/html.ts). */
 
 router.get(
   '/:id/print-view',
@@ -990,8 +1026,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const id = idParam(req);
     const doc = await buildRequisitionDocument(id);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(renderRequisitionDocumentHtml(doc));
+    sendPrintDocument(res, renderRequisitionDocumentHtml(doc));
   }),
 );
 
@@ -1022,8 +1057,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const issueId = idParam(req, 'issueId');
     const doc = await buildIssueSlipDocument(issueId);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(renderIssueSlipHtml(doc));
+    sendPrintDocument(res, renderIssueSlipHtml(doc));
   }),
 );
 

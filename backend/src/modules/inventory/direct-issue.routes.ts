@@ -21,6 +21,8 @@ import { nextDocumentNumber, dateStamp, timeStamp } from '../../domain/numbering
 import { toQty } from '../../domain/money.js';
 import { issueDirectStoreLine, reverseDirectStoreLine } from '../../domain/stock.js';
 import { loadCompanySettings } from '../../domain/company.js';
+import { sendPrintDocument } from '../../core/html.js';
+import { renderDirectIssueSlipHtml } from './direct-issue-document.js';
 
 const router = Router();
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -331,6 +333,9 @@ router.post(
 );
 
 /* ── GET /inventory/direct-issues/:id/print ───────────────────────────────── */
+/* The slip is rendered by direct-issue-document.ts (every value escaped, a
+   cancelled issue marked as such) and goes out with a policy that lets it run and
+   load nothing (core/html.ts). */
 
 router.get(
   '/:id/print',
@@ -338,111 +343,36 @@ router.get(
   asyncHandler(async (req, res) => {
     const id = idParam(req);
     const header = await queryOne<Record<string, unknown>>(
-      `SELECT h.*, u.employee_name AS created_by_name
+      `SELECT h.*, u.employee_name AS created_by_name, xu.employee_name AS cancelled_by_name
          FROM direct_issue_headers h
          LEFT JOIN users u ON u.id = h.created_by
+         LEFT JOIN users xu ON xu.id = h.cancelled_by
         WHERE h.id = $1`,
       [id],
     );
     if (!header) throw NotFoundError('Direct Issue');
 
-    const lines = await query<Record<string, unknown>>(
-      `SELECT l.*, i.hsn_code
+    const lines = await query<{ item_code: string; item_description: string; uom_code: string | null; issue_qty: string; remarks: string | null }>(
+      `SELECT l.item_code, l.item_description, l.uom_code, l.issue_qty, l.remarks
          FROM direct_issue_lines l
-         JOIN items i ON i.id = l.item_id
         WHERE l.direct_issue_id = $1
         ORDER BY l.line_no ASC`,
       [id],
     );
 
-    const company = await loadCompanySettings();
-
-    const lineRowsHtml = lines.map((l, i) => `
-      <tr>
-        <td style="text-align:center; padding:6px; border:1px solid #ccc;">${i + 1}</td>
-        <td style="padding:6px; border:1px solid #ccc; font-weight:600;">${l.item_code}</td>
-        <td style="padding:6px; border:1px solid #ccc;">${l.item_description}</td>
-        <td style="text-align:center; padding:6px; border:1px solid #ccc;">${l.uom_code || '-'}</td>
-        <td style="text-align:right; padding:6px; border:1px solid #ccc; font-weight:700;">${Number(l.issue_qty).toFixed(2)}</td>
-        <td style="padding:6px; border:1px solid #ccc;">${l.remarks || ''}</td>
-      </tr>
-    `).join('');
-
-    const html = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Direct Store Issue Slip - ${header.issue_no}</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 30px; color: #111; }
-    .header { border-bottom: 2px solid #111; padding-bottom: 12px; margin-bottom: 20px; }
-    .title { font-size: 20px; font-weight: 700; text-transform: uppercase; margin-bottom: 4px; }
-    .company { font-size: 14px; color: #444; }
-    .doc-meta { display: flex; justify-content: space-between; margin-bottom: 20px; font-size: 13px; }
-    .box { background: #f9f9f9; padding: 12px; border: 1px solid #ddd; border-radius: 4px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 13px; }
-    th { background: #f0f0f0; padding: 8px 6px; border: 1px solid #ccc; text-align: left; }
-    .signatures { display: flex; justify-content: space-between; margin-top: 60px; font-size: 13px; }
-    .sig-line { border-top: 1px solid #444; width: 180px; text-align: center; padding-top: 5px; }
-    @media print {
-      body { margin: 15px; }
-      .no-print { display: none; }
-    }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <div class="title">STORE DIRECT ISSUE SLIP</div>
-    <div class="company">${company.name || 'Zeeta Electrical Engineering Pvt. Ltd.'}</div>
-  </div>
-
-  <div class="doc-meta">
-    <div class="box" style="width: 48%;">
-      <div><strong>Issue Slip No:</strong> ${header.issue_no}</div>
-      <div><strong>Date:</strong> ${String(header.issue_date).slice(0, 10)} ${header.issue_time || ''}</div>
-      <div><strong>Purpose:</strong> ${header.purpose || '-'}</div>
-    </div>
-    <div class="box" style="width: 48%;">
-      <div><strong>Recipient:</strong> ${header.recipient_name} (${header.recipient_employee_code || '-'})</div>
-      <div><strong>Department:</strong> ${header.department_name || '-'}</div>
-      <div><strong>Cost Centre:</strong> ${header.cost_centre_name || '-'}</div>
-    </div>
-  </div>
-
-  <table>
-    <thead>
-      <tr>
-        <th style="width: 40px; text-align: center;">#</th>
-        <th style="width: 120px;">Item Code</th>
-        <th>Description</th>
-        <th style="width: 70px; text-align: center;">UOM</th>
-        <th style="width: 90px; text-align: right;">Issued Qty</th>
-        <th style="width: 140px;">Remarks</th>
-      </tr>
-    </thead>
-    <tbody>
-      ${lineRowsHtml}
-    </tbody>
-    <tfoot>
-      <tr style="background:#f4f4f4; font-weight:700;">
-        <td colspan="4" style="padding:8px; border:1px solid #ccc; text-align:right;">Total Quantity Issued:</td>
-        <td style="padding:8px; border:1px solid #ccc; text-align:right;">${Number(header.total_qty).toFixed(2)}</td>
-        <td style="border:1px solid #ccc;"></td>
-      </tr>
-    </tfoot>
-  </table>
-
-  ${header.remarks ? `<div style="margin-top:15px; font-size:12px;"><strong>Remarks:</strong> ${header.remarks}</div>` : ''}
-
-  <div class="signatures">
-    <div class="sig-line">Store Incharge<br><span style="font-size:11px; color:#666;">${header.created_by_name || 'Store'}</span></div>
-    <div class="sig-line">Recipient Signature<br><span style="font-size:11px; color:#666;">${header.recipient_name}</span></div>
-  </div>
-</body>
-</html>`;
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.status(200).send(html);
+    const h = header as Record<string, string>;
+    sendPrintDocument(res, renderDirectIssueSlipHtml({
+      issue_no: h.issue_no, issue_date: header.issue_date as string | Date, issue_time: h.issue_time,
+      purpose: h.purpose, remarks: h.remarks,
+      recipient_name: h.recipient_name, recipient_employee_code: h.recipient_employee_code,
+      department_name: h.department_name, cost_centre_name: h.cost_centre_name,
+      total_qty: String(header.total_qty), created_by_name: (header.created_by_name as string | null) ?? null,
+      cancellation: h.status === 'CANCELLED'
+        ? { at: (header.cancelled_at as string | Date | null) ?? null, by: (header.cancelled_by_name as string | null) ?? null, reason: h.cancel_reason }
+        : null,
+      lines,
+      company: await loadCompanySettings(),
+    }));
   }),
 );
 

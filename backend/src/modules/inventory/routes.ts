@@ -1011,6 +1011,17 @@ router.post(
 );
 
 /* ── GET /inventory/requisition-queue ───────────────────────────────────────── */
+/* available_stock_qty is the stock left for a line once the lines ahead of it in
+   this queue (oldest requisition first, the order it is listed in) have taken
+   theirs; the page reads a line as Sufficient when that covers its balance. It
+   used to be live stock less EVERY open line's balance, this line's own included,
+   so a line needing 2 with 3 on hand and nothing else waiting read 1 and
+   "Shortage" (2026-10-17 E2E S4-07b), and an over-issued line counted as negative
+   demand. Live stock less only the OTHER lines' balances calls a line covered only
+   when the stock covers every open line of the item, so of two lines needing 6
+   against 10 on hand both would read short, though the first can be issued now;
+   in queue order the first reads 10 and the second 4. Every line in the window
+   has a positive balance (the WHERE below), so nothing over-issued counts. */
 
 router.get(
   '/requisition-queue',
@@ -1038,7 +1049,11 @@ router.get(
               COALESCE(lu.code, '') AS uom_code,
               i.inventory_category AS category,
               i.live_stock_qty,
-              GREATEST(0, i.live_stock_qty - COALESCE(req_all.allocated_qty, 0)) AS available_stock_qty
+              GREATEST(0, i.live_stock_qty - COALESCE(SUM(rl.requested_qty - COALESCE(v.issued_qty, 0)) OVER (
+                PARTITION BY rl.item_id
+                ORDER BY h.requisition_date, h.id, rl.line_no
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+              ), 0)) AS available_stock_qty
          FROM requisition_lines rl
          JOIN requisition_headers h ON h.id = rl.requisition_id
          JOIN items i ON i.id = rl.item_id
@@ -1047,14 +1062,6 @@ router.get(
          LEFT JOIN lookups lu ON lu.id = rl.uom_id
          LEFT JOIN users u ON u.id = h.requester_user_id
          LEFT JOIN v_requisition_line_balance v ON v.requisition_line_id = rl.id
-         LEFT JOIN (
-           SELECT rl2.item_id, SUM(rl2.requested_qty - COALESCE(v2.issued_qty, 0)) AS allocated_qty
-             FROM requisition_lines rl2
-             JOIN requisition_headers rh2 ON rh2.id = rl2.requisition_id
-             JOIN v_requisition_line_balance v2 ON v2.requisition_line_id = rl2.id
-            WHERE rh2.status IN ('APPROVED', 'PARTIALLY_ISSUED')
-            GROUP BY rl2.item_id
-         ) req_all ON req_all.item_id = i.id
         WHERE h.status IN ('APPROVED', 'PARTIALLY_ISSUED')
           AND (rl.requested_qty - COALESCE(v.issued_qty, 0)) > 0
         ORDER BY h.requisition_date ASC, h.id ASC, rl.line_no ASC`,
