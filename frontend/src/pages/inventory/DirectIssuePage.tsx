@@ -900,8 +900,8 @@ export default function DirectIssuePage() {
       <Modal
         open={slip !== null}
         onClose={closeSlip}
-        title={`Direct Issue Slip — ${slip?.issueNo ?? ''}${slip?.cancelled ? ' (cancelled)' : ''}`}
-        subtitle="The printable slip, as it prints"
+        title={`Direct issue slip preview — ${slip?.issueNo ?? ''}${slip?.cancelled ? ' (cancelled)' : ''}`}
+        subtitle="The slip exactly as it prints"
         size="xl"
         footer={
           <>
