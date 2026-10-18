@@ -933,7 +933,7 @@ router.post(
       if (body.expectedSystemQty !== undefined && toQty(body.expectedSystemQty) !== toQty(item.live_stock_qty)) {
         throw ConflictError(
           `${item.item_code}'s book stock is ${Number(item.live_stock_qty)}, not ${Number(body.expectedSystemQty)} as shown when the count was entered. ` +
-          'Nothing was posted. Reopen the count to see the current figure.',
+          'Nothing was posted: check the count against the current book stock before posting it.',
           { itemCode: item.item_code, bookStock: toQty(item.live_stock_qty), shown: toQty(body.expectedSystemQty) },
         );
       }
