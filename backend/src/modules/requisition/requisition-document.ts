@@ -13,6 +13,8 @@
  */
 import { formatIndian } from '../../domain/money.js';
 import type { CompanySettings } from '../../domain/company.js';
+// The shared escape also covers quotes: the logo and brand are written into attributes.
+import { escapeHtml as esc, PRINT_DOCUMENT_CSP_META } from '../../core/html.js';
 
 export type RequisitionDocumentCompany = CompanySettings;
 
@@ -43,9 +45,6 @@ export interface RequisitionDocumentData {
   lines: RequisitionDocumentLine[];
   company: CompanySettings;
 }
-
-const esc = (s: string | null | undefined): string =>
-  (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 const fmtDate = (d: string | null): string => {
   if (!d) return '—';
@@ -106,6 +105,7 @@ export function renderRequisitionDocumentHtml(d: RequisitionDocumentData): strin
 <html>
 <head>
 <meta charset="utf-8" />
+${PRINT_DOCUMENT_CSP_META}
 <title>${esc(d.requisition_no)}</title>
 <style>
   @page { size: A4; margin: 12mm 12mm 16mm; }

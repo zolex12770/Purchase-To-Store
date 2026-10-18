@@ -16,9 +16,10 @@ import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery,
   parsedQuery, listQuerySchema, resolveSort, offsetOf, idParam, csvArray, csvIdArray, attachmentDisposition,
 } from '../../core/http.js';
-import { NotFoundError, BusinessRuleError, ValidationError, AuthorizationError } from '../../core/errors.js';
+import { NotFoundError, BusinessRuleError, ValidationError, AuthorizationError, ConflictError } from '../../core/errors.js';
 import { requirePermission, requireAnyPermission } from '../../auth/middleware.js';
 import { auditIn, audit, actorFrom } from '../../core/audit.js';
+import { sendPrintDocument } from '../../core/html.js';
 import { nextDocumentNumber, dateStamp, timeStamp, toDateOnly } from '../../domain/numbering.js';
 import {
   assertRequisitionTransition, assertRequisitionEditable, assertNotAlready, REQUISITION_ISSUABLE, type RequisitionStatus,
@@ -806,6 +807,17 @@ router.delete(
 const issueLineSchema = z.object({
   requisitionLineId: z.coerce.number().int().positive(),
   issueQty: z.union([z.number(), z.string()]).refine((v) => Number(v) > 0, 'Issue quantity must be greater than zero.'),
+  /**
+   * The line's issued quantity as the issue dialog showed it. When it no longer
+   * matches, the issue is refused with 409: the dialog was stale, or this is the
+   * same issue sent twice. A double click on "Issue material" posted two slips and
+   * deducted the stock twice (2026-10-17 E2E S4-12), and nothing else can tell a
+   * repeat from a deliberate over-issue, which Rule 24 allows. Optional, so a
+   * caller that does not send it keeps the old behaviour.
+   */
+  expectedIssuedQty: z.union([z.number(), z.string()])
+    .refine((v) => String(v).trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= 0, 'Must be a quantity of zero or more.')
+    .optional(),
 });
 
 const issueSchema = z.object({
@@ -864,6 +876,17 @@ router.post(
         );
         if (!bal) {
           throw ValidationError(`Line ${i + 1}: not a valid line on this requisition.`, [{ field: `lines.${i}.requisitionLineId`, message: 'Not found.' }]);
+        }
+        // A stale or repeated issue (expectedIssuedQty, issueLineSchema). Checked
+        // under the line lock and inside the transaction, so the slip and any line
+        // already deducted above roll back with it: nothing is issued.
+        if (line.expectedIssuedQty !== undefined && !dec(line.expectedIssuedQty).eq(dec(bal.issued_qty))) {
+          throw ConflictError(
+            `Line ${i + 1} (${bal.item_code}) now has ${toQty(bal.issued_qty)} issued, not the ${toQty(line.expectedIssuedQty)} ` +
+            'shown when this issue was prepared: another issue was posted or reversed in the meantime, or this one was sent twice. ' +
+            'Nothing was issued. Check the quantities again before issuing.',
+            { requisitionLineId: line.requisitionLineId, expectedIssuedQty: toQty(line.expectedIssuedQty), issuedQty: toQty(bal.issued_qty) },
+          );
         }
 
         const issueQty = toQty(line.issueQty);
@@ -983,6 +1006,7 @@ router.post(
 );
 
 /* ── Print — one document, two ways to consume it (mirrors PO/GRN) ──────────── */
+/* The HTML goes out with a policy that lets it run and load nothing (core/html.ts). */
 
 router.get(
   '/:id/print-view',
@@ -990,8 +1014,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const id = idParam(req);
     const doc = await buildRequisitionDocument(id);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(renderRequisitionDocumentHtml(doc));
+    sendPrintDocument(res, renderRequisitionDocumentHtml(doc));
   }),
 );
 
@@ -1022,8 +1045,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const issueId = idParam(req, 'issueId');
     const doc = await buildIssueSlipDocument(issueId);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(renderIssueSlipHtml(doc));
+    sendPrintDocument(res, renderIssueSlipHtml(doc));
   }),
 );
 
