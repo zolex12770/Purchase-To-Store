@@ -13,6 +13,8 @@
  *        · the 10-minute check analyses the tables due, the check that took an automatic
  *          backup every table, and a business-sheet sync that wrote rows the tables it
  *          changed.
+ *   3. C40: migration 034 gives the HOD role item.view and lookup.view, so an account
+ *      holding only HOD can find and choose the items of the requisition it raises.
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import request from 'supertest';
@@ -161,6 +163,79 @@ describe('the item and supplier searches name records by id (C41)', () => {
     const junk = await request(app).get(api('/items/search?ids=abc&limit=5')).set(auth(adminToken));
     expect(junk.status).toBe(200);
     expect((await request(app).get(api(`/suppliers/search?ids=${sup!.id}`)).set(auth(viewerToken))).status).toBe(403);
+  });
+});
+
+/* ── 3. C40: the HOD role may search the items a requisition needs ──────────── */
+
+describe('the HOD role and the item search (C40, migration 034)', () => {
+  const MIGRATION = '034_hod_role_item_and_lookup_view';
+  /** Every grant, as role:permission, of the roles other than `except`. */
+  const grants = async (except = '') => (await query<{ held: string }>(
+    `SELECT r.code || ':' || p.code AS held FROM role_permissions rp
+       JOIN roles r ON r.id = rp.role_id JOIN permissions p ON p.id = rp.permission_id
+      WHERE r.code <> $1 ORDER BY 1`,
+    [except],
+  )).map((g) => g.held);
+  /** A release with 034 starting on this database: its migrations run before it answers anyone. */
+  const deploy034 = async () => {
+    const { runMigrations } = await import('../db/migrate.js');
+    const { invalidateAuthState } = await import('../auth/middleware.js');
+    await query('DELETE FROM schema_migrations WHERE version = $1', [MIGRATION]);
+    expect((await runMigrations({ silent: true })).applied).toEqual([MIGRATION]);
+    invalidateAuthState();
+  };
+
+  it('a HOD role holding requisition rights only is given item.view and lookup.view, and its holder can find and choose an item', async () => {
+    // The role as scripts/reconcile_all_department_hods_and_roles.ts created it on production.
+    const [hod] = await query<{ id: number }>(
+      `INSERT INTO roles (code, name, description, is_system, is_active)
+       VALUES ('HOD', 'HOD', 'Department Head: approves and decides material requisitions.', TRUE, TRUE) RETURNING id`,
+    );
+    await query(
+      `INSERT INTO role_permissions (role_id, permission_id)
+       SELECT $1, id FROM permissions
+        WHERE code IN ('requisition.view', 'requisition.create', 'requisition.edit', 'requisition.approve', 'requisition.print')`,
+      [hod!.id],
+    );
+    const user = await request(app).post(api('/users')).set(auth(adminToken)).send({
+      employeeId: 'T-PLAT-HOD', employeeName: 'Platform HOD only', designation: 'HOD',
+      password: PASSWORD, mustChangePassword: false, roleIds: [hod!.id],
+    });
+    expect(user.status).toBe(201);
+    const hodToken = await signIn('T-PLAT-HOD', [PASSWORD]);
+    const [item] = await query<{ id: string }>(
+      `INSERT INTO items (item_code, item_description, is_active) VALUES ('T4-HOD-1', 'Platform HOD item', TRUE) RETURNING id`,
+    );
+    const search = () => request(app).get(api('/items/search?q=T4-HOD')).set(auth(hodToken));
+    // S1-D10: the picker of Create Requisition was refused.
+    expect((await search()).status).toBe(403);
+    const others = await grants('HOD');
+
+    await deploy034();
+
+    expect(await grants('HOD')).toEqual(others);
+    expect((await grants()).filter((g) => g.startsWith('HOD:'))).toEqual([
+      'HOD:item.view', 'HOD:lookup.view',
+      'HOD:requisition.approve', 'HOD:requisition.create', 'HOD:requisition.edit', 'HOD:requisition.print', 'HOD:requisition.view',
+    ]);
+    const found = await search();
+    expect(found.status).toBe(200);
+    expect(found.body.data.map((r: { item_code: string }) => r.item_code)).toEqual(['T4-HOD-1']);
+    // Choosing it fills the line from its profile; the form's masters answer too.
+    expect((await request(app).get(api(`/items/${item!.id}/profile`)).set(auth(hodToken))).status).toBe(200);
+    expect((await request(app).get(api('/lookups/DEPARTMENT')).set(auth(hodToken))).status).toBe(200);
+    // Nothing else came with it.
+    expect((await request(app).get(api('/suppliers/search?q=T4')).set(auth(hodToken))).status).toBe(403);
+  });
+
+  it('a database without a HOD role is left as it was', async () => {
+    await query(`DELETE FROM user_roles WHERE role_id = (SELECT id FROM roles WHERE code = 'HOD')`);
+    await query(`DELETE FROM roles WHERE code = 'HOD'`);
+    const before = await grants();
+    await deploy034();
+    expect(await query(`SELECT id FROM roles WHERE code = 'HOD'`)).toEqual([]);
+    expect(await grants()).toEqual(before);
   });
 });
 
