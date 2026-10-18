@@ -14,6 +14,9 @@
  *      with a policy that lets them run and load nothing.
  *   4. S1-06: the requisition list names the raiser and the HOD of each row, so the
  *      screen can offer the HOD decisions to that HOD only.
+ *   5. Review case RV-C09b (2026-10-18): a requisition submitted from the detail page
+ *      (POST /:id/submit) goes to its department's HOD as mapped now, as the edit
+ *      form's resubmit does; it waited on the former HOD.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
@@ -324,6 +327,65 @@ describe('the requisition list says who raised each requisition and who decides 
     expect(list.status).toBe(200);
     const row = (list.body.data as { id: number; requester_user_id: number; hod_user_id: number }[]).find((r) => r.id === created.body.data.id);
     expect(row).toMatchObject({ requester_user_id: storeUserId, hod_user_id: adminUserId });
+  });
+});
+
+describe('a submit from the detail page goes to the department\'s HOD as mapped now (review case RV-C09b)', () => {
+  const oldHod = { id: 0, token: '' };
+  const newHod = { id: 0, token: '' };
+  const mapHod = async (hodUserId: number) =>
+    expect((await request(app).put(api(`/requisitions/departments/${deptId}/hod`)).set(auth(adminToken)).send({ hodUserId })).status).toBe(200);
+  const raise = async (submit: boolean) => {
+    const itemId = await mkItem(`TSIG-HOD-${submit ? 'S' : 'D'}`);
+    const created = await request(app).post(api('/requisitions')).set(auth(storeToken))
+      .send({ remarks: 'HOD routing', submit, lines: [{ itemId, requestedQty: '1' }] });
+    expect(created.status).toBe(201);
+    return created.body.data as { id: number; hod_user_id: number | null };
+  };
+  const submitFromDetail = (id: number) => request(app).post(api(`/requisitions/${id}/submit`)).set(auth(storeToken)).send({});
+
+  beforeAll(async () => {
+    const roles = (await request(app).get(api('/roles')).set(auth(adminToken))).body.data as { id: number; code: string }[];
+    for (const [hod, employeeId, employeeName] of [
+      [oldHod, 'T-SIG-HOD-OLD', 'Store Issue Guard Old HOD'], [newHod, 'T-SIG-HOD-NEW', 'Store Issue Guard New HOD'],
+    ] as const) {
+      const created = await request(app).post(api('/users')).set(auth(adminToken)).send({
+        employeeId, employeeName, designation: 'HOD', password: PASSWORD, mustChangePassword: false,
+        roleIds: [roles.find((x) => x.code === 'EMPLOYEE')!.id],
+      });
+      expect(created.status).toBe(201);
+      hod.id = Number(created.body.data.id);
+      hod.token = (await request(app).post(api('/auth/login')).send({ employeeId, password: PASSWORD })).body.data.accessToken;
+    }
+  });
+
+  it('a RETURNED requisition resubmitted there goes to the new HOD, who may then decide it', async () => {
+    await mapHod(oldHod.id);
+    const raised = await raise(true);
+    expect(raised.hod_user_id).toBe(oldHod.id);
+    expect((await request(app).post(api(`/requisitions/${raised.id}/return`)).set(auth(oldHod.token)).send({ reason: 'Please correct it' })).status).toBe(200);
+
+    await mapHod(newHod.id);
+    expect((await submitFromDetail(raised.id)).status).toBe(200);
+    expect(await requisition(raised.id)).toMatchObject({ status: 'PENDING_APPROVAL', hod_user_id: newHod.id, hod_name: 'Store Issue Guard New HOD' });
+    expect((await request(app).post(api(`/requisitions/${raised.id}/approve`)).set(auth(oldHod.token)).send({})).status).toBe(403);
+    expect((await request(app).post(api(`/requisitions/${raised.id}/approve`)).set(auth(newHod.token)).send({})).status).toBe(200);
+  });
+
+  it('a DRAFT submitted there is routed the same way, and the audit trail names both HODs', async () => {
+    await mapHod(oldHod.id);
+    const draft = await raise(false);
+    expect(draft.hod_user_id).toBe(oldHod.id);
+
+    await mapHod(newHod.id);
+    expect((await submitFromDetail(draft.id)).status).toBe(200);
+    expect(await requisition(draft.id)).toMatchObject({ status: 'PENDING_APPROVAL', hod_user_id: newHod.id });
+    const audit = await query<{ before_data: { hodUserId?: number }; after_data: { hodUserId?: number } }>(
+      `SELECT before_data, after_data FROM audit_logs WHERE entity = 'requisition' AND entity_id = $1 AND action = 'SUBMIT'`, [String(draft.id)],
+    );
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.before_data.hodUserId).toBe(oldHod.id);
+    expect(audit[0]!.after_data.hodUserId).toBe(newHod.id);
   });
 });
 

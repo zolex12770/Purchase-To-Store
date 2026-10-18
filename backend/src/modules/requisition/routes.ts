@@ -683,9 +683,9 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
       const result = await withTransaction(async (tx) => {
         const header = await txQueryOne<{
           id: number; requisition_no: string; status: RequisitionStatus;
-          requester_user_id: number; hod_user_id: number | null;
+          requester_user_id: number; hod_user_id: number | null; department_id: number | null;
         }>(
-          tx, 'SELECT id, requisition_no, status, requester_user_id, hod_user_id FROM requisition_headers WHERE id = $1 FOR UPDATE', [id],
+          tx, 'SELECT id, requisition_no, status, requester_user_id, hod_user_id, department_id FROM requisition_headers WHERE id = $1 FOR UPDATE', [id],
         );
         if (!header) throw NotFoundError('Requisition');
         // Submit / reopen / cancel are the raiser's own actions (the HOD-only
@@ -732,6 +732,13 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
           }
         }
 
+        // A submit goes to the department's HOD as mapped now, as the edit form's
+        // resubmit (PUT with submit) does. It kept the HOD stored when the
+        // requisition was raised, so once the department's HOD changed, a RETURNED
+        // requisition resubmitted from the detail page waited on the former HOD and
+        // the new one was refused (review case RV-C09b, 2026-10-18).
+        const hod = opts.action === 'SUBMIT' ? await resolveHod(tx, header.department_id) : null;
+
         const now = new Date().toISOString();
         const setters: Record<string, string> = {
           APPROVE: 'hod_decided_at = $3, hod_decided_by = $4, hod_decision_reason = NULL',
@@ -739,11 +746,12 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
           RETURN: 'hod_decided_at = $3, hod_decided_by = $4, hod_decision_reason = $5',
           REOPEN: 'hod_decided_at = NULL, hod_decided_by = NULL, hod_decision_reason = NULL, submitted_at = NULL, submitted_by = NULL',
           CANCEL: 'closed_at = $3, closed_by = $4, close_reason = $5',
-          SUBMIT: 'submitted_at = $3, submitted_by = $4',
+          SUBMIT: 'submitted_at = $3, submitted_by = $4, hod_user_id = $5, hod_name = $6',
         };
         const setClause = setters[opts.action]!;
         const params: unknown[] = [id, opts.to, now, userId];
         if (['REJECT', 'RETURN', 'CANCEL'].includes(opts.action)) params.push(reason ?? null);
+        if (hod) params.push(hod.hodUserId, hod.hodName);
 
         await tx.query(
           `UPDATE requisition_headers SET status = $2, ${setClause}, updated_at = $3, updated_by = $4 WHERE id = $1`,
@@ -758,8 +766,11 @@ function transitionRoute(path: string, opts: TransitionOptions): void {
         await auditIn(tx, {
           actor: actorFrom(req), action: opts.action,
           entity: 'requisition', entityId: id, entityLabel: header.requisition_no,
-          before: { status: header.status },
-          after: { status: opts.to, actorUserId: userId, requesterUserId: header.requester_user_id, selfApproval: isSelfApproval },
+          before: { status: header.status, ...(hod ? { hodUserId: header.hod_user_id } : {}) },
+          after: {
+            status: opts.to, actorUserId: userId, requesterUserId: header.requester_user_id, selfApproval: isSelfApproval,
+            ...(hod ? { hodUserId: hod.hodUserId } : {}),
+          },
           message: reason ?? (isSelfApproval ? 'Self-approved by an authorised Super Admin.' : null),
         });
 
