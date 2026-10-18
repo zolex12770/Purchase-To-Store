@@ -16,6 +16,7 @@ import {
 import { useDebounced } from '../../components/simple';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
 import { describeSync, type SyncResult } from '../../lib/describeSync';
+import { rowById, rateAfterItemChoice } from '../../lib/inventoryForms';
 
 export type InventoryCategoryKey = 'RM' | 'FG' | 'WIP' | 'TRADING' | 'GENERAL';
 
@@ -227,7 +228,7 @@ function CategoryItemSelect({ category, value, onChange, invalid }: {
           : term.trim() ? `No ${category} item matches. Check the item code or name.` : `Type the ${category} item code or name.`
       }
       onChange={(v) => {
-        const row = linked.find((r) => r.id === Number(v));
+        const row = rowById(linked, v);
         if (row) onChange(moveItemOf(row));
       }}
     />
@@ -341,6 +342,8 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
   const [moveQty, setMoveQty] = useState('');
   const [moveWeightKg, setMoveWeightKg] = useState('');
   const [moveRate, setMoveRate] = useState('');
+  // Whether the user typed the rate; otherwise it is the chosen item's own (rateAfterItemChoice).
+  const [moveRateTyped, setMoveRateTyped] = useState(false);
   const [moveLocation, setMoveLocation] = useState('');
   const [moveDepartment, setMoveDepartment] = useState('');
   const [moveRefDoc, setMoveRefDoc] = useState('');
@@ -497,6 +500,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
     setMoveQty('');
     setMoveWeightKg('');
     setMoveRate(item?.rate ? String(item.rate) : '');
+    setMoveRateTyped(false);
     setMoveLocation('');
     setMoveDepartment('');
     setMoveRefDoc('');
@@ -1432,7 +1436,7 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                   onChange={(it) => {
                     setMoveItem(it);
                     setMoveItemError(null);
-                    if (!moveRate && it.rate) setMoveRate(String(it.rate));
+                    setMoveRate((r) => rateAfterItemChoice(r, moveRateTyped, it.rate));
                   }}
                 />
               </Field>
@@ -1500,7 +1504,10 @@ export function CategoryWorkspaceView({ category, onOpenAdjustment }: Props) {
                   step="0.01"
                   placeholder="e.g. 450"
                   value={moveRate}
-                  onChange={(e) => setMoveRate(e.target.value)}
+                  onChange={(e) => {
+                    setMoveRate(e.target.value);
+                    setMoveRateTyped(true);
+                  }}
                 />
               </Field>
 

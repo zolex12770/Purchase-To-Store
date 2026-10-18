@@ -4,11 +4,15 @@
  *
  *   1. C05 (S5-13b): a re-run of the stock scan leaves an approved suggestion the only open
  *      one for its item, and while a second suggestion for the same shortage is open neither
- *      converts, so a shortage becomes one indent.
+ *      is approved further nor converts, so a shortage becomes one indent. The queue offers
+ *      Reject on both rows of such a pair, also once approved (T2 review: both approved, the
+ *      queue offered only a Convert that returned 409).
  *   2. C26 (S5-09b): each queue row's can_approve is the approve route's own rule: a store
  *      user approves a pending suggestion, not a store-approved one; a Purchase Head does both.
  *   3. C10 (S5-18): a physical count is refused, and posts nothing, when the book stock it was
  *      entered against is not the item's stock; one entered against it records that figure.
+ *      The count reads that figure from the row it is posted against, also for an inactive
+ *      item, which the stock register does not list (T2 review).
  *   4. C15 (S3-10d, S3-10f): a lot On Hold or under test stays QC-held in the register, whole.
  *   5. C19 (S5-19): reversing a receipt is refused while its category figure has been issued.
  *   6. C22 (S5-17b): the Overview's Total Stock Valuation is the register's own total.
@@ -49,6 +53,18 @@ const registerRow = async (itemId: number) =>
 const suggestionsOf = (itemId: number) =>
   query<{ id: number; status: string }>('SELECT id, status FROM auto_indents WHERE item_id = $1 ORDER BY id', [itemId]);
 const OPEN = ['SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED', 'PURCHASE_APPROVED', 'APPROVED'];
+/** A suggestion as a scan before the C05 fix could leave it (next to another open one). */
+async function insertSuggestion(itemId: number, code: string, status: string): Promise<number> {
+  const [row] = await query<{ id: number }>(
+    `INSERT INTO auto_indents (item_id, item_code, item_name, eligible_stock, min_stock, reorder_level, suggested_qty,
+                               department_id, cost_centre_id, status)
+     VALUES ($1, $2, $3, 8, 0, 10, 2, $4, $5, $6) RETURNING id`,
+    [itemId, code, `Inventory test ${code}`, deptId, ccId, status],
+  );
+  return Number(row!.id);
+}
+const indentLinesOf = async (itemId: number) =>
+  Number((await query<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_indent_lines WHERE item_id = $1', [itemId]))[0]!.n);
 
 async function mkItem(code: string, extra: Record<string, unknown> = {}): Promise<number> {
   const r = await post('/items', {
@@ -143,29 +159,90 @@ describe('the stock scan and an approved suggestion (C05, E2E S5-13b)', () => {
     expect((await suggestionsOf(itemId)).filter((s) => OPEN.includes(s.status)).map((s) => Number(s.id))).toEqual([approvedId]);
   });
 
-  it('while a second suggestion for the item is open, neither converts; once it is rejected, one indent is made', async () => {
+  it('while a second suggestion for the item is open, neither is approved further nor converts; once one is rejected, one indent is made', async () => {
     // A duplicate the scan made before the fix.
-    const [dup] = await query<{ id: number }>(
-      `INSERT INTO auto_indents (item_id, item_code, item_name, eligible_stock, min_stock, reorder_level, suggested_qty,
-                                 department_id, cost_centre_id, status)
-       VALUES ($1, 'TINV2-SCAN', 'Inventory test TINV2-SCAN', 8, 0, 10, 2, $2, $3, 'PENDING_APPROVAL') RETURNING id`,
-      [itemId, deptId, ccId],
-    );
-    const dupId = Number(dup!.id);
-    const indentsBefore = Number((await query<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_indent_lines WHERE item_id = $1', [itemId]))[0]!.n);
+    const dupId = await insertSuggestion(itemId, 'TINV2-SCAN', 'PENDING_APPROVAL');
+    const indentsBefore = await indentLinesOf(itemId);
 
     const refused = await post(`/inventory/auto-indents/${approvedId}/convert`, {}, headToken);
     expect(refused.status).toBe(409);
     expect(refused.body.error.message).toContain(`no. ${dupId}`);
-    expect((await post(`/inventory/auto-indents/${dupId}/approve`, {}, headToken)).status).toBe(200);
-    expect((await post(`/inventory/auto-indents/${dupId}/convert`, {}, headToken)).status).toBe(409);
-    expect(Number((await query<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_indent_lines WHERE item_id = $1', [itemId]))[0]!.n)).toBe(indentsBefore);
+    // Approving the duplicate as well left both approved, and then neither converted (T2 review).
+    const approveDup = await post(`/inventory/auto-indents/${dupId}/approve`, {}, headToken);
+    expect(approveDup.status).toBe(409);
+    expect(approveDup.body.error.message).toContain(`no. ${approvedId}, approved`);
+    expect((await post(`/inventory/auto-indents/${dupId}/approve`, {}, storeToken)).status).toBe(409);
+    expect((await suggestionsOf(itemId)).map((s) => s.status)).toEqual(['APPROVED', 'PENDING_APPROVAL']);
+    expect(await indentLinesOf(itemId)).toBe(indentsBefore);
 
     expect((await post(`/inventory/auto-indents/${dupId}/reject`, { reason: 'Duplicate of the approved suggestion' }, headToken)).status).toBe(200);
     const converted = await post(`/inventory/auto-indents/${approvedId}/convert`, {}, headToken);
     expect(converted.status, JSON.stringify(converted.body)).toBe(200);
     expect((await suggestionsOf(itemId)).map((s) => s.status)).toEqual(['CONVERTED', 'REJECTED']);
-    expect(Number((await query<{ n: string }>('SELECT COUNT(*) AS n FROM purchase_indent_lines WHERE item_id = $1', [itemId]))[0]!.n)).toBe(indentsBefore + 1);
+    expect(await indentLinesOf(itemId)).toBe(indentsBefore + 1);
+  });
+});
+
+/* ── 1b. C05 (T2 review): a duplicate pair can always be resolved on screen ──── */
+
+describe('the queue offers the way out of a duplicate pair (C05, T2 review of E2E S5-13b)', () => {
+  type QueueRow = {
+    id: number; status: string; can_approve: boolean; can_reject: boolean; can_convert: boolean;
+    open_duplicate_id: number | null; open_duplicate_status: string | null;
+  };
+  const queue = async (code: string, token: string) => {
+    const r = await get(`/inventory/auto-indents?search=${code}`, token);
+    expect(r.status).toBe(200);
+    return Object.fromEntries((r.body.data as QueueRow[]).map((x) => [Number(x.id), x])) as Record<number, QueueRow>;
+  };
+
+  it('approved and pending: Reject on both, Approve and Convert on neither, each naming the other', async () => {
+    const itemId = await mkItem('TINV2-PAIR');
+    const a = await insertSuggestion(itemId, 'TINV2-PAIR', 'APPROVED');
+    const b = await insertSuggestion(itemId, 'TINV2-PAIR', 'PENDING_APPROVAL');
+
+    const head = await queue('TINV2-PAIR', headToken);
+    expect(head[a]).toMatchObject({ can_approve: false, can_reject: true, can_convert: false, open_duplicate_id: b, open_duplicate_status: 'PENDING_APPROVAL' });
+    expect(head[b]).toMatchObject({ can_approve: false, can_reject: true, can_convert: false, open_duplicate_id: a, open_duplicate_status: 'APPROVED' });
+    // The store user may reject an approved suggestion too: the reject route allows it.
+    const store = await queue('TINV2-PAIR', storeToken);
+    expect(store[a]).toMatchObject({ can_reject: true, can_convert: false });
+    expect(store[b]).toMatchObject({ can_approve: false, can_reject: true });
+    const buyer = await queue('TINV2-PAIR', buyerToken);
+    expect([buyer[a]!.can_reject, buyer[b]!.can_reject, buyer[a]!.can_convert]).toEqual([false, false, false]);
+
+    expect((await post(`/inventory/auto-indents/${b}/reject`, { reason: 'Duplicate of the approved suggestion' }, storeToken)).status).toBe(200);
+    const after = await queue('TINV2-PAIR', headToken);
+    expect(after[a]).toMatchObject({ open_duplicate_id: null, can_convert: true, can_reject: true });
+    expect(after[b]).toMatchObject({ status: 'REJECTED', open_duplicate_id: null, can_reject: false, can_approve: false, can_convert: false });
+    // A Purchase User (indent.create) converts an approved suggestion as before.
+    expect((await queue('TINV2-PAIR', buyerToken))[a]!.can_convert).toBe(true);
+  });
+
+  it('both approved, as a pre-fix duplicate can be at deploy time: Reject is offered on both and one converts after', async () => {
+    const itemId = await mkItem('TINV2-BOTH');
+    const a = await insertSuggestion(itemId, 'TINV2-BOTH', 'APPROVED');
+    const b = await insertSuggestion(itemId, 'TINV2-BOTH', 'APPROVED');
+    const rows = await queue('TINV2-BOTH', headToken);
+    // The probe on the review copy: both rows offered only "Convert to Indent", which returned 409.
+    expect([rows[a]!.can_convert, rows[b]!.can_convert]).toEqual([false, false]);
+    expect([rows[a]!.can_reject, rows[b]!.can_reject]).toEqual([true, true]);
+    expect((await post(`/inventory/auto-indents/${a}/convert`, {}, headToken)).status).toBe(409);
+
+    expect((await post(`/inventory/auto-indents/${b}/reject`, { reason: 'Duplicate of the other approved suggestion' }, headToken)).status).toBe(200);
+    const indentsBefore = await indentLinesOf(itemId);
+    expect((await post(`/inventory/auto-indents/${a}/convert`, {}, headToken)).status).toBe(200);
+    expect(await indentLinesOf(itemId)).toBe(indentsBefore + 1);
+    const done = await queue('TINV2-BOTH', headToken);
+    expect(done[a]).toMatchObject({ status: 'CONVERTED', can_reject: false, can_approve: false, can_convert: false });
+  });
+
+  it('a closed suggestion offers nothing the server refuses (ORDERED)', async () => {
+    const itemId = await mkItem('TINV2-ORD');
+    const o = await insertSuggestion(itemId, 'TINV2-ORD', 'ORDERED');
+    const rows = await queue('TINV2-ORD', headToken);
+    expect(rows[o]).toMatchObject({ can_approve: false, can_reject: false, can_convert: false, open_duplicate_id: null });
+    expect((await post(`/inventory/auto-indents/${o}/reject`, { reason: 'probe' }, headToken)).status).toBe(422);
   });
 });
 
@@ -229,6 +306,34 @@ describe('a physical count and the book stock it was entered against (C10, E2E S
     // A caller that sends no figure posts as before.
     expect((await post('/inventory/adjustments', { itemId, actualStockQty: 24, reason: 'Recount' }, storeToken)).status).toBe(201);
     expect((await post('/inventory/adjustments', { itemId, actualStockQty: 24, expectedSystemQty: 'abc', reason: 'Recount' }, storeToken)).status).toBe(422);
+  });
+
+  it("reads the book stock of the row the count is posted against, also for an item that is inactive (T2 review)", async () => {
+    const itemId = await mkItem('TINV2-INACT');
+    await receive(itemId, '7');
+    // An item on a GRN line is deactivated, not deleted (DELETE /items/:id).
+    expect((await request(app).delete(api(`/items/${itemId}`)).set(auth(adminToken))).status).toBe(200);
+    expect((await query<{ a: boolean }>('SELECT is_active AS a FROM items WHERE id = $1', [itemId]))[0]!.a).toBe(false);
+    // The modal read the stock register, which lists active items only: no row, so no book stock.
+    expect((await get(`/inventory/stock?itemId=${itemId}`, storeToken)).body.data).toEqual([]);
+
+    const book = await get(`/inventory/adjustments/book-stock/${itemId}`, storeToken);
+    expect(book.status, JSON.stringify(book.body)).toBe(200);
+    expect(book.body.data).toMatchObject({ item_code: 'TINV2-INACT', is_active: false });
+    expect(Number(book.body.data.item_id)).toBe(itemId);
+    expect(Number(book.body.data.live_stock_qty)).toBe(7);
+
+    const counted = await post('/inventory/adjustments', {
+      itemId, actualStockQty: 6, expectedSystemQty: book.body.data.live_stock_qty, reason: 'Cycle Count Reconciliation',
+    }, storeToken);
+    expect(counted.status, JSON.stringify(counted.body)).toBe(201);
+    expect(counted.body.data).toMatchObject({ previousStock: '7.0000', newStock: '6.0000', deltaQty: '-1.0000' });
+    expect(Number((await get(`/inventory/adjustments/book-stock/${itemId}`, storeToken)).body.data.live_stock_qty)).toBe(6);
+
+    // The right to read it is the right to post the count.
+    expect((await get(`/inventory/adjustments/book-stock/${itemId}`, buyerToken)).status).toBe(403);
+    expect((await get(`/inventory/adjustments/book-stock/${itemId}`, headToken)).status).toBe(403);
+    expect((await get('/inventory/adjustments/book-stock/987654321', storeToken)).status).toBe(404);
   });
 });
 

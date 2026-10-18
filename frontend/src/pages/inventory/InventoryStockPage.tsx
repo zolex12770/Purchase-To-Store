@@ -18,7 +18,7 @@ import {
   PackageSearch, Plus, PackageMinus,
   RefreshCw,
 } from 'lucide-react';
-import { api, downloadFile, qs, type PageMeta } from '../../lib/api';
+import { api, downloadFile, qs, ApiError, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
 import { useToast } from '../../components/Toast';
@@ -27,11 +27,12 @@ import { FilterBar } from '../../components/FilterBar';
 import { DataTable, type Column } from '../../components/DataTable';
 import { StatTile } from '../../components/KpiCard';
 import {
-  Button, Card, CardBody, CardHeader, Badge, StatusBadge, MovementChip,
+  Button, Card, CardBody, CardHeader, Badge, StatusBadge, MovementChip, Banner,
   Modal, Field, Textarea, Select, Input,
 } from '../../components/ui';
 import { qty, formatDate, formatDateTime, count, money, moneyCompact, toShortUom } from '../../lib/format';
-import { LEDGER_TXN_TYPES, movementMeta } from '../../lib/status';
+import { LEDGER_TXN_TYPES, movementMeta, statusMeta } from '../../lib/status';
+import { countAfterBookRead } from '../../lib/inventoryForms';
 import { CategoryWorkspaceView, describeSync, type InventoryCategoryKey } from './CategoryWorkspaceView';
 
 /* ── Type Interfaces ────────────────────────────────────────────────────────── */
@@ -219,9 +220,22 @@ interface AutoIndentRow {
   /** The indent a converted suggestion became (auto_indents.indent_id; null once that indent is deleted). */
   indent_id: number | null;
   indent_no: string;
-  /** The server's own approve rule for this user and status (backend inventory/routes.ts). */
+  /** The server's own approve, reject and convert rules for this user and row (backend inventory/routes.ts). */
   can_approve: boolean;
+  can_reject: boolean;
+  can_convert: boolean;
+  /** Another open suggestion for the same item: approve and convert wait until one of the two is rejected. */
+  open_duplicate_id: number | null;
+  open_duplicate_status: string | null;
   created_at: string;
+}
+
+/** GET /inventory/adjustments/book-stock/:id — the items row a physical count is posted against. */
+interface BookStock {
+  item_id: number;
+  item_code: string;
+  is_active: boolean;
+  live_stock_qty: string;
 }
 
 interface AutoIndentStats {
@@ -347,6 +361,10 @@ export default function InventoryStockPage() {
     sheetStock?: number;
   } | null>(null);
   const [adjActualCount, setAdjActualCount] = useState<string>('');
+  // Whether the counter typed the count; an untouched count follows the book stock (countAfterBookRead).
+  const [adjCountTyped, setAdjCountTyped] = useState(false);
+  // A count the server refused because the book stock moved while it was open (409).
+  const [adjRefused, setAdjRefused] = useState<{ shown: number; bookStock: number } | null>(null);
   const [adjReason, setAdjReason] = useState<string>('Cycle Count Reconciliation');
   const [adjFindings, setAdjFindings] = useState<string>('');
   const [adjRemarks, setAdjRemarks] = useState<string>('');
@@ -461,25 +479,26 @@ export default function InventoryStockPage() {
   // The book stock the count is posted against: the item's ERP stock, read fresh whenever the
   // modal opens on an item, from whichever screen. A category workspace passed its own sheet
   // figure instead, so the modal showed 6 as the book stock while the server posted against 26,
-  // and the pre-filled count took the stock from 26 to 6 (E2E S5-18).
+  // and the pre-filled count took the stock from 26 to 6 (E2E S5-18). Read from the very row the
+  // count is posted against, active or not: the stock register lists active items only, and a
+  // workspace row of an inactive item could not be counted at all (T2 review).
   const adjItemId = isAdjModalOpen ? selectedAdjItem?.id : undefined;
   const adjBookQuery = useQuery({
     queryKey: ['inventory-adj-book-stock', adjItemId],
-    queryFn: () => api.getWithMeta<StockRow[], PageMeta>(`/inventory/stock${qs({ itemId: adjItemId, pageSize: 1 })}`),
+    queryFn: () => api.get<BookStock>(`/inventory/adjustments/book-stock/${adjItemId}`),
     enabled: adjItemId !== undefined,
     // Never an earlier read: a count reopened later must not be pre-filled with an old figure.
     staleTime: 0,
     gcTime: 0,
   });
-  const adjBookRow = adjBookQuery.data?.data?.find((r) => Number(r.item_id) === adjItemId);
-  const adjBookStock = adjBookRow ? Number(adjBookRow.live_stock_qty || 0) : null;
-  const adjBookMissing = adjItemId !== undefined && adjBookQuery.isSuccess && !adjBookRow;
+  const adjBookStock = adjBookQuery.data ? Number(adjBookQuery.data.live_stock_qty || 0) : null;
 
-  // Pre-fill the count with the book stock once it is known, as before, never over a typed figure.
+  // Pre-fill the count with the book stock once it is known, and again whenever it is read anew
+  // while the counter has typed nothing; a typed figure is never overwritten.
   useEffect(() => {
-    if (adjItemId === undefined || adjBookStock === null) return;
-    setAdjActualCount((c) => (c === '' ? String(adjBookStock) : c));
-  }, [adjItemId, adjBookStock]);
+    if (adjItemId === undefined) return;
+    setAdjActualCount((c) => countAfterBookRead(c, adjCountTyped, adjBookStock));
+  }, [adjItemId, adjBookStock, adjCountTyped]);
 
   // 5. Requisition Queue
   const { data: reqQueueData, isLoading: reqQueueLoading } = useQuery({
@@ -536,7 +555,11 @@ export default function InventoryStockPage() {
     },
     onError: (err) => {
       toast.fromError(err, 'Failed to post physical stock adjustment');
-      // A refused count (the book stock moved since it was read) shows the current figure.
+      // A count refused because the book stock moved since it was read: the modal says so and
+      // reads the figure again, and an untouched count follows it (countAfterBookRead).
+      if (err instanceof ApiError && err.status === 409 && err.details?.bookStock !== undefined) {
+        setAdjRefused({ shown: Number(err.details.shown), bookStock: Number(err.details.bookStock) });
+      }
       void qc.invalidateQueries({ queryKey: ['inventory-adj-book-stock'] });
     },
   });
@@ -656,9 +679,16 @@ export default function InventoryStockPage() {
 
   /* ── Stock Adjustment Helper ────────────────────────────────────────────── */
 
-  const openAdjustment = (item: NonNullable<typeof selectedAdjItem>) => {
+  /** The item counted: its count starts untouched, pre-filled with its book stock once loaded. */
+  const chooseAdjItem = (item: NonNullable<typeof selectedAdjItem>) => {
     setSelectedAdjItem(item);
-    setAdjActualCount(''); // pre-filled with the book stock once it is loaded
+    setAdjActualCount('');
+    setAdjCountTyped(false);
+    setAdjRefused(null);
+  };
+
+  const openAdjustment = (item: NonNullable<typeof selectedAdjItem>) => {
+    chooseAdjItem(item);
     setAdjReason('Cycle Count Reconciliation');
     setAdjFindings('');
     setAdjRemarks('');
@@ -1203,13 +1233,18 @@ export default function InventoryStockPage() {
           return <span className="cell-muted" style={{ fontSize: 'var(--text-xs)' }}>Closed</span>;
         }
 
-        const canApprove = can('auto_indent.approve');
-        const canConvert = can('indent.create');
-        const isApproved = r.status === 'APPROVED' || r.status === 'PURCHASE_APPROVED';
-
         return (
-          <div className="row" style={{ gap: 4, justifyContent: 'flex-end' }}>
-            {/* The server's own rule for this user (can_approve): a store user approves a pending
+          <div className="row" style={{ gap: 4, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+            {/* Two open suggestions for one shortage (left by scans before the fix of E2E S5-13b):
+                neither is approved further nor converted until one is rejected, and Reject is
+                offered on both, also once approved (T2 review). */}
+            {r.open_duplicate_id !== null && (
+              <span className="cell-muted" style={{ fontSize: 'var(--text-xs)', flexBasis: '100%', textAlign: 'right' }}>
+                No. {r.id}: no. {r.open_duplicate_id} ({statusMeta(r.open_duplicate_status).label.toLowerCase()}) is open for
+                the same item. Reject one of the two.
+              </span>
+            )}
+            {/* The server's own rules for this user and row: a store user approves a pending
                 suggestion, not one the store already approved, which the server refused (E2E S5-09b). */}
             {r.can_approve && (
               <Button
@@ -1223,7 +1258,7 @@ export default function InventoryStockPage() {
               </Button>
             )}
 
-            {canApprove && !isApproved && (
+            {r.can_reject && (
               <Button
                 variant="danger"
                 size="sm"
@@ -1237,7 +1272,7 @@ export default function InventoryStockPage() {
               </Button>
             )}
 
-            {canConvert && isApproved && (
+            {r.can_convert && (
               <Button
                 variant="primary"
                 size="sm"
@@ -2234,16 +2269,13 @@ export default function InventoryStockPage() {
                     {adjItemCandidates.data.map((item) => (
                       <div
                         key={item.item_id}
-                        onClick={() => {
-                          setSelectedAdjItem({
-                            id: item.item_id,
-                            code: item.item_code,
-                            description: item.item_description,
-                            category: item.category,
-                            uom: item.uom_code,
-                          });
-                          setAdjActualCount('');
-                        }}
+                        onClick={() => chooseAdjItem({
+                          id: item.item_id,
+                          code: item.item_code,
+                          description: item.item_description,
+                          category: item.category,
+                          uom: item.uom_code,
+                        })}
                         style={{
                           padding: '8px 12px',
                           cursor: 'pointer',
@@ -2299,7 +2331,7 @@ export default function InventoryStockPage() {
                         {qty(adjBookStock)} {toShortUom(selectedAdjItem.uom)}
                       </span>
                     </div>
-                  ) : !adjBookQuery.isError && !adjBookMissing && (
+                  ) : !adjBookQuery.isError && (
                     <div style={{ color: 'var(--text-muted)' }}>Loading the book stock…</div>
                   )}
                   {selectedAdjItem.sheetStock !== undefined && (
@@ -2309,14 +2341,31 @@ export default function InventoryStockPage() {
                     </div>
                   )}
                 </div>
-                {(adjBookQuery.isError || adjBookMissing) && (
-                  <div role="alert" style={{ marginTop: 8, fontSize: 'var(--text-xs)', color: 'var(--danger-700)' }}>
-                    {adjBookMissing
-                      ? `${selectedAdjItem.code} is not an active item in the stock register, so its book stock cannot be counted here.`
-                      : 'The book stock could not be loaded. Close the count and try again.'}
+                {adjBookQuery.data?.is_active === false && (
+                  <div className="cell-muted" style={{ marginTop: 6, fontSize: 'var(--text-xs)' }}>
+                    Inactive in the item master: the stock register does not list it, but its stock can still be counted.
+                  </div>
+                )}
+                {adjBookQuery.isError && (
+                  <div style={{ marginTop: 8 }}>
+                    <Banner tone="danger">
+                      {adjBookQuery.error instanceof ApiError && adjBookQuery.error.status === 404
+                        ? `${selectedAdjItem.code} is not in the item master, so its stock cannot be counted.`
+                        : 'The book stock could not be loaded. Close the count and try again.'}
+                    </Banner>
                   </div>
                 )}
               </div>
+            )}
+
+            {selectedAdjItem && adjRefused && (
+              <Banner tone="warning">
+                Nothing was posted: the book stock moved from {qty(adjRefused.shown)} to {qty(adjRefused.bookStock)} while
+                this count was open (a receipt or issue was posted meanwhile).{' '}
+                {adjCountTyped
+                  ? 'The variance below is against the new figure: check the count before posting it again.'
+                  : 'The count now starts from the new book stock: enter the quantity actually counted.'}
+              </Banner>
             )}
 
             {selectedAdjItem && (
@@ -2328,7 +2377,10 @@ export default function InventoryStockPage() {
                     min="0"
                     placeholder="Enter verified physical count…"
                     value={adjActualCount}
-                    onChange={(e) => setAdjActualCount(e.target.value)}
+                    onChange={(e) => {
+                      setAdjActualCount(e.target.value);
+                      setAdjCountTyped(true);
+                    }}
                   />
                 </Field>
 

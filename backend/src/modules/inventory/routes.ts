@@ -13,7 +13,7 @@
  */
 import { Router, type Request } from 'express';
 import { z } from 'zod';
-import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder } from '../../db/index.js';
+import { query, queryOne, withTransaction, txQuery, txQueryOne, SqlBuilder, type Queryable } from '../../db/index.js';
 import {
   asyncHandler, sendOk, sendCreated, sendPage, validateBody, validateQuery, parsedQuery,
   listQuerySchema, offsetOf, idParam, csvIdArray, toKolkataStartOfDay, toKolkataEndOfDay,
@@ -799,6 +799,33 @@ router.get(
   }),
 );
 
+/* ── GET /inventory/adjustments/book-stock/:id ──────────────────────────────── */
+
+/** The book stock a physical count of a Purchase item is posted against: the same items row,
+    found the same way (by id, active or not), that POST /adjustments locks and records as the
+    count's system stock, so the count modal shows exactly that figure. The modal read it from
+    the stock register, which lists active items only, so a count opened on a workspace row of
+    an inactive item showed no book stock and could not be posted (T2 review of E2E S5-18:
+    1,583 linked workspace rows point at inactive items on the 2026-10-17 copy, 918 of them
+    holding stock). Same right as posting the count. */
+router.get(
+  '/adjustments/book-stock/:id',
+  requirePermission('inventory.adjust'),
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const item = await queryOne<{ uom_code: string } & Record<string, unknown>>(
+      `SELECT i.id AS item_id, i.item_code, i.item_description, i.inventory_category AS category,
+              COALESCE(u.code, '') AS uom_code, i.is_active, i.live_stock_qty
+         FROM items i
+         LEFT JOIN lookups u ON u.id = i.uom_id
+        WHERE i.id = $1`,
+      [id],
+    );
+    if (!item) throw NotFoundError('Item');
+    sendOk(res, { ...item, uom_code: toShortUom(item.uom_code) });
+  }),
+);
+
 /* ── POST /inventory/adjustments ────────────────────────────────────────────── */
 
 const createAdjustmentSchema = z.object({
@@ -1044,6 +1071,30 @@ router.get(
     Head's approval sets APPROVED, so every later scan added another suggestion for the same
     shortage next to the approved one, and both could become indents (E2E S5-13b). */
 const CLOSED_AUTO_INDENT_STATUSES = ['CONVERTED', 'ORDERED', 'REJECTED'];
+/** The statuses the reject route takes a suggestion from, and the convert route. */
+const REJECTABLE_AUTO_INDENT_STATUSES = ['SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED', 'PURCHASE_APPROVED', 'APPROVED'];
+const CONVERTIBLE_AUTO_INDENT_STATUSES = ['APPROVED', 'PURCHASE_APPROVED'];
+
+/** Another open suggestion for the same item, if any. Scans before the open-status fix above
+    left a second open suggestion for a shortage next to an approved one (E2E S5-13b); while
+    two are open neither is approved further nor converted, so the shortage becomes one indent. */
+async function otherOpenSuggestion(tx: Queryable, itemId: number, id: number): Promise<{ id: number; status: string } | null> {
+  return txQueryOne<{ id: number; status: string }>(
+    tx,
+    `SELECT id, status FROM auto_indents
+      WHERE item_id = $1 AND id <> $2 AND status <> ALL($3::text[])
+      ORDER BY id
+      LIMIT 1`,
+    [itemId, id, CLOSED_AUTO_INDENT_STATUSES],
+  );
+}
+
+const duplicateSuggestionError = (itemCode: string, other: { id: number; status: string }) =>
+  ConflictError(
+    `Another suggestion for ${itemCode} (no. ${other.id}, ${other.status.replace(/_/g, ' ').toLowerCase()}) is open for the same shortage. ` +
+    'Reject one of the two first, so the shortage becomes one indent.',
+    { duplicateId: other.id, duplicateStatus: other.status },
+  );
 
 router.post(
   ['/auto-indent/generate', '/auto-indents/generate'],
@@ -1248,7 +1299,9 @@ router.get(
   asyncHandler(async (req, res) => {
     const q = parsedQuery<z.infer<typeof autoIndentListSchema>>(res);
     const b = buildAutoIndentFilter(q);
-    const approvable = req.user!.permissions.has('auto_indent.approve') ? approvableAutoIndentStatuses(req.user!.roles) : [];
+    const decides = req.user!.permissions.has('auto_indent.approve');
+    const approvable = decides ? approvableAutoIndentStatuses(req.user!.roles) : [];
+    const converts = req.user!.permissions.has('indent.create');
 
     const totalRow = await queryOne<{ n: string }>(
       `SELECT COUNT(*) AS n FROM auto_indents ai ${b.where()}`,
@@ -1272,11 +1325,22 @@ router.get(
       b.params,
     );
 
+    const closed = b.push(CLOSED_AUTO_INDENT_STATUSES);
     const limit = b.push(q.pageSize);
     const offset = b.push(offsetOf(q));
 
-    const rows = await query<{ status: string }>(
-      `SELECT ai.* FROM auto_indents ai
+    // The other open suggestion for the row's item, if any (otherOpenSuggestion): approve and
+    // convert refuse both rows of such a pair, reject takes either.
+    const rows = await query<{ status: string; open_duplicate_id: number | null }>(
+      `SELECT ai.*, dup.id AS open_duplicate_id, dup.status AS open_duplicate_status
+         FROM auto_indents ai
+         LEFT JOIN LATERAL (
+           SELECT d.id, d.status FROM auto_indents d
+            WHERE d.item_id = ai.item_id AND d.id <> ai.id
+              AND d.status <> ALL(${closed}::text[]) AND ai.status <> ALL(${closed}::text[])
+            ORDER BY d.id
+            LIMIT 1
+         ) dup ON TRUE
        ${b.where()}
        ORDER BY
          CASE ai.status
@@ -1292,7 +1356,15 @@ router.get(
       b.params,
     );
 
-    sendPage(res, rows.map((r) => ({ ...r, can_approve: approvable.includes(r.status) })), total, q.page, q.pageSize, {
+    // Each action the queue offers is the route's own rule for this user and row. Reject was
+    // offered only before approval, so once both rows of a duplicate pair were approved neither
+    // could be converted (409) nor rejected on screen (T2 review of E2E S5-13b).
+    const actions = (r: { status: string; open_duplicate_id: number | null }) => ({
+      can_approve: approvable.includes(r.status) && r.open_duplicate_id === null,
+      can_reject: decides && REJECTABLE_AUTO_INDENT_STATUSES.includes(r.status),
+      can_convert: converts && CONVERTIBLE_AUTO_INDENT_STATUSES.includes(r.status) && r.open_duplicate_id === null,
+    });
+    sendPage(res, rows.map((r) => ({ ...r, ...actions(r) })), total, q.page, q.pageSize, {
       totals: {
         totalSuggestions: total,
         totalSuggestedQty: Number(totalsRow?.total_qty ?? 0),
@@ -1342,9 +1414,9 @@ router.post(
 
     const result = await withTransaction(async (tx) => {
       const ai = await txQueryOne<{
-        id: number; item_code: string; status: string;
+        id: number; item_id: number; item_code: string; status: string;
       }>(
-        tx, 'SELECT id, item_code, status FROM auto_indents WHERE id = $1 FOR UPDATE', [id],
+        tx, 'SELECT id, item_id, item_code, status FROM auto_indents WHERE id = $1 FOR UPDATE', [id],
       );
       if (!ai) throw NotFoundError('Auto Indent');
       // A suggestion only moves forward: store approval, then purchase approval. Without
@@ -1353,6 +1425,10 @@ router.post(
       if (!approvableAutoIndentStatuses(req.user!.roles).includes(ai.status)) {
         throw BusinessRuleError(`Auto indent for ${ai.item_code} is ${ai.status.replace(/_/g, ' ').toLowerCase()} and cannot be approved now.`);
       }
+      // Approving the second of two open suggestions for one shortage left both approved, and
+      // then neither converts (T2 review of E2E S5-13b): one of them is rejected first.
+      const other = await otherOpenSuggestion(tx, ai.item_id, id);
+      if (other) throw duplicateSuggestionError(ai.item_code, other);
 
       const nextStatus = storeOnly ? 'STORE_APPROVED' : 'APPROVED';
 
@@ -1403,7 +1479,7 @@ router.post(
         tx, 'SELECT id, item_code, status FROM auto_indents WHERE id = $1 FOR UPDATE', [id],
       );
       if (!ai) throw NotFoundError('Auto Indent');
-      if (!['SUGGESTED', 'PENDING_APPROVAL', 'STORE_APPROVED', 'PURCHASE_APPROVED', 'APPROVED'].includes(ai.status)) {
+      if (!REJECTABLE_AUTO_INDENT_STATUSES.includes(ai.status)) {
         throw BusinessRuleError(`Auto indent for ${ai.item_code} is ${ai.status.replace(/_/g, ' ').toLowerCase()} and cannot be rejected now.`);
       }
 
@@ -1462,27 +1538,13 @@ router.post(
       }
       // Only a fully approved suggestion becomes an indent; a pending or rejected one
       // could be converted before (no approval at all).
-      if (ai.status !== 'APPROVED' && ai.status !== 'PURCHASE_APPROVED') {
+      if (!CONVERTIBLE_AUTO_INDENT_STATUSES.includes(ai.status)) {
         throw BusinessRuleError(`Auto indent for ${ai.item_code} must be approved before it is converted (it is ${ai.status.replace(/_/g, ' ').toLowerCase()}).`);
       }
-      // One shortage, one indent. Scans before the open-status fix above left a second open
-      // suggestion for the same shortage next to an approved one (E2E S5-13b); while two are
-      // open neither converts, so only one of them can ever become an indent.
-      const duplicate = await txQueryOne<{ id: number; status: string }>(
-        tx,
-        `SELECT id, status FROM auto_indents
-          WHERE item_id = $1 AND id <> $2 AND status <> ALL($3::text[])
-          ORDER BY id
-          LIMIT 1`,
-        [ai.item_id, id, CLOSED_AUTO_INDENT_STATUSES],
-      );
-      if (duplicate) {
-        throw ConflictError(
-          `Another suggestion for ${ai.item_code} (no. ${duplicate.id}, ${duplicate.status.replace(/_/g, ' ').toLowerCase()}) is open for the same shortage. ` +
-          'Reject one of the two first, so the shortage becomes one indent.',
-          { duplicateId: duplicate.id, duplicateStatus: duplicate.status },
-        );
-      }
+      // One shortage, one indent: while a second suggestion for the item is open, neither
+      // converts, so only one of them can ever become an indent (E2E S5-13b).
+      const other = await otherOpenSuggestion(tx, ai.item_id, id);
+      if (other) throw duplicateSuggestionError(ai.item_code, other);
 
       // Read item details
       const item = await txQueryOne<{
