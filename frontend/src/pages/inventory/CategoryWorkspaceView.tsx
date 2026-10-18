@@ -193,12 +193,15 @@ function CategoryItemSelect({ category, value, onChange, invalid }: {
 }) {
   const [term, setTerm] = useState('');
   const settled = useDebounced(term.trim(), 250);
+  // Read afresh each time the form opens (gcTime 0: no rows kept from an earlier form), and under the
+  // workspace list's key, so a movement, reversal or sync refreshes it: the option's stock is what an
+  // issue is checked against, and a cached one went stale after the first receipt.
   const { data, isFetching } = useQuery({
-    queryKey: ['inventory-category-item-pick', category, settled],
+    queryKey: ['inventory-category-items', category, 'pick', settled],
     queryFn: () => api.getWithMeta<CategoryItemRow[], PageMeta>(
       `/inventory/categories/${category}${qs({ search: settled || undefined, pageSize: 50, sortBy: 'item_code', sortDir: 'asc' })}`,
     ),
-    staleTime: 30_000,
+    gcTime: 0,
   });
   const rows = data?.data ?? [];
   const linked = rows.filter((r): r is CategoryItemRow & { item_id: number } => r.item_id !== null);
