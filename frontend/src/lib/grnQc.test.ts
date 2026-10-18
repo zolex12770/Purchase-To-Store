@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  qcBadgeLabel, lineQc, hasLots, savedNote, grnSaveOutcome, qcDecisionToast, qcSplitProblem, qcRemainder, type GrnLineQcFields,
+  qcBadgeLabel, lineQc, hasLots, savedNote, grnSaveOutcome, qcDecisionToast, qcDecisionSplit, qcSplitProblem, qcRemainder,
+  type GrnLineQcFields,
 } from './grnQc';
 
 const held: GrnLineQcFields = { qc_inspection_status: 'PENDING_QC', accepted_qty: null, rejected_qty: null, mln_no: null };
@@ -57,11 +58,39 @@ describe('the GRN form toast', () => {
 // S3-D7: every decision said 'stock updated', a hold or a failure included.
 describe('the QC decision toast', () => {
   it('says whether stock moved', () => {
-    expect(qcDecisionToast({ status: 'QC_PASSED', stockMoved: true, message: 'Recorded.' }).title)
-      .toBe('Decision recorded: accepted quantity added to stock');
-    expect(qcDecisionToast({ status: 'ON_HOLD', stockMoved: false, message: 'Recorded.' }))
+    expect(qcDecisionToast({ status: 'QC_PASSED', stockMoved: true, acceptedQty: '5.0000', rejectedQty: '0.0000', message: 'Recorded.' }))
+      .toEqual({ title: 'Decision recorded: accepted quantity added to stock', detail: 'Recorded. 5 accepted into stock.' });
+    expect(qcDecisionToast({ status: 'ON_HOLD', stockMoved: false, acceptedQty: '0.0000', rejectedQty: '0.0000', message: 'Recorded.' }))
       .toEqual({ title: 'Decision recorded: stock unchanged', detail: 'Recorded. The material stays held out of stock until QC passes or fails it.' });
-    expect(qcDecisionToast({ status: 'QC_FAILED', stockMoved: false, message: 'Recorded.' }).detail).toMatch(/Nothing was accepted/);
+    expect(qcDecisionToast({ status: 'QC_FAILED', stockMoved: false, acceptedQty: '0.0000', rejectedQty: '5.0000', message: 'Recorded.' }).detail)
+      .toMatch(/Nothing was accepted/);
+  });
+
+  // T3 review follow-up: 'Nothing was accepted' was said of any final decision that moved
+  // no stock, so a failed inspection recorded with 2 accepted was told as accepting nothing.
+  it('words a final decision from the split the server recorded', () => {
+    expect(qcDecisionToast({ status: 'ACCEPTED_WITH_DEVIATION', stockMoved: true, acceptedQty: '8.0000', rejectedQty: '2.0000', message: 'Recorded.' }).detail)
+      .toBe('Recorded. 8 accepted into stock; 2 rejected.');
+    expect(qcDecisionToast({ status: 'QC_FAILED', stockMoved: false, acceptedQty: '0.0000', rejectedQty: '5.0000', message: 'Recorded.' }))
+      .toEqual({ title: 'Decision recorded: stock unchanged', detail: 'Recorded. Nothing was accepted (5 rejected), so nothing went into stock.' });
+    const told = qcDecisionToast({ status: 'QC_FAILED', stockMoved: false, acceptedQty: '2.0000', rejectedQty: '3.0000', message: 'Recorded.' });
+    expect(told.detail).not.toMatch(/Nothing was accepted/);
+    expect(told).toEqual({
+      title: 'Decision recorded: stock unchanged',
+      detail: 'Recorded. 2 accepted and 3 rejected were recorded, but nothing went into stock.',
+    });
+    // In stored units: 0.1 accepted and 0.2 rejected of a 0.3 kg lot.
+    expect(qcDecisionToast({ status: 'QC_PASSED', stockMoved: true, acceptedQty: '0.1000', rejectedQty: '0.2000', message: 'Recorded.' }).detail)
+      .toBe('Recorded. 0.1 accepted into stock; 0.2 rejected.');
+  });
+
+  it("sends a failed inspection as its label says, 'Full Rejection': nothing accepted, all received rejected", () => {
+    expect(qcDecisionSplit('QC_FAILED', '2', '3', '5.0000')).toEqual({ accepted: '0', rejected: '5.0000', fixed: true });
+    expect(qcDecisionSplit('ACCEPTED_WITH_DEVIATION', '2', '3', '5.0000')).toEqual({ accepted: '2', rejected: '3', fixed: false });
+    expect(qcDecisionSplit('QC_IN_PROGRESS', '4', '1', '10')).toEqual({ accepted: '4', rejected: '1', fixed: false });
+    // Whatever the form held, what it sends is a whole final split.
+    const { accepted, rejected } = qcDecisionSplit('QC_FAILED', '0.3', '0', '0.3000');
+    expect(qcSplitProblem(accepted, rejected, '0.3000', true)).toBeNull();
   });
 
   it('fills in the rejected rest in stored units', () => {

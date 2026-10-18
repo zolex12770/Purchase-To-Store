@@ -5,7 +5,8 @@
  * - Material with `qc_required = true` is held in QC before entering usable stock.
  * - Inspectors record test findings, accepted/rejected quantities, and dispositions.
  * - On QC Passed / Accepted with Deviation, accepted quantity is released into live stock.
- * - On QC Rejected, rejected quantity remains isolated and routed for RTV/Scrap.
+ * - On QC Failed (Full Rejection / RTV), the whole lot is rejected: nothing is accepted,
+ *   and it remains isolated and routed for RTV/Scrap.
  */
 import { Router } from 'express';
 import { z } from 'zod';
@@ -284,16 +285,30 @@ router.post(
       const split = dec(accepted).plus(dec(rejected));
       const received = toQty(qi.received_qty);
       const shown = (v: string) => dec(v).toString();
+
+      const isPass = body.status === 'QC_PASSED' || body.status === 'ACCEPTED_WITH_DEVIATION';
+      const isFail = body.status === 'QC_FAILED';
+      const isFinal = isPass || isFail;
+
+      // QC Failed is 'Full Rejection / RTV' on the QC screen: the whole lot is rejected.
+      // A failed decision with an accepted quantity was recorded as it came, so the GRN
+      // line read 2 accepted of a failed lot that put nothing into stock, and the toast
+      // said nothing was accepted (T3 review follow-up). Accepting part of a lot is a
+      // deviation pass, which releases what it accepts. With nothing accepted, the
+      // final-split rule below makes the rejected quantity all that was received.
+      if (isFail && dec(accepted).greaterThan(0)) {
+        throw ValidationError(
+          'A failed inspection rejects the whole lot; record a partial acceptance as Accepted with deviation.',
+          [{ field: 'acceptedQty', message: 'A failed inspection accepts nothing.' }],
+        );
+      }
+
       if (split.greaterThan(dec(received))) {
         throw ValidationError(
           `Sum of accepted (${shown(accepted)}) and rejected (${shown(rejected)}) cannot exceed received quantity (${shown(received)}).`,
           [{ field: 'acceptedQty', message: 'Accepted + Rejected exceeds received quantity.' }],
         );
       }
-
-      const isPass = body.status === 'QC_PASSED' || body.status === 'ACCEPTED_WITH_DEVIATION';
-      const isFail = body.status === 'QC_FAILED';
-      const isFinal = isPass || isFail;
 
       if (isFail && !body.rejectionReason) {
         throw ValidationError('Rejection reason is mandatory when failing inspection.', [
@@ -400,12 +415,16 @@ router.post(
         message: `QC inspection decision for ${qi.item_code} on GRN ${qi.grn_no}: ${body.status}.`,
       });
 
+      // The split as recorded (on the GRN line too for a final decision): the QC
+      // screen words its toast from these, not from the status.
       return {
         inspectionId: id,
         itemCode: qi.item_code,
         status: body.status,
         overallQcStatus,
         stockMoved,
+        acceptedQty: accepted,
+        rejectedQty: rejected,
       };
     });
 

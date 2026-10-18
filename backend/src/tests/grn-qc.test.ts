@@ -12,7 +12,8 @@
  *   3. Cancel takes back out only what went into stock (a held line nothing, a
  *      passed line what QC accepted), closes the inspections still open, and
  *      refuses in words, before writing anything, when the stock has left.
- *   4. A QC decision is refused on a GRN that is not POSTED.
+ *   4. A QC decision is refused on a GRN that is not POSTED, and a failed one
+ *      ('Full Rejection / RTV') that accepts any quantity.
  *   5. The GRN list's QC tiles count the codes GRNs store.
  *   6. The label PDF does not count a print, POST /grn/labels/print does, and a
  *      PDF's file name carries no slash or quote.
@@ -433,6 +434,60 @@ describe('a quality decision', () => {
     const [decided] = await linesOf(grn.id);
     expect([Number(decided!.accepted_qty), Number(decided!.rejected_qty)]).toEqual([8, 1]);
     expect((await grnOf(grn.id)).qc_status).toBe('QC_PASSED');
+  });
+
+  it("a failed inspection rejects the whole lot, as the QC screen labels it ('Full Rejection / RTV')", async () => {
+    const qcItem = await mkItem('TGRNQC-J3', true);
+    const grn = await receive([{ itemId: qcItem, qty: '5' }]);
+    const id = Number((await inspectionsOf(grn.id))[0]!.id);
+    const decisionAudits = async () => Number((await query<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM audit_logs WHERE entity = 'qc_inspection' AND entity_id = $1`, [String(id)],
+    ))[0]!.n);
+
+    // Each was recorded: a 'failed' lot with 2 (or all 5, or 0.0001) accepted on its GRN
+    // line, no stock moved, and a toast saying nothing was accepted (T3 review follow-up).
+    for (const body of [
+      { status: 'QC_FAILED', acceptedQty: 2, rejectedQty: 3, rejectionReason: 'Three cracked' },
+      { status: 'QC_FAILED', acceptedQty: 5, rejectedQty: 0, rejectionReason: 'Test certificate missing' },
+      { status: 'QC_FAILED', acceptedQty: '0.0001', rejectedQty: '4.9999', rejectionReason: 'Off spec' },
+      { status: 'QC_FAILED', acceptedQty: 2, rejectedQty: 0 }, // short, and no reason: the acceptance is what is wrong
+    ]) {
+      const r = await decide(id, body);
+      expect(r.status, JSON.stringify(body)).toBe(422);
+      expect(r.body.error.message)
+        .toBe('A failed inspection rejects the whole lot; record a partial acceptance as Accepted with deviation.');
+      expect(r.body.error.issues).toEqual([{ field: 'acceptedQty', message: 'A failed inspection accepts nothing.' }]);
+    }
+    // Nothing was written: not the inspection, the GRN line, the GRN, the stock or the audit trail.
+    expect((await inspectionsOf(grn.id)).map((i) => [i.status, Number(i.accepted_qty), Number(i.rejected_qty)]))
+      .toEqual([['PENDING_QC', 0, 0]]);
+    const [held] = await linesOf(grn.id);
+    expect([held!.accepted_qty, held!.rejected_qty]).toEqual([null, null]);
+    expect(await grnOf(grn.id)).toEqual({ status: 'POSTED', qc_status: 'PENDING_QC' });
+    expect(await stockOf(qcItem)).toBe(0);
+    expect(await decisionAudits()).toBe(0);
+
+    // The failure itself: 0 accepted and all 5 rejected, on the inspection and the GRN line,
+    // and the answer carries that split, which the QC screen's toast is worded from.
+    const failed = await decide(id, { status: 'QC_FAILED', acceptedQty: 0, rejectedQty: 5, rejectionReason: 'Three cracked' });
+    expect(failed.status).toBe(200);
+    expect(failed.body.data).toMatchObject({ status: 'QC_FAILED', stockMoved: false, acceptedQty: '0.0000', rejectedQty: '5.0000' });
+    expect((await inspectionsOf(grn.id)).map((i) => [i.status, Number(i.accepted_qty), Number(i.rejected_qty)]))
+      .toEqual([['QC_FAILED', 0, 5]]);
+    const [rejected] = await linesOf(grn.id);
+    expect([Number(rejected!.accepted_qty), Number(rejected!.rejected_qty)]).toEqual([0, 5]);
+    expect(await grnOf(grn.id)).toEqual({ status: 'POSTED', qc_status: 'QC_FAILED' });
+    expect(await stockOf(qcItem)).toBe(0);
+
+    // A partial acceptance is recorded the way the message says, and releases what it accepts.
+    const deviation = await decide(id, {
+      status: 'ACCEPTED_WITH_DEVIATION', acceptedQty: 2, rejectedQty: 3, rejectionReason: 'Three cracked; two taken on concession',
+    });
+    expect(deviation.status).toBe(200);
+    expect(deviation.body.data).toMatchObject({ stockMoved: true, acceptedQty: '2.0000', rejectedQty: '3.0000' });
+    expect(await stockOf(qcItem)).toBe(2);
+    const [released] = await linesOf(grn.id);
+    expect([Number(released!.accepted_qty), Number(released!.rejected_qty)]).toEqual([2, 3]);
   });
 
   it('is refused on a draft GRN', async () => {
