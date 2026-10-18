@@ -471,7 +471,7 @@ export default function InventoryStockPage() {
     staleTime: 0,
     gcTime: 0,
   });
-  const adjBookRow = adjBookQuery.data?.data?.find((r) => r.item_id === adjItemId);
+  const adjBookRow = adjBookQuery.data?.data?.find((r) => Number(r.item_id) === adjItemId);
   const adjBookStock = adjBookRow ? Number(adjBookRow.live_stock_qty || 0) : null;
   const adjBookMissing = adjItemId !== undefined && adjBookQuery.isSuccess && !adjBookRow;
 
