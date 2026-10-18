@@ -11,7 +11,8 @@ import {
   Upload, Download, FileSpreadsheet, CheckCircle2, AlertTriangle, XCircle,
   ArrowRight, FileDown, Info, RotateCcw, ShieldAlert,
 } from 'lucide-react';
-import { api, downloadFile, uploadFile, ApiError } from '../../lib/api';
+import { api, uploadFile, ApiError } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
@@ -59,6 +60,7 @@ interface ImportJob {
 export default function ImportExport() {
   const { can } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -177,11 +179,11 @@ export default function ImportExport() {
                     </div>
                     <div className="row" style={{ gap: 6 }}>
                       <Button variant="primary" size="sm" icon={<Download size={13} />} block
-                              onClick={() => void downloadFile(`/io/export/${d.key}?format=xlsx`, `${d.key}.xlsx`)}>
+                              onClick={() => void download(`/io/export/${d.key}?format=xlsx`, `${d.key}.xlsx`)}>
                         Excel
                       </Button>
                       <Button variant="secondary" size="sm" block
-                              onClick={() => void downloadFile(`/io/export/${d.key}?format=csv`, `${d.key}.csv`)}>
+                              onClick={() => void download(`/io/export/${d.key}?format=csv`, `${d.key}.csv`)}>
                         CSV
                       </Button>
                     </div>
@@ -239,7 +241,7 @@ export default function ImportExport() {
                       <SectionTitle
                         action={
                           <Button variant="secondary" size="sm" icon={<FileDown size={13} />}
-                                  onClick={() => void downloadFile(`/io/import/template/${activeEntity.key}`, `${activeEntity.key}-template.xlsx`)}>
+                                  onClick={() => void download(`/io/import/template/${activeEntity.key}`, `${activeEntity.key}-template.xlsx`)}>
                             Download template
                           </Button>
                         }
@@ -323,7 +325,7 @@ export default function ImportExport() {
                       <>
                         {preview.invalidRows > 0 && (
                           <Button variant="secondary" size="sm" icon={<FileDown size={13} />}
-                                  onClick={() => void downloadFile(`/io/import/${preview.jobId}/errors.csv`, `import-errors-${preview.jobId}.csv`)}>
+                                  onClick={() => void download(`/io/import/${preview.jobId}/errors.csv`, `import-errors-${preview.jobId}.csv`)}>
                             Error report
                           </Button>
                         )}

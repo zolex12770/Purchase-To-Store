@@ -152,10 +152,15 @@ router.get(
   validateQuery(z.object({
     q: z.string().trim().max(120).optional(),
     limit: z.coerce.number().int().min(1).max(100).default(20),
+    // Names the records a filter holds by id (a drill-down's ?itemId=), inactive ones
+    // too: the filter bar showed "#id" for any not in its current results (C41).
+    ids: csvIdArray,
   })),
   asyncHandler(async (_req, res) => {
-    const { q, limit } = parsedQuery<{ q?: string; limit: number }>(res);
-    const term = `%${(q ?? '').toLowerCase()}%`;
+    const { q, limit, ids } = parsedQuery<{ q?: string; limit: number; ids?: number[] }>(res);
+    const match = ids
+      ? { sql: 'i.id = ANY($1::bigint[])', param: ids }
+      : { sql: `i.is_active = TRUE AND ($1 = '%%' OR lower(i.item_code) LIKE $1 OR lower(i.item_description) LIKE $1)`, param: `%${(q ?? '').toLowerCase()}%` };
     const rows = await query(
       `SELECT i.id, i.item_code, i.item_description, i.item_specification, i.standard_rate,
               i.uom_id, u.code AS uom_code, u.name AS uom_name, i.hsn_code,
@@ -163,11 +168,10 @@ router.get(
               i.department_id, i.cost_centre_id, i.min_stock, i.max_stock
          FROM items i
          LEFT JOIN lookups u ON u.id = i.uom_id
-        WHERE i.deleted_at IS NULL AND i.is_active = TRUE
-          AND ($1 = '%%' OR lower(i.item_code) LIKE $1 OR lower(i.item_description) LIKE $1)
+        WHERE i.deleted_at IS NULL AND ${match.sql}
         ORDER BY i.item_code
         LIMIT $2`,
-      [term, limit],
+      [match.param, limit],
     );
     sendOk(res, rows);
   }),

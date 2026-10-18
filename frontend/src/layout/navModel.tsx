@@ -42,7 +42,38 @@ export const navAllowed = (item: { permission?: string; anyOf?: string[] }, can:
 /** Analysis screens open for the module's own "analyze" right or the dashboard-wide one — the analytics API's rule. */
 const analysisRights = (module: string) => ({ permission: `${module}.analyze`, anyOf: [`${module}.analyze`, 'dashboard.analyze'] });
 
-const INVENTORY_VIEW = ['inventory.view', 'auto_indent.view'];
+export interface Access { permission: string; anyOf?: string[] }
+
+/**
+ * The rule of each screen whose menu entry and route guard (App.tsx guardScreen) disagreed
+ * with its API, written once for both (C17). Data management admitted role.view and the
+ * nonexistent user.admin, and showed "0 records" when every call came back 403 (S1-D8);
+ * Direct issue admitted inventory, requisition-issue and auto-indent viewers, and showed
+ * "Nothing to show" (S4). Each is the right its API demands:
+ */
+export const SCREEN_ACCESS = {
+  // backend inventory/routes.ts: overview, stock, ledger and adjustments
+  '/inventory': { permission: 'inventory.view', anyOf: ['inventory.view', 'auto_indent.view'] },
+  // backend inventory/direct-issue.routes.ts: the register's list
+  '/inventory/direct-issue': { permission: 'direct_issue.view' },
+  // backend admin/data-management.routes.ts: router.use(requirePermission('system.admin'))
+  '/admin/data-management': { permission: 'system.admin' },
+} satisfies Record<string, Access>;
+
+const INVENTORY_VIEW = SCREEN_ACCESS['/inventory'].anyOf;
+
+/**
+ * The inventory tabs open on the /inventory route, so none may be offered to a user that
+ * route refuses, and each needs what its own list does: the category workspaces read
+ * /inventory/categories/:category (inventory.view), the auto-indent tab /inventory/auto-indents
+ * (auto_indent.view). Count adjustments and the requisition queue were offered on
+ * inventory.adjust or requisition.issue alone, which the route refuses.
+ */
+const INVENTORY_TAB = {
+  view: { anyOf: INVENTORY_VIEW },
+  category: { permission: 'inventory.view' },
+  autoIndent: { permission: 'auto_indent.view' },
+} satisfies Record<string, Partial<Access>>;
 
 /*
  * Labels are sentence case and unique: the four children that were all called
@@ -104,18 +135,18 @@ export const NAV: NavEntry[] = [
   {
     label: 'Inventory & stock', icon: <Boxes size={16} />, base: '/inventory', hue: 'var(--module-inventory)',
     items: [
-      { to: '/inventory?tab=overview', label: 'Overview', icon: <LayoutDashboard size={14} />, anyOf: INVENTORY_VIEW },
-      { to: '/inventory?tab=rm', label: 'Raw material (RM)', icon: <Layers size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=fg', label: 'Finished goods (FG)', icon: <PackageCheck size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=wip', label: 'Work in progress (WIP)', icon: <Factory size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=trading', label: 'Trading materials', icon: <Tag size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=general', label: 'General stores & spares', icon: <Wrench size={14} />, anyOf: INVENTORY_VIEW, section: 'Stock by category' },
-      { to: '/inventory?tab=stock', label: 'Stock register', icon: <Warehouse size={14} />, anyOf: INVENTORY_VIEW, section: 'Registers' },
-      { to: '/inventory?tab=ledger', label: 'Movement ledger', icon: <History size={14} />, anyOf: INVENTORY_VIEW, section: 'Registers' },
-      { to: '/inventory?tab=adjustments', label: 'Count adjustments', icon: <ClipboardCheck size={14} />, anyOf: ['inventory.adjust', ...INVENTORY_VIEW], section: 'Registers' },
-      { to: '/inventory?tab=requisition-queue', label: 'Requisition queue', icon: <PackageSearch size={14} />, anyOf: ['inventory.view', 'requisition.issue', 'auto_indent.view'], section: 'Store' },
-      { to: '/inventory/direct-issue', label: 'Direct issue', icon: <PackageMinus size={14} />, permission: 'direct_issue.view', section: 'Store' },
-      { to: '/inventory?tab=auto-indent', label: 'Auto-indent', icon: <Zap size={14} />, anyOf: ['auto_indent.view', 'inventory.view'], section: 'Store' },
+      { to: '/inventory?tab=overview', label: 'Overview', icon: <LayoutDashboard size={14} />, ...INVENTORY_TAB.view },
+      { to: '/inventory?tab=rm', label: 'Raw material (RM)', icon: <Layers size={14} />, ...INVENTORY_TAB.category, section: 'Stock by category' },
+      { to: '/inventory?tab=fg', label: 'Finished goods (FG)', icon: <PackageCheck size={14} />, ...INVENTORY_TAB.category, section: 'Stock by category' },
+      { to: '/inventory?tab=wip', label: 'Work in progress (WIP)', icon: <Factory size={14} />, ...INVENTORY_TAB.category, section: 'Stock by category' },
+      { to: '/inventory?tab=trading', label: 'Trading materials', icon: <Tag size={14} />, ...INVENTORY_TAB.category, section: 'Stock by category' },
+      { to: '/inventory?tab=general', label: 'General stores & spares', icon: <Wrench size={14} />, ...INVENTORY_TAB.category, section: 'Stock by category' },
+      { to: '/inventory?tab=stock', label: 'Stock register', icon: <Warehouse size={14} />, ...INVENTORY_TAB.view, section: 'Registers' },
+      { to: '/inventory?tab=ledger', label: 'Movement ledger', icon: <History size={14} />, ...INVENTORY_TAB.view, section: 'Registers' },
+      { to: '/inventory?tab=adjustments', label: 'Count adjustments', icon: <ClipboardCheck size={14} />, ...INVENTORY_TAB.view, section: 'Registers' },
+      { to: '/inventory?tab=requisition-queue', label: 'Requisition queue', icon: <PackageSearch size={14} />, ...INVENTORY_TAB.view, section: 'Store' },
+      { to: '/inventory/direct-issue', label: 'Direct issue', icon: <PackageMinus size={14} />, ...SCREEN_ACCESS['/inventory/direct-issue'], section: 'Store' },
+      { to: '/inventory?tab=auto-indent', label: 'Auto-indent', icon: <Zap size={14} />, ...INVENTORY_TAB.autoIndent, section: 'Store' },
     ],
   },
   {
@@ -123,7 +154,7 @@ export const NAV: NavEntry[] = [
     items: [
       { to: '/admin/users', label: 'Users', icon: <UsersIcon size={14} />, permission: 'user.view' },
       { to: '/admin/roles', label: 'Roles & permissions', icon: <Shield size={14} />, permission: 'role.view' },
-      { to: '/admin/data-management', label: 'Data management & audit', icon: <Database size={14} />, anyOf: ['system.admin', 'user.admin', 'role.view'] },
+      { to: '/admin/data-management', label: 'Data management & audit', icon: <Database size={14} />, ...SCREEN_ACCESS['/admin/data-management'] },
       { to: '/admin/import-export', label: 'Import / export', icon: <ArrowLeftRight size={14} />, permission: 'item.view' },
       { to: '/admin/sync', label: 'Google Sheets sync', icon: <RefreshCw size={14} />, permission: 'sync.view' },
       { to: '/admin/backup', label: 'Backup & restore', icon: <HardDriveDownload size={14} />, permission: 'backup.view' },

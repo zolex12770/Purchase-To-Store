@@ -7,7 +7,7 @@
  */
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api, qs } from './api';
+import { api, qs, ApiError } from './api';
 
 import { toShortUom } from './format';
 
@@ -117,12 +117,68 @@ export interface ItemOption {
   max_stock?: number | string | null;
 }
 
-export function useItemSearch(term: string) {
+/** `enabled` as for useSupplierSearch: a filter bar without an item filter, or a user without item.view, asks nothing. */
+export function useItemSearch(term: string, enabled = true) {
   return useQuery({
     queryKey: ['items', 'search', term],
     queryFn: () => api.get<ItemOption[]>(`/items/search${qs({ q: term, limit: 50 })}`),
     staleTime: 60 * 1000,
+    enabled,
   });
+}
+
+/** The most records one lookup by id names (the supplier search's own cap). */
+const NAMED_MAX = 50;
+const idSet = (ids: readonly string[]) => [...new Set(ids)].filter((id) => /^\d+$/.test(id)).sort().slice(0, NAMED_MAX);
+
+/** The search endpoint asked for exactly these records, by id (backend masters routes, `ids`). */
+export const byIdPath = (kind: MasterKind, ids: readonly string[]) => {
+  const key = idSet(ids);
+  return `/${kind === 'item' ? 'items' : 'suppliers'}/search${qs({ ids: key, limit: key.length })}`;
+};
+
+/**
+ * The records a filter names by id only. A drill-down or a bookmark arrives as
+ * ?supplierId=10039, and the filter bar named only what its current search had
+ * returned, so the pill read "Supplier: #10039" (C41). One request per set of ids,
+ * through the search endpoint and its right, kept for 10 minutes.
+ */
+export function useItemsById(ids: readonly string[], enabled = true) {
+  const key = idSet(ids);
+  return useQuery({
+    queryKey: ['items', 'by-id', key],
+    queryFn: () => api.get<ItemOption[]>(byIdPath('item', key)),
+    enabled: enabled && key.length > 0,
+    staleTime: 10 * 60 * 1000,
+  });
+}
+
+export function useSuppliersById(ids: readonly string[], enabled = true) {
+  const key = idSet(ids);
+  return useQuery({
+    queryKey: ['suppliers', 'by-id', key],
+    queryFn: () => api.get<SupplierOption[]>(byIdPath('supplier', key)),
+    enabled: enabled && key.length > 0,
+    staleTime: 10 * 60 * 1000,
+  });
+}
+
+export type MasterKind = 'item' | 'supplier';
+const MASTER_RIGHT: Record<MasterKind, string> = { item: 'item.view', supplier: 'supplier.view' };
+
+/**
+ * What an item or supplier picker says when it lists nothing. A refused or failed
+ * search is said so: a 403 from /items/search read as "No item found" (C40, S1-D10:
+ * a HOD-only account may raise a requisition, but its role holds no item.view).
+ */
+export function masterSearchEmptyText(kind: MasterKind, term: string, error: unknown): string {
+  const plural = kind === 'item' ? 'items' : 'suppliers';
+  if (error instanceof ApiError && error.status === 403) {
+    return `You cannot search ${plural}: your role does not include ${MASTER_RIGHT[kind]}. Ask your administrator for it.`;
+  }
+  if (error) return `Could not search ${plural}. ${error instanceof Error ? error.message : ''}`.trim();
+  if (!term) return kind === 'item' ? 'Type the item code or name to search.' : 'Type the supplier name to search.';
+  return kind === 'item' ? 'No item found. Check the item code or name.' : 'No supplier found. Check the name.';
 }
 
 export interface SupplierOption {

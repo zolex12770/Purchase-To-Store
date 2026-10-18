@@ -1,4 +1,4 @@
-import { StrictMode } from 'react';
+import { StrictMode, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -13,8 +13,9 @@ import './styles/simple.css';
 
 import { AuthProvider } from './lib/auth';
 import { ThemeProvider } from './lib/theme';
-import { ToastProvider } from './components/Toast';
-import { ApiError } from './lib/api';
+import { ToastProvider, useToast } from './components/Toast';
+import { shouldRetryQuery } from './lib/queryRetry';
+import { reportUnhandledApiError } from './lib/unhandledApiErrors';
 import App from './App';
 
 const queryClient = new QueryClient({
@@ -23,15 +24,23 @@ const queryClient = new QueryClient({
       staleTime: 30_000,
       gcTime: 5 * 60_000,
       refetchOnWindowFocus: false,
-      retry: (failureCount, error) => {
-        // Never retry an auth/permission/validation failure — it will not fix itself.
-        if (error instanceof ApiError && error.status > 0 && error.status < 500) return false;
-        return failureCount < 2;
-      },
+      // Never what will not fix itself, nor a request that timed out (C01): lib/queryRetry.ts.
+      retry: shouldRetryQuery,
     },
     mutations: { retry: false },
   },
 });
+
+/** An API failure nobody awaited is shown as a toast, not lost (C12): lib/unhandledApiErrors.ts. */
+function UnhandledApiErrors() {
+  const toast = useToast();
+  useEffect(() => {
+    const onRejection = (event: PromiseRejectionEvent) => { reportUnhandledApiError(event, (err) => toast.fromError(err)); };
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => window.removeEventListener('unhandledrejection', onRejection);
+  }, [toast]);
+  return null;
+}
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -39,6 +48,7 @@ createRoot(document.getElementById('root')!).render(
       <ThemeProvider>
         <BrowserRouter>
           <ToastProvider>
+            <UnhandledApiErrors />
             <AuthProvider>
               <App />
             </AuthProvider>

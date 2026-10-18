@@ -20,9 +20,10 @@ import { useState, useRef, useEffect, useId, type ReactNode } from 'react';
 import { ChevronDown, X, CalendarDays, AlertCircle, Check, Plus, Search } from 'lucide-react';
 import { Button, MenuList, Popover, menuKeyNav, useMenuAutofocus } from './ui';
 import {
-  useLookups, useSupplierSearch, useItemSearch, useUserOptions,
-  CATEGORY_LABEL, type LookupCategory,
+  useLookups, useSupplierSearch, useItemSearch, useUserOptions, useItemsById, useSuppliersById,
+  masterSearchEmptyText, CATEGORY_LABEL, type LookupCategory,
 } from '../lib/masters';
+import { ApiError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useDebounced } from './simple';
 import { today, daysAgo, startOfMonth, formatDate } from '../lib/format';
@@ -119,15 +120,31 @@ export function FilterBar({
   /* ── Supplier search ────────────────────────────────────────────────────── */
   const supplierFilter = show.includes('supplier') && can('supplier.view');
   const [supplierTerm, setSupplierTerm] = useState('');
-  const { data: suppliers } = useSupplierSearch(useDebounced(supplierTerm.trim(), 250), supplierFilter);
+  const { data: suppliers, error: supplierError } = useSupplierSearch(useDebounced(supplierTerm.trim(), 250), supplierFilter);
   const supplierNames = useRef(new Map<string, string>());
   for (const s of suppliers ?? []) supplierNames.current.set(String(s.id), s.supplier_name);
 
   /* ── Item search ────────────────────────────────────────────────────────── */
+  // Asked only where the bar shows an item filter to a user who may search items: it
+  // searched on every list for every user, and a role without item.view drew a 403 each time.
+  const itemFilter = show.includes('item') && can('item.view');
   const [itemTerm, setItemTerm] = useState('');
-  const { data: items } = useItemSearch(useDebounced(itemTerm.trim(), 250));
+  const { data: items, error: itemError } = useItemSearch(useDebounced(itemTerm.trim(), 250), itemFilter);
   const itemNames = useRef(new Map<string, string>());
   for (const i of items ?? []) itemNames.current.set(String(i.id), `${i.item_code} - ${i.item_description}`);
+
+  /* ── Names for ids that arrived in the address ─────────────────────────────
+     A drill-down or a bookmark names its supplier or item by id; the pill showed
+     "#10039" because only the current search results were named (C41). The ones
+     not named yet are looked up once, by id. */
+  const idsOf = (param: string) => (filters[param] as string[] | undefined) ?? [];
+  const { data: namedSuppliers } = useSuppliersById(idsOf('supplierId').filter((id) => !supplierNames.current.has(id)), supplierFilter);
+  for (const s of namedSuppliers ?? []) supplierNames.current.set(String(s.id), s.supplier_name);
+  const { data: namedItems } = useItemsById(idsOf('itemId').filter((id) => !itemNames.current.has(id)), itemFilter);
+  for (const i of namedItems ?? []) itemNames.current.set(String(i.id), `${i.item_code} - ${i.item_description}`);
+
+  /** A searchable picker's empty list: the refusal, when the user may not search it at all. */
+  const refused = (right: string) => new ApiError(403, 'AUTHORIZATION_ERROR', `Requires ${right}.`);
 
   const labelFor = (key: FilterKey, id: string): string => {
     if (key === 'supplier') return supplierNames.current.get(id) ?? `#${id}`;
@@ -160,8 +177,12 @@ export function FilterBar({
   };
 
   /* ── Which dimensions show as pills ─────────────────────────────────────── */
+  // A supplier or item filter the user may not search still shows, and can be cleared,
+  // while the address applies one: it went on filtering the list with no pill to say so.
   const dims: FilterKey[] = show.filter((k) => k !== 'dateRange')
-    .filter((k) => (k === 'supplier' ? supplierFilter : k === 'status' ? Boolean(statusOptions) : true));
+    .filter((k) => (k === 'supplier' ? supplierFilter || idsOf('supplierId').length > 0
+      : k === 'item' ? itemFilter || idsOf('itemId').length > 0
+        : k === 'status' ? Boolean(statusOptions) : true));
   const defaults = (primary ?? [...dims].sort((a, b) => PILL_PRIORITY.indexOf(a) - PILL_PRIORITY.indexOf(b))).filter((k) => dims.includes(k)).slice(0, 2);
   const [revealed, setRevealed] = useState<FilterKey[]>([]);
   const [autoOpen, setAutoOpen] = useState<FilterKey | null>(null);
@@ -200,6 +221,7 @@ export function FilterBar({
             selected={selected}
             onToggle={onToggle}
             onSearch={setSupplierTerm}
+            emptyText={masterSearchEmptyText('supplier', supplierTerm.trim(), supplierFilter ? supplierError : refused('supplier.view'))}
           />
         );
       case 'item':
@@ -210,6 +232,7 @@ export function FilterBar({
             selected={selected}
             onToggle={onToggle}
             onSearch={setItemTerm}
+            emptyText={masterSearchEmptyText('item', itemTerm.trim(), itemFilter ? itemError : refused('item.view'))}
           />
         );
       case 'qcStatus':
@@ -485,7 +508,7 @@ function FilterPill({
 
 /** Compact multi-select rendered as a scrollable checkbox list, used inside a FilterPill popover. */
 function MultiPicker({
-  label, options, selected, onToggle, onSearch,
+  label, options, selected, onToggle, onSearch, emptyText,
 }: {
   label: string;
   options: { value: string; label: string }[];
@@ -493,6 +516,8 @@ function MultiPicker({
   onToggle: (value: string) => void;
   /** Search on the server instead of filtering `options` — for lists too long to preload. */
   onSearch?: (term: string) => void;
+  /** What an empty list says, when the search can say more (a refusal, a failure). */
+  emptyText?: string;
 }) {
   const [term, setTerm] = useState('');
   const filtered = onSearch || !term
@@ -518,7 +543,7 @@ function MultiPicker({
       <div style={{ maxHeight: 260, overflowY: 'auto' }} role="group" aria-label={label}>
         {filtered.length === 0 && (
           <div style={{ padding: 8, fontSize: 'var(--fs-13)', color: 'var(--text-3)', textAlign: 'center' }}>
-            {onSearch && !term ? `Type to search ${label.toLowerCase()}` : 'No options'}
+            {emptyText ?? (onSearch && !term ? `Type to search ${label.toLowerCase()}` : 'No options')}
           </div>
         )}
         {filtered.map((o) => (

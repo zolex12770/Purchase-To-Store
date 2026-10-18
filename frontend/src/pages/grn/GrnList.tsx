@@ -5,7 +5,8 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Plus, Download, Printer, Truck } from 'lucide-react';
-import { api, qs, downloadFile, type PageMeta } from '../../lib/api';
+import { api, qs, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
 import { PageHeader } from '../../layout/AppShell';
@@ -51,6 +52,7 @@ const STATUS_TABS = [
 ];
 
 export default function GrnList() {
+  const download = useDownload();
   const navigate = useNavigate();
   const { can } = useAuth();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
@@ -161,7 +163,7 @@ export default function GrnList() {
             <Button variant="secondary" size="sm" icon={<Printer size={13} />} onClick={() => window.print()}>Print</Button>
             {can('grn.export') && (
               <Button variant="secondary" size="sm" icon={<Download size={13} />}
-                      onClick={() => void downloadFile(`/io/export/grn?format=xlsx${query.replace('?', '&')}`, 'grn.xlsx')}>
+                      onClick={() => void download(`/io/export/grn?format=xlsx${query.replace('?', '&')}`, 'grn.xlsx')}>
                 Export
               </Button>
             )}
@@ -224,7 +226,7 @@ export default function GrnList() {
         onPageChange={(p) => setFilters({ page: p }, { resetPage: false })}
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(r) => navigate(`/grn/${r.id}`)}
-        onExport={can('grn.export') ? (format) => void downloadFile(`/io/export/grn?format=${format}${query.replace('?', '&')}`, `grn.${format}`) : undefined}
+        onExport={can('grn.export') ? (format) => void download(`/io/export/grn?format=${format}${query.replace('?', '&')}`, `grn.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle="No goods receipts found"
         emptyMessage={activeCount > 0 ? 'No receipts match the current filters.' : 'Receive goods against an issued purchase order to create your first GRN.'}

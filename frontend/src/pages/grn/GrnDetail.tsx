@@ -9,7 +9,8 @@ import { useEffect, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Pencil, Send, Ban, Printer, Trash2, ShoppingCart, FileDown, Tag } from 'lucide-react';
-import { api, downloadFile } from '../../lib/api';
+import { api } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { PageHeader, PrintHeader } from '../../layout/AppShell';
@@ -119,6 +120,7 @@ export default function GrnDetail() {
   }, []);
   const { can } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
 
   const [action, setAction] = useState<ActionKind | null>(null);
@@ -190,7 +192,7 @@ export default function GrnDetail() {
             <Button variant="ghost" size="sm" icon={<ArrowLeft size={13} />} onClick={() => navigate('/grn')}>Back</Button>
             <Button variant="secondary" size="sm" icon={<Printer size={13} />} onClick={() => window.print()}>Print</Button>
             <Button variant="secondary" size="sm" icon={<FileDown size={13} />}
-                    onClick={() => void downloadFile(`/grn/${id}/pdf`, `${data.grn_no}.pdf`)}>
+                    onClick={() => void download(`/grn/${id}/pdf`, `${data.grn_no}.pdf`)}>
               PDF
             </Button>
             {/* A line held for QC gets its lot only when QC passes it: with no lot

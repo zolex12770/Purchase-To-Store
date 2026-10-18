@@ -16,7 +16,7 @@ import {
   asyncHandler, sendOk, sendCreated, validateBody, validateQuery, parsedQuery, idParam,
   EXPORT_ROW_CAP, refuseTruncatedExport,
 } from '../../core/http.js';
-import { NotFoundError, ValidationError, BusinessRuleError } from '../../core/errors.js';
+import { NotFoundError, ValidationError, BusinessRuleError, AuthorizationError } from '../../core/errors.js';
 import { requirePermission } from '../../auth/middleware.js';
 import { audit, auditIn, actorFrom } from '../../core/audit.js';
 import { DATASETS, DATASET_KEYS, type ColumnDef } from './datasets.js';
@@ -128,8 +128,10 @@ router.get(
         { field: 'dataset', message: `Supported: ${DATASET_KEYS.join(', ')}.` },
       ]);
     }
+    // A missing right is a 403 like every other one, so the client shows its refusal
+    // warning; it answered 422 VALIDATION_ERROR, as if the request were malformed (S1-D9).
     if (!req.user!.permissions.has(dataset.permission)) {
-      throw ValidationError(`You do not have permission to export ${dataset.title}.`);
+      throw AuthorizationError(`You do not have permission to export ${dataset.title} (${dataset.permission}).`);
     }
 
     const { format } = parsedQuery<z.infer<typeof exportFormatSchema>>(res);
@@ -409,7 +411,7 @@ router.post(
       ]);
     }
     if (!req.user!.permissions.has(entity.permission)) {
-      throw ValidationError(`You do not have permission to import ${entity.title}.`);
+      throw AuthorizationError(`You do not have permission to import ${entity.title} (${entity.permission}).`);
     }
     if (!req.file) throw ValidationError('Please choose a CSV or Excel file to import.');
 
@@ -612,7 +614,7 @@ router.get(
     if (!job) throw NotFoundError('Import job');
     const entity = IMPORT_ENTITIES[job.entity];
     if (!entity || !req.user!.permissions.has(entity.permission)) {
-      throw ValidationError(`You do not have permission to view this import.`);
+      throw AuthorizationError(`You do not have permission to view this import.`);
     }
 
     const rows = await query(
@@ -644,7 +646,7 @@ router.get(
     if (!job) throw NotFoundError('Import job');
     const entity = IMPORT_ENTITIES[job.entity];
     if (!entity || !req.user!.permissions.has(entity.permission)) {
-      throw ValidationError(`You do not have permission to view this import.`);
+      throw AuthorizationError(`You do not have permission to view this import.`);
     }
 
     const rows = await query<{ row_number: number; raw_data: Record<string, string>; errors: { field: string; message: string }[] }>(
@@ -688,7 +690,7 @@ router.post(
     const entity = IMPORT_ENTITIES[job.entity];
     if (!entity) throw NotFoundError('Import target');
     if (!req.user!.permissions.has(entity.permission)) {
-      throw ValidationError(`You do not have permission to import ${entity.title}.`);
+      throw AuthorizationError(`You do not have permission to import ${entity.title} (${entity.permission}).`);
     }
     if (job.status !== 'PREVIEW') {
       throw BusinessRuleError(`This import has already been ${job.status.toLowerCase()}.`);

@@ -9,6 +9,7 @@ import { Suspense, lazy, useState, type ReactNode } from 'react';
 import { Routes, Route, Navigate, useLocation, useNavigate, useNavigationType } from 'react-router-dom';
 import { useAuth } from './lib/auth';
 import { AppShell } from './layout/AppShell';
+import { SCREEN_ACCESS } from './layout/navModel';
 import { LoadingBlock, EmptyState, Button, Spinner } from './components/ui';
 import { ShieldAlert, Compass, Home as HomeIcon } from 'lucide-react';
 
@@ -120,6 +121,15 @@ const guardAnalysis = (module: 'indent' | 'po' | 'grn' | 'requisition', element:
 );
 
 /**
+ * Guard for a screen whose rule is written once for its route and its menu entry
+ * (navModel.tsx SCREEN_ACCESS), so the two cannot drift from the API again (C17).
+ */
+const guardScreen = (path: keyof typeof SCREEN_ACCESS, element: ReactNode) => {
+  const access: { permission: string; anyOf?: string[] } = SCREEN_ACCESS[path];
+  return <RequirePermission permission={access.permission} anyOf={access.anyOf}>{element}</RequirePermission>;
+};
+
+/**
  * The sign-in screen. Once signed in, the user is sent on to the page they first
  * asked for — `RequireAuth` records it in the navigation state — and to Home
  * only when there is none. The redirect used to be a fixed "/home", which won
@@ -204,12 +214,12 @@ export default function App() {
                 <Route path="/requisitions/:id" element={guard('requisition.view', <RequisitionDetail />)} />
                 <Route path="/requisitions/:id/edit" element={guard('requisition.edit', <RequisitionForm />)} />
 
-                <Route path="/inventory" element={<RequirePermission permission="inventory.view" anyOf={['inventory.view', 'auto_indent.view']}><InventoryStockPage /></RequirePermission>} />
+                <Route path="/inventory" element={guardScreen('/inventory', <InventoryStockPage />)} />
                 {/* Old addresses of two inventory views. They rendered the Overview
                     (the page defaults to it), so a bookmark opened the wrong screen;
                     they now redirect to the view they name (audit UI-017). */}
                 <Route path="/inventory/stock" element={<Navigate to="/inventory?tab=stock" replace />} />
-                <Route path="/inventory/direct-issue" element={<RequirePermission permission="direct_issue.view" anyOf={['direct_issue.view', 'auto_indent.view', 'requisition.issue', 'inventory.view']}><DirectIssuePage /></RequirePermission>} />
+                <Route path="/inventory/direct-issue" element={guardScreen('/inventory/direct-issue', <DirectIssuePage />)} />
                 <Route path="/inventory/auto-indent" element={<Navigate to="/inventory?tab=auto-indent" replace />} />
 
                 <Route path="/qc" element={guard('qc.view', <QcPage />)} />
@@ -223,7 +233,7 @@ export default function App() {
                 <Route path="/admin/import-export" element={<ImportExport />} />
                 <Route path="/admin/sync" element={guard('sync.view', <SyncAdmin />)} />
                 <Route path="/admin/settings" element={guard('system.admin', <SettingsPage />)} />
-                <Route path="/admin/data-management" element={<RequirePermission permission="system.admin" anyOf={['system.admin', 'user.admin', 'role.view']}><DataManagement /></RequirePermission>} />
+                <Route path="/admin/data-management" element={guardScreen('/admin/data-management', <DataManagement />)} />
 
                 <Route path="*" element={<NotFound />} />
               </Routes>

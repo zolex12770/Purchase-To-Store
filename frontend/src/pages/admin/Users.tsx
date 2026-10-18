@@ -6,7 +6,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Plus, Pencil, KeyRound, Unlock, UserX, Download, ShieldCheck, Clock, Lock,
 } from 'lucide-react';
-import { api, qs, downloadFile, ApiError, type PageMeta } from '../../lib/api';
+import { api, qs, ApiError, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
 import { useToast } from '../../components/Toast';
@@ -73,6 +74,7 @@ const PASSWORD_RULES = 'Choose one for this person alone, never an example or a 
 export default function Users() {
   const { can, user: me, isSuperAdmin } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
   const { filters, setFilters } = useFilters();
 
@@ -288,7 +290,7 @@ export default function Users() {
           <>
             {can('user.export') && (
               <Button variant="secondary" size="sm" icon={<Download size={13} />}
-                      onClick={() => void downloadFile(`/io/export/users?format=xlsx${query.replace('?', '&')}`, 'users.xlsx')}>
+                      onClick={() => void download(`/io/export/users?format=xlsx${query.replace('?', '&')}`, 'users.xlsx')}>
                 Export
               </Button>
             )}
@@ -329,7 +331,7 @@ export default function Users() {
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(u) => setDetailId(u.id)}
         selectedKey={detailId}
-        onExport={can('user.export') ? (format) => void downloadFile(`/io/export/users?format=${format}${query.replace('?', '&')}`, `users.${format}`) : undefined}
+        onExport={can('user.export') ? (format) => void download(`/io/export/users?format=${format}${query.replace('?', '&')}`, `users.${format}`) : undefined}
         emptyTitle="No users found"
         toolbar={
           <>

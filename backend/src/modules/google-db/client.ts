@@ -25,8 +25,9 @@
  *    reported number rather than an assurance.
  */
 import { env } from '../../config/env.js';
+import { googleKeyFile, googleKeyFileProblem, keyFileReadFailure } from '../../config/google.js';
 import { logger } from '../../core/logger.js';
-import { IntegrationError } from '../../core/errors.js';
+import { IntegrationError, NotConfiguredError } from '../../core/errors.js';
 
 const SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
@@ -37,7 +38,13 @@ export interface GoogleDbConfig {
   reason?: string;
 }
 
-/** Reports configuration WITHOUT throwing — absent config must degrade, never crash. */
+/**
+ * Reports configuration WITHOUT throwing — absent config must degrade, never crash.
+ * A named key file that is not on disk is not configured either (the check every Google
+ * reader shares, config/google.ts): it used to count as configured, so every drain and
+ * export handed the missing path to GoogleAuth, failed on its ENOENT and stored a
+ * message naming the path as the replica's last error (C37 follow-up).
+ */
 export function googleDbConfig(): GoogleDbConfig {
   const spreadsheetId = env.GOOGLE_DB_SPREADSHEET_ID;
   const enabled = env.GOOGLE_DB_SYNC_ENABLED;
@@ -48,11 +55,18 @@ export function googleDbConfig(): GoogleDbConfig {
         + 'The ERP runs normally without it; the Google replica is simply inactive.',
     };
   }
-  if (!env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE?.trim()) {
+  if (!googleKeyFile()) {
     return {
       configured: false, spreadsheetId, enabled,
       reason: 'The replica needs a service account (GOOGLE_SERVICE_ACCOUNT_KEY_FILE); '
         + 'an API key cannot write to a spreadsheet.',
+    };
+  }
+  const keyProblem = googleKeyFileProblem();
+  if (keyProblem) {
+    return {
+      configured: false, spreadsheetId, enabled,
+      reason: `${keyProblem} The ERP runs normally without it; the Google replica is inactive.`,
     };
   }
   return { configured: true, spreadsheetId, enabled };
@@ -66,11 +80,14 @@ let cached: SheetsApi | null = null;
 async function client(): Promise<SheetsApi> {
   if (cached) return cached;
   const cfg = googleDbConfig();
-  if (!cfg.configured) throw IntegrationError(cfg.reason ?? 'Google replica is not configured.');
+  // A state of this server, not a failed call to Google: 503 SYNC_NOT_CONFIGURED, logged
+  // as a warning, like every other Google refusal of that kind (S6-D1, C37). It answered
+  // 502 INTEGRATION_ERROR.
+  if (!cfg.configured) throw NotConfiguredError(cfg.reason ?? 'Google replica is not configured.');
 
   const { google } = await import('googleapis');
   const { GoogleAuth } = await import('google-auth-library');
-  const auth = new GoogleAuth({ keyFile: env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE, scopes: [SCOPE] });
+  const auth = new GoogleAuth({ keyFile: googleKeyFile()!, scopes: [SCOPE] });
   cached = google.sheets({ version: 'v4', auth: auth as never });
   return cached;
 }
@@ -149,6 +166,10 @@ async function call<T>(what: string, fn: () => Promise<T>, attempts = 3): Promis
       await new Promise((r) => setTimeout(r, delay));
     }
   }
+  // A key file that went missing after the check above fails at GoogleAuth's first read,
+  // with the path in its message — kept out of the replica's stored last error.
+  const unreadable = keyFileReadFailure(lastErr);
+  if (unreadable) throw NotConfiguredError(`Google replica: ${what} failed — the Google key file could not be read (${unreadable}).`);
   const message = lastErr instanceof Error ? lastErr.message : String(lastErr);
   const status = statusOf(lastErr);
   if (status === 403) {

@@ -57,8 +57,10 @@ async function main() {
       console.log('Found existing HOD role ID:', hodRole.id);
     }
 
-    // Ensure permissions for HOD role
-    const perms = ['requisition.view', 'requisition.create', 'requisition.edit', 'requisition.approve', 'requisition.print'];
+    // Ensure permissions for HOD role. item.view and lookup.view as every role that raises
+    // requisitions holds them (EMPLOYEE's baseline): without item.view a HOD-only account
+    // opened Create Requisition and could not search a single item (C40, S1-D10).
+    const perms = ['requisition.view', 'requisition.create', 'requisition.edit', 'requisition.approve', 'requisition.print', 'item.view', 'lookup.view'];
     for (const p of perms) {
       const pRow = (await tx.query("SELECT id FROM permissions WHERE code = $1", [p])).rows[0];
       if (pRow) {

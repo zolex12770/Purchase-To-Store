@@ -17,7 +17,8 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Printer, Download } from 'lucide-react';
-import { api, qs, downloadFile } from '../../lib/api';
+import { api, qs } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useFilters, drilldownLink, type FilterState } from '../../lib/useFilters';
 import { PageHeader, PrintHeader } from '../../layout/AppShell';
 import { FilterBar } from '../../components/FilterBar';
@@ -64,6 +65,7 @@ const DIMENSIONS = [
 ];
 
 export default function RequisitionAnalysis() {
+  const download = useDownload();
   const navigate = useNavigate();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
   const [dimension, setDimension] = useState(DIMENSIONS[0]!.key);
@@ -138,7 +140,7 @@ export default function RequisitionAnalysis() {
           <>
             <Button
               variant="secondary" size="sm" icon={<Download size={13} />}
-              onClick={() => void downloadFile(`/io/export/requisition-lines?format=xlsx${query.replace('?', '&')}`, 'requisition-lines.xlsx')}
+              onClick={() => void download(`/io/export/requisition-lines?format=xlsx${query.replace('?', '&')}`, 'requisition-lines.xlsx')}
             >
               Export
             </Button>

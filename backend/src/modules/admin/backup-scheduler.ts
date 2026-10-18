@@ -4,9 +4,15 @@
  * if there is none) it takes one and then applies retention. Catch-up rather
  * than clock-time: this PC is not always on overnight, so a backup that fell due
  * while it was off is taken soon after the next start-up.
+ *
+ * The same check keeps the planner statistics current, which the embedded engine
+ * never does on its own (db/statistics.ts, C01): each tick analyses the tables that
+ * changed by more than autovacuum's rule allows, and the tick that took an automatic
+ * backup analyses every table.
  */
 import { query, queryOne } from '../../db/index.js';
 import { logger } from '../../core/logger.js';
+import { analyseEveryTable, analyseStaleTables, type AnalyseOutcome } from '../../db/statistics.js';
 import { createBackup, applyRetention, isBackupRunning } from './backup-service.js';
 
 const CHECK_MS = 10 * 60 * 1000;
@@ -55,13 +61,29 @@ export async function runScheduledBackupIfDue(): Promise<'TAKEN' | 'NOT_DUE' | '
   return 'TAKEN';
 }
 
-async function tick(): Promise<void> {
+/** One check: the backup when it is due, then the planner statistics. Exported for the tests. */
+export async function runScheduledMaintenance(): Promise<{ backup: 'TAKEN' | 'NOT_DUE' | 'SKIPPED' | 'FAILED'; statistics: AnalyseOutcome }> {
+  let backup: 'TAKEN' | 'NOT_DUE' | 'SKIPPED' | 'FAILED';
   try {
-    await runScheduledBackupIfDue();
+    backup = await runScheduledBackupIfDue();
   } catch (err) {
     // A failed automatic backup must never take the server down; it is retried next tick.
     logger.error('Automatic backup failed — will retry', { error: err instanceof Error ? err.message : String(err) });
+    backup = 'FAILED';
   }
+  // Never throws. After a backup every table: the counters the periodic rule reads start
+  // from zero again when the process is killed (a stop on Windows), so twice a day the
+  // whole database is analysed whatever they say.
+  const statistics = backup === 'TAKEN'
+    ? await analyseEveryTable('after the automatic backup')
+    : await analyseStaleTables('periodic check');
+  return { backup, statistics };
+}
+
+async function tick(): Promise<void> {
+  await runScheduledMaintenance().catch((err: unknown) => {
+    logger.error('Scheduled maintenance failed — will retry', { error: err instanceof Error ? err.message : String(err) });
+  });
 }
 
 export function startBackupScheduler(): void {
@@ -70,7 +92,7 @@ export function startBackupScheduler(): void {
   firstTimer.unref?.();
   timer = setInterval(() => void tick(), CHECK_MS);
   timer.unref?.();
-  logger.info('Backups     : automatic backups on (checks every 10 min; interval and retention in Settings).');
+  logger.info('Backups     : automatic backups on (checks every 10 min; interval and retention in Settings); the same check refreshes planner statistics.');
 }
 
 export function stopBackupScheduler(): void {

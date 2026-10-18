@@ -8,7 +8,8 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Plus, Download, CheckCircle2, XCircle, RotateCcw, Printer } from 'lucide-react';
-import { api, qs, downloadFile, type PageMeta } from '../../lib/api';
+import { api, qs, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
 import { useToast } from '../../components/Toast';
@@ -56,6 +57,7 @@ export default function IndentList() {
   const navigate = useNavigate();
   const { can } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
 
@@ -199,7 +201,7 @@ export default function IndentList() {
             <Button variant="secondary" size="sm" icon={<Printer size={13} />} onClick={() => window.print()}>Print</Button>
             {can('indent.export') && (
               <Button variant="secondary" size="sm" icon={<Download size={13} />}
-                      onClick={() => void downloadFile(`/io/export/indents?format=xlsx${query.replace('?', '&')}`, 'indents.xlsx')}>
+                      onClick={() => void download(`/io/export/indents?format=xlsx${query.replace('?', '&')}`, 'indents.xlsx')}>
                 Export
               </Button>
             )}
@@ -258,7 +260,7 @@ export default function IndentList() {
         onPageChange={(page) => setFilters({ page }, { resetPage: false })}
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(r) => navigate(`/indents/${r.id}`)}
-        onExport={can('indent.export') ? (format) => void downloadFile(`/io/export/indents?format=${format}${query.replace('?', '&')}`, `indents.${format}`) : undefined}
+        onExport={can('indent.export') ? (format) => void download(`/io/export/indents?format=${format}${query.replace('?', '&')}`, `indents.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle="No indents found"
         emptyMessage={activeCount > 0 ? 'No indents match the current filters.' : 'Raise your first purchase indent to start the procurement cycle.'}

@@ -188,10 +188,29 @@ async function toApiError(res: Response): Promise<ApiError> {
 /** Requests had no time limit: a stuck call left a spinner forever. The longest list
     (purchase orders) answers in about 8 s, so 90 s only ever catches a dead connection. */
 const REQUEST_TIMEOUT_MS = 90_000;
-function withTimeout(signal?: AbortSignal): { signal: AbortSignal; done: () => void } {
+
+interface TimeLimit {
+  signal: AbortSignal;
+  /** The limit fired: whatever the fetch or a read of its body rejects with since is a timeout. */
+  readonly timedOut: boolean;
+  /** The caller aborted, through its own signal. */
+  readonly cancelled: boolean;
+  /** Starts the wait again: a body still arriving is not stuck. */
+  restart: () => void;
+  done: () => void;
+}
+
+function withTimeout(signal?: AbortSignal): TimeLimit {
   // Built by hand rather than AbortSignal.any/timeout, which older shop-floor browsers lack.
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(new DOMException('Request timed out', 'TimeoutError')), REQUEST_TIMEOUT_MS);
+  let fired = false;
+  let finished = false;
+  const fire = () => {
+    if (ctl.signal.aborted) return; // the caller's abort came first, and is what it was
+    fired = true;
+    ctl.abort(new DOMException('Request timed out', 'TimeoutError'));
+  };
+  let timer = setTimeout(fire, REQUEST_TIMEOUT_MS);
   const forward = () => ctl.abort(signal?.reason);
   if (signal) {
     if (signal.aborted) forward();
@@ -199,10 +218,40 @@ function withTimeout(signal?: AbortSignal): { signal: AbortSignal; done: () => v
   }
   return {
     signal: ctl.signal,
-    done: () => { clearTimeout(timer); signal?.removeEventListener('abort', forward); },
+    get timedOut() { return fired; },
+    get cancelled() { return signal?.aborted === true; },
+    restart: () => {
+      if (finished || ctl.signal.aborted) return;
+      clearTimeout(timer);
+      timer = setTimeout(fire, REQUEST_TIMEOUT_MS);
+    },
+    done: () => { finished = true; clearTimeout(timer); signal?.removeEventListener('abort', forward); },
   };
 }
-const isTimeout = (err: unknown) => err instanceof DOMException && err.name === 'TimeoutError';
+
+const TOOK_TOO_LONG = 'The server took too long to answer. Please try again.';
+
+/**
+ * A fetch that never got an answer, as the error a screen can show: the caller's own
+ * abort as it was, the time limit as TIMEOUT, anything else as NETWORK_ERROR. A raw
+ * "TypeError: Failed to fetch" reached the screens that download files (C12).
+ *
+ * Which of the three it was is read from the limit, not from the error's type: Chromium
+ * rejects a body read the limit cut off with a plain AbortError ("The user aborted a
+ * request."), not with the limit's TimeoutError, and a browser without abort reasons does
+ * the same for the fetch itself. Taken for the caller's own abort, such a timeout was
+ * passed on, and a download that took over 90 s ended without a file or a word (C12
+ * follow-up). No caller can abort a download, so an AbortError there was never one.
+ */
+function noAnswer(err: unknown, limit?: TimeLimit, tooLong = TOOK_TOO_LONG): unknown {
+  if (limit?.timedOut) return new ApiError(0, 'TIMEOUT', tooLong);
+  if (limit?.cancelled) return err;
+  return new ApiError(
+    0,
+    'NETWORK_ERROR',
+    'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.',
+  );
+}
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, signal, _retried } = options;
@@ -221,13 +270,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    if (isTimeout(err)) throw new ApiError(0, 'TIMEOUT', 'The server took too long to answer. Please try again.');
-    throw new ApiError(
-      0,
-      'NETWORK_ERROR',
-      'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.',
-    );
+    throw noAnswer(err, limit);
   } finally {
     limit.done();
   }
@@ -269,9 +312,7 @@ export async function requestWithMeta<T, M = Record<string, unknown>>(
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    if (isTimeout(err)) throw new ApiError(0, 'TIMEOUT', 'The server took too long to answer. Please try again.');
-    throw new ApiError(0, 'NETWORK_ERROR', 'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.');
+    throw noAnswer(err, limit);
   } finally {
     limit.done();
   }
@@ -298,27 +339,79 @@ export const api = {
   del: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 };
 
+const STOPPED_ARRIVING =
+  `The file stopped arriving: nothing came for ${REQUEST_TIMEOUT_MS / 1000} seconds. Check the network connection and try again.`;
+
+/**
+ * Reads the whole body, as `res.blob()` would, telling `arrived` of every part that comes in.
+ */
+async function readBody(res: Response, arrived: () => void): Promise<Blob> {
+  // No stream to watch (an empty answer): read in one piece.
+  if (!res.body) return res.blob();
+  const reader = res.body.getReader();
+  const parts: BlobPart[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return new Blob(parts, { type: res.headers.get('content-type') ?? '' });
+    parts.push(value);
+    arrived();
+  }
+}
+
+/**
+ * Fetches an authenticated GET as `request` does — a failure without an answer as an
+ * ApiError, one refresh on 401 — and reads its whole body. Downloads and previews had
+ * none of it: a lost connection rejected with a raw TypeError, a stuck one never ended
+ * (C12).
+ *
+ * The time limit covers the wait for the answer and then each wait for the next part of
+ * the body, never the whole transfer. One limit over the whole read cut a ~100 MB backup
+ * off at 90 s on a link slower than about 1.1 MB/s, where the same download had always
+ * finished (C12 follow-up); a body that stops arriving for the whole limit still ends.
+ */
+async function fetchAuthenticated(path: string, retried = false): Promise<{ res: Response; body: Blob }> {
+  const limit = withTimeout();
+  try {
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}${path}`, {
+        credentials: 'include',
+        signal: limit.signal,
+        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+      });
+    } catch (err) {
+      throw noAnswer(err, limit);
+    }
+    if (res.status === 401 && !retried) {
+      limit.done();
+      // Once more after a refresh, as `request` does — never in a loop.
+      if ((await refreshSession()).ok) return await fetchAuthenticated(path, true);
+      accessToken = null;
+      onUnauthenticated?.();
+      throw await toApiError(res);
+    }
+    if (!res.ok) throw await toApiError(res);
+    try {
+      return { res, body: await readBody(res, limit.restart) };
+    } catch (err) {
+      throw noAnswer(err, limit, STOPPED_ARRIVING);
+    }
+  } finally {
+    limit.done();
+  }
+}
+
 /**
  * Triggers a file download through an authenticated request.
  * A plain <a href> cannot carry the bearer token, so the file is fetched as a
- * blob and handed to the browser.
+ * blob and handed to the browser. Rejects with an ApiError the screen can show;
+ * a click handler uses lib/useDownload, which shows it.
  */
 export async function downloadFile(path: string, fallbackName: string): Promise<void> {
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: 'include',
-    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-  });
-
-  if (res.status === 401 && (await refreshSession()).ok) {
-    return downloadFile(path, fallbackName);
-  }
-  if (!res.ok) throw await toApiError(res);
-
+  const { res, body } = await fetchAuthenticated(path);
   const disposition = res.headers.get('content-disposition') ?? '';
   const match = /filename="?([^"]+)"?/.exec(disposition);
-  const filename = match?.[1] ?? fallbackName;
-
-  saveBlob(await res.blob(), filename);
+  saveBlob(body, match?.[1] ?? fallbackName);
 }
 
 /** Hands a file built in the browser (or fetched) to the browser's download. */
@@ -340,15 +433,7 @@ export function saveBlob(blob: Blob, filename: string): void {
  * returns the text instead of triggering a save.
  */
 export async function fetchHtml(path: string): Promise<string> {
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: 'include',
-    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-  });
-  if (res.status === 401 && (await refreshSession()).ok) {
-    return fetchHtml(path);
-  }
-  if (!res.ok) throw await toApiError(res);
-  return res.text();
+  return (await fetchAuthenticated(path)).body.text();
 }
 
 /** Uploads a file (import preview) with the bearer token attached. */
@@ -356,13 +441,20 @@ export async function uploadFile<T>(path: string, file: File): Promise<T> {
   const form = new FormData();
   form.append('file', file);
 
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'POST',
-    credentials: 'include',
-    // Content-Type is intentionally omitted so the browser sets the multipart boundary.
-    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-    body: form,
-  });
+  // No time limit: a large file over a slow link may take longer than any answer
+  // should, but a connection that fails is still said so, not a raw TypeError.
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      // Content-Type is intentionally omitted so the browser sets the multipart boundary.
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+      body: form,
+    });
+  } catch (err) {
+    throw noAnswer(err);
+  }
 
   if (!res.ok) throw await toApiError(res);
   const json = (await res.json()) as { data: T };

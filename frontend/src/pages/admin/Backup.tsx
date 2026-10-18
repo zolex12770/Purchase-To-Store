@@ -10,7 +10,8 @@ import {
   HardDriveDownload, Plus, ShieldCheck, Download, Trash2, RotateCcw,
   FolderOpen, AlertTriangle, CheckCircle2, XCircle, DatabaseZap, ScanSearch, Eraser,
 } from 'lucide-react';
-import { api, downloadFile } from '../../lib/api';
+import { api } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
@@ -87,6 +88,7 @@ const formatBytes = (b: string | number): string => {
 export default function Backup() {
   const { can } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
 
   const [creating, setCreating] = useState(false);
@@ -244,7 +246,7 @@ export default function Backup() {
             <ShieldCheck size={13} />
           </Button>
           <Button variant="ghost" size="sm" title="Download" disabled={!b.fileExists}
-                  onClick={() => void downloadFile(`/backup/${b.id}/download`, b.filename)}>
+                  onClick={() => void download(`/backup/${b.id}/download`, b.filename)}>
             <Download size={13} />
           </Button>
           {can('backup.admin') && (
