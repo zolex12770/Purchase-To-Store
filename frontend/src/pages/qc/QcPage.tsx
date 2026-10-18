@@ -27,7 +27,7 @@ import {
   Modal, Field, Input, Textarea, Select,
 } from '../../components/ui';
 import { qty, formatDate, count, toShortUom } from '../../lib/format';
-import { qcDecisionToast, qcSplitProblem, type QcDecisionResult } from '../../lib/grnQc';
+import { qcDecisionToast, qcSplitProblem, qcRemainder, type QcDecisionResult } from '../../lib/grnQc';
 import { refreshAfterGrnChange } from '../../lib/grnRefresh';
 
 interface InspectionRow {
@@ -464,9 +464,8 @@ export default function QcPage() {
                 onChange={(e) => {
                   setAcceptedQty(e.target.value);
                   if (inspectingItem) {
-                    const rec = Number(inspectingItem.received_qty);
-                    const acc = Number(e.target.value || 0);
-                    if (rec >= acc) setRejectedQty(String(rec - acc));
+                    const left = qcRemainder(inspectingItem.received_qty, e.target.value);
+                    if (left !== null) setRejectedQty(left);
                   }
                 }}
               />

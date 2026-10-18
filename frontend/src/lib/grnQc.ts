@@ -148,6 +148,12 @@ export function qcDecisionToast(res: QcDecisionResult): { title: string; detail:
 const units = (v: string | number | null | undefined): number => Math.round(Number(v || 0) * 10_000);
 const shown = (u: number): string => String(u / 10_000);
 
+/** What is left to reject once `accepted` of `received` is accepted, as the form fills it in: 0.3 − 0.1 is 0.2, not 0.19999999999999998. */
+export function qcRemainder(received: string | number, accepted: string | number): string | null {
+  const left = units(received) - units(accepted);
+  return left >= 0 ? shown(left) : null;
+}
+
 /** Why a QC split cannot be submitted, or null: compared in stored units, never as floats. */
 export function qcSplitProblem(accepted: string | number, rejected: string | number, received: string | number, final: boolean): string | null {
   const sum = units(accepted) + units(rejected);

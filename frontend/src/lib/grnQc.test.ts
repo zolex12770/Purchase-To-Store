@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  qcBadgeLabel, lineQc, hasLots, savedNote, grnSaveOutcome, qcDecisionToast, qcSplitProblem, type GrnLineQcFields,
+  qcBadgeLabel, lineQc, hasLots, savedNote, grnSaveOutcome, qcDecisionToast, qcSplitProblem, qcRemainder, type GrnLineQcFields,
 } from './grnQc';
 
 const held: GrnLineQcFields = { qc_inspection_status: 'PENDING_QC', accepted_qty: null, rejected_qty: null, mln_no: null };
@@ -62,6 +62,12 @@ describe('the QC decision toast', () => {
     expect(qcDecisionToast({ status: 'ON_HOLD', stockMoved: false, message: 'Recorded.' }))
       .toEqual({ title: 'Decision recorded: stock unchanged', detail: 'Recorded. The material stays held out of stock until QC passes or fails it.' });
     expect(qcDecisionToast({ status: 'QC_FAILED', stockMoved: false, message: 'Recorded.' }).detail).toMatch(/Nothing was accepted/);
+  });
+
+  it('fills in the rejected rest in stored units', () => {
+    expect(qcRemainder('0.3000', '0.1')).toBe('0.2');
+    expect(qcRemainder('10', '8')).toBe('2');
+    expect(qcRemainder('1', '2')).toBeNull();
   });
 
   it('compares a split in stored units: 0.1 + 0.2 of 0.3 is whole', () => {
