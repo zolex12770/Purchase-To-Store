@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   qcBadgeLabel, lineQc, hasLots, savedNote, grnSaveOutcome, qcDecisionToast, qcDecisionSplit, qcSplitProblem, qcRemainder,
-  type GrnLineQcFields,
+  qcSplitOnDecisionChange, qcDecisionProblem, QC_PASS_DECISIONS, QC_PASS_NOTHING_ACCEPTED,
+  type GrnLineQcFields, type QcFormSplit,
 } from './grnQc';
 
 const held: GrnLineQcFields = { qc_inspection_status: 'PENDING_QC', accepted_qty: null, rejected_qty: null, mln_no: null };
@@ -104,5 +105,73 @@ describe('the QC decision toast', () => {
     expect(qcSplitProblem('0.1', '0.2', '0.3000', false)).toBeNull();
     expect(qcSplitProblem('0.2', '0.2', '0.3', false)).toBe('Total inspected quantity (0.4) cannot exceed received quantity (0.3).');
     expect(qcSplitProblem('0.1', '0.1', '0.3', true)).toBe('A final decision must account for all 0.3 received: accepted + rejected is 0.2.');
+  });
+});
+
+// T3 follow-up review (P2): Update on a failed inspection opens at 0 accepted and all 5
+// rejected. Switching the decision to Accepted with Deviation kept that split, which passed
+// every check here; the server recorded a 'pass' that released nothing, and a pass is never
+// decided again.
+describe('changing the QC decision', () => {
+  const received = '5.0000';
+  const DECISIONS = ['QC_PASSED', 'ACCEPTED_WITH_DEVIATION', 'QC_FAILED', 'ON_HOLD', 'QC_IN_PROGRESS'];
+  /** What the form sends for a decision: a failed one is fixed at 0 / all received. */
+  const sent = (status: string, form: QcFormSplit): QcFormSplit => {
+    const { accepted, rejected } = qcDecisionSplit(status, form.accepted, form.rejected, received);
+    return { accepted, rejected };
+  };
+
+  it('never carries a failed split into a pass that can be sent', () => {
+    const failed: QcFormSplit = { accepted: '0', rejected: received }; // Update on a failed inspection
+    const deviation = qcSplitOnDecisionChange('QC_FAILED', 'ACCEPTED_WITH_DEVIATION', failed, received);
+    expect(qcDecisionProblem('ACCEPTED_WITH_DEVIATION', sent('ACCEPTED_WITH_DEVIATION', deviation), received))
+      .toBe(QC_PASS_NOTHING_ACCEPTED);
+
+    // Every way through the decision list, up to four changes, from a failed inspection
+    // (Update) and from a pending one (Inspect, which opens at QC Passed): a pass the form
+    // would send accepts something.
+    const walk = (from: string, form: QcFormSplit, changes: number, path: string[]): void => {
+      if (changes === 0) return;
+      for (const to of DECISIONS.filter((d) => d !== from)) {
+        const next = qcSplitOnDecisionChange(from, to, form, received);
+        const out = sent(to, next);
+        if (QC_PASS_DECISIONS.includes(to) && qcDecisionProblem(to, out, received) === null) {
+          expect(Number(out.accepted), [...path, to].join(' -> ')).toBeGreaterThan(0);
+        }
+        walk(to, next, changes - 1, [...path, to]);
+      }
+    };
+    walk('QC_FAILED', failed, 4, ['QC_FAILED']);
+    walk('QC_PASSED', { accepted: received, rejected: '0.0000' }, 4, ['QC_PASSED']);
+  });
+
+  it('starts the quantities afresh when the decision leaves QC Failed; full acceptance and full rejection set their own', () => {
+    const failed: QcFormSplit = { accepted: '0', rejected: received };
+    expect(qcSplitOnDecisionChange('QC_FAILED', 'ACCEPTED_WITH_DEVIATION', failed, received)).toEqual({ accepted: '', rejected: '' });
+    expect(qcSplitOnDecisionChange('QC_FAILED', 'ON_HOLD', failed, received)).toEqual({ accepted: '', rejected: '' });
+    expect(qcSplitOnDecisionChange('QC_FAILED', 'QC_IN_PROGRESS', failed, received)).toEqual({ accepted: '', rejected: '' });
+    expect(qcSplitOnDecisionChange('QC_FAILED', 'QC_PASSED', failed, received)).toEqual({ accepted: received, rejected: '0' });
+    expect(qcSplitOnDecisionChange('ON_HOLD', 'QC_FAILED', { accepted: '4', rejected: '1' }, received)).toEqual({ accepted: '0', rejected: received });
+    // Between the other decisions, what was entered stays.
+    expect(qcSplitOnDecisionChange('QC_PASSED', 'ACCEPTED_WITH_DEVIATION', { accepted: received, rejected: '0' }, received))
+      .toEqual({ accepted: received, rejected: '0' });
+    expect(qcSplitOnDecisionChange('QC_IN_PROGRESS', 'ACCEPTED_WITH_DEVIATION', { accepted: '4', rejected: '1' }, received))
+      .toEqual({ accepted: '4', rejected: '1' });
+  });
+
+  it('refuses a pass that accepts nothing, however it was entered, as the server does', () => {
+    for (const status of ['QC_PASSED', 'ACCEPTED_WITH_DEVIATION']) {
+      expect(qcDecisionProblem(status, { accepted: '0', rejected: '5' }, received)).toBe(QC_PASS_NOTHING_ACCEPTED);
+      expect(qcDecisionProblem(status, { accepted: '', rejected: '' }, received)).toBe(QC_PASS_NOTHING_ACCEPTED);
+      expect(qcDecisionProblem(status, { accepted: '0.00001', rejected: '5' }, received)).toBe(QC_PASS_NOTHING_ACCEPTED);
+    }
+    expect(QC_PASS_NOTHING_ACCEPTED).toBe('A pass accepts some of the lot. Enter the accepted quantity, or choose QC Failed to reject all of it.');
+    expect(qcDecisionProblem('ACCEPTED_WITH_DEVIATION', { accepted: '2', rejected: '3' }, received)).toBeNull();
+    expect(qcDecisionProblem('ACCEPTED_WITH_DEVIATION', { accepted: '2', rejected: '' }, received))
+      .toBe('A final decision must account for all 5 received: accepted + rejected is 2.');
+    expect(qcDecisionProblem('QC_FAILED', sent('QC_FAILED', { accepted: '', rejected: '' }), received)).toBeNull();
+    // An interim decision is not a pass: it may hold nothing yet.
+    expect(qcDecisionProblem('ON_HOLD', { accepted: '', rejected: '' }, received)).toBeNull();
+    expect(qcDecisionProblem('QC_IN_PROGRESS', { accepted: '0', rejected: '1' }, received)).toBeNull();
   });
 });

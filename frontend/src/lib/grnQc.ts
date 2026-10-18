@@ -186,6 +186,43 @@ export function qcDecisionSplit(
   return { accepted, rejected, fixed: false };
 }
 
+/** The decisions that release what they accept into stock (backend qc/routes.ts isPass). */
+export const QC_PASS_DECISIONS: readonly string[] = ['QC_PASSED', 'ACCEPTED_WITH_DEVIATION'];
+/** A final decision accounts for everything received: what is not accepted is rejected. */
+export const QC_FINAL_DECISIONS: readonly string[] = [...QC_PASS_DECISIONS, 'QC_FAILED'];
+
+/** The quantities the QC form holds, as its inputs hold them. */
+export interface QcFormSplit { accepted: string; rejected: string }
+
+/**
+ * The quantities the QC form holds once its decision changes from `from` to `to`. QC Passed
+ * is full acceptance and QC Failed full rejection, so each sets its own split. Leaving QC
+ * Failed for any other decision empties the quantities, to be entered afresh: the failed
+ * split (0 accepted, all received rejected) stayed in the form, so Update on a failed
+ * inspection and then Accepted with Deviation sent a pass of 0 accepted, which the server
+ * recorded as passed and, being a pass, never let be decided again (T3 follow-up review).
+ * Between the other decisions, what was entered stays.
+ */
+export function qcSplitOnDecisionChange(from: string, to: string, form: QcFormSplit, received: string): QcFormSplit {
+  if (to === 'QC_PASSED') return { accepted: received, rejected: '0' };
+  if (to === 'QC_FAILED') return { accepted: '0', rejected: received };
+  if (from === 'QC_FAILED') return { accepted: '', rejected: '' };
+  return form;
+}
+
+/** Why the QC form does not send a pass of nothing (the server refuses one too, qc/routes.ts). */
+export const QC_PASS_NOTHING_ACCEPTED = 'A pass accepts some of the lot. Enter the accepted quantity, or choose QC Failed to reject all of it.';
+
+/**
+ * Why the QC form cannot send this decision, or null: the server's own rules, checked
+ * before it is asked. A pass releases what it accepts, so it accepts something (in stored
+ * units: 0.00001 is 0); a final decision accounts for all that was received.
+ */
+export function qcDecisionProblem(status: string, form: QcFormSplit, received: string): string | null {
+  if (QC_PASS_DECISIONS.includes(status) && units(form.accepted) <= 0) return QC_PASS_NOTHING_ACCEPTED;
+  return qcSplitProblem(form.accepted, form.rejected, received, QC_FINAL_DECISIONS.includes(status));
+}
+
 /** What is left to reject once `accepted` of `received` is accepted, as the form fills it in: 0.3 − 0.1 is 0.2, not 0.19999999999999998. */
 export function qcRemainder(received: string | number, accepted: string | number): string | null {
   const left = units(received) - units(accepted);

@@ -28,7 +28,8 @@ import {
 } from '../../components/ui';
 import { qty, formatDate, count, toShortUom } from '../../lib/format';
 import {
-  qcDecisionToast, qcDecisionSplit, qcSplitProblem, qcRemainder, QC_FAILED_SPLIT_HINT, type QcDecisionResult,
+  qcDecisionToast, qcDecisionSplit, qcDecisionProblem, qcSplitOnDecisionChange, qcRemainder, QC_FAILED_SPLIT_HINT,
+  type QcDecisionResult,
 } from '../../lib/grnQc';
 import { refreshAfterGrnChange } from '../../lib/grnRefresh';
 
@@ -75,9 +76,6 @@ interface QcStats {
  */
 const canDecide = (r: InspectionRow) =>
   r.grn_status === 'POSTED' && !['QC_PASSED', 'ACCEPTED_WITH_DEVIATION', 'CANCELLED'].includes(r.status);
-
-/** A final decision accounts for everything received: what is not accepted is rejected. */
-const FINAL_DECISIONS: InspectionRow['status'][] = ['QC_PASSED', 'ACCEPTED_WITH_DEVIATION', 'QC_FAILED'];
 
 export default function QcPage() {
   const { can } = useAuth();
@@ -185,8 +183,9 @@ export default function QcPage() {
     const rej = Number(split.rejected || 0);
 
     // Compared as the server compares them, in stored units: as floats 0.1 + 0.2 of a
-    // 0.3 receipt exceeded it, and the split never reached the server.
-    const problem = qcSplitProblem(split.accepted, split.rejected, inspectingItem.received_qty, FINAL_DECISIONS.includes(decisionStatus));
+    // 0.3 receipt exceeded it, and the split never reached the server. A pass that
+    // accepts nothing is not sent either (T3 follow-up review).
+    const problem = qcDecisionProblem(decisionStatus, split, inspectingItem.received_qty);
     if (problem) {
       toast.error(problem);
       return;
@@ -445,14 +444,17 @@ export default function QcPage() {
               value={decisionStatus}
               onChange={(e) => {
                 const s = e.target.value as InspectionRow['status'];
-                setDecisionStatus(s);
-                if (s === 'QC_PASSED' && inspectingItem) {
-                  setAcceptedQty(inspectingItem.received_qty);
-                  setRejectedQty('0');
-                } else if (s === 'QC_FAILED' && inspectingItem) {
-                  setAcceptedQty('0');
-                  setRejectedQty(inspectingItem.received_qty);
+                // A failed split is not carried into another decision: Update on a failed
+                // inspection, then Accepted with Deviation, sent a pass of 0 accepted (T3
+                // follow-up review). The quantities start empty there instead.
+                if (inspectingItem) {
+                  const next = qcSplitOnDecisionChange(
+                    decisionStatus, s, { accepted: acceptedQty, rejected: rejectedQty }, inspectingItem.received_qty,
+                  );
+                  setAcceptedQty(next.accepted);
+                  setRejectedQty(next.rejected);
                 }
+                setDecisionStatus(s);
               }}
             >
               <option value="QC_PASSED">QC Passed (Full Acceptance into Store)</option>
