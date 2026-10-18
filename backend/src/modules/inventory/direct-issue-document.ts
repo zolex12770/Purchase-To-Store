@@ -42,16 +42,22 @@ export interface DirectIssueSlipData {
   company: CompanySettings;
 }
 
-/**
- * The slip printed "Sat Oct 17" for its date: the driver returns a DATE as a
- * Date, and the route cut ten characters off its string form.
- */
-const fmtDate = (d: string | Date | null): string => {
+const fmt = (d: string | Date | null, timeZone?: string): string => {
   if (!d) return '—';
   const dt = d instanceof Date ? d : new Date(d);
   if (Number.isNaN(dt.getTime())) return '—';
-  return dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+  return dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', timeZone });
 };
+
+/**
+ * A DATE column. The slip printed "Sat Oct 17" for it: the driver returns a DATE
+ * as a Date at UTC midnight, and the route cut ten characters off its string
+ * form. Read in UTC, it is that calendar day wherever the server runs.
+ */
+const fmtDay = (d: string | Date | null): string => fmt(d, 'UTC');
+
+/** A moment (cancelled_at), on the server's own calendar like the other documents. */
+const fmtDate = (d: string | Date | null): string => fmt(d);
 
 const qty = (v: string | number): string => formatIndian(v, 2);
 
@@ -117,7 +123,7 @@ ${cancelled ? `
   <div class="doc-meta">
     <div class="box">
       <div><strong>Issue Slip No:</strong> ${esc(d.issue_no)}</div>
-      <div><strong>Date:</strong> ${fmtDate(d.issue_date)} ${esc(d.issue_time)}</div>
+      <div><strong>Date:</strong> ${fmtDay(d.issue_date)} ${esc(d.issue_time)}</div>
       <div><strong>Purpose:</strong> ${esc(d.purpose) || '-'}</div>
     </div>
     <div class="box">
