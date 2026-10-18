@@ -24,7 +24,7 @@ import {
 } from '../../lib/requisitionAccess';
 import { PageHeader } from '../../layout/AppShell';
 import {
-  Button, Card, CardBody, CardHeader, Field, Input, Select, EmptyState, LoadingBlock, Banner,
+  Button, Card, CardBody, CardHeader, Field, Input, Select, EmptyState, LoadingBlock, ErrorState, Banner,
 } from '../../components/ui';
 import { qty, today, text, toShortUom } from '../../lib/format';
 
@@ -235,6 +235,8 @@ export default function RequisitionForm() {
   }
 
   if (isEdit && existing.isLoading) return <LoadingBlock label="Loading requisition…" />;
+  // Without the requisition there is no status or raiser to decide the form by.
+  if (isEdit && existing.error) return <ErrorState error={existing.error} onRetry={() => void existing.refetch()} />;
 
   return (
     <>
