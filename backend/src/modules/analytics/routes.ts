@@ -21,7 +21,7 @@ import { METRICS, METRIC_BY_KEY, AGEING_BUCKETS, ageingCase } from '../../domain
 import { dec, shareOf, pctChange } from '../../domain/money.js';
 import { ValidationError } from '../../core/errors.js';
 import {
-  buildPoFilter, poLineScope, poListTotals, pendingLineSql, PO_FROM, type PoListFilter,
+  buildPoFilter, poLineScope, poListTotals, pendingLineSql, PO_ROWS_FROM, type PoListFilter,
 } from '../purchase-order/routes.js';
 import { buildGrnFilter, grnLineScope, grnListTotals, GRN_FROM, type GrnListFilter } from '../grn/routes.js';
 import {
@@ -67,7 +67,7 @@ function linesOf(list: SqlBuilder, member: (where: string) => string, scopeOf: (
  */
 function poLineFilter(f: UniversalFilter): SqlBuilder {
   const q = poQuery(f, { excludeCancelled: 'true' });
-  return linesOf(buildPoFilter(q), (where) => `v.po_id IN (SELECT h.id ${PO_FROM} ${where})`, (b) => poLineScope(q, b, 'v'));
+  return linesOf(buildPoFilter(q), (where) => `v.po_id IN (SELECT h.id ${PO_ROWS_FROM} ${where})`, (b) => poLineScope(q, b, 'v'));
 }
 
 const PO_LINE_FROM = 'FROM v_po_line_balance v';

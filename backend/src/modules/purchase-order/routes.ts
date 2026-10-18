@@ -161,6 +161,15 @@ export const PO_FROM = `
   JOIN v_po_header_balance b ON b.po_id = h.id
   JOIN suppliers s ON s.id = h.supplier_id`;
 
+/**
+ * The same rows as PO_FROM (the balance view has one row per order) without the view, for
+ * queries that read no balance column and would otherwise total every order's receipts
+ * just to filter: the KPI cards run the list's totals four times per dashboard load.
+ */
+export const PO_ROWS_FROM = `
+  FROM purchase_order_headers h
+  JOIN suppliers s ON s.id = h.supplier_id`;
+
 export interface PoListTotals {
   poCount: number;
   lineCount: number;
@@ -206,7 +215,7 @@ export async function poListTotals(q: PoListFilter, db?: Queryable): Promise<PoL
             COALESCE(SUM(tl.open_pending_amount), 0) AS pending,
             COALESCE(SUM(tl.received_amount) FILTER (WHERE h.status <> 'CANCELLED'), 0) AS received,
             COALESCE(SUM(tl.amount) FILTER (WHERE h.status = 'CANCELLED'), 0) AS "cancelledValue"
-       ${PO_FROM}
+       ${PO_ROWS_FROM}
        LEFT JOIN v_po_line_balance tl ON tl.po_id = h.id${scope ? ` AND ${scope}` : ''}
        ${b.where()}`,
     b.params,
