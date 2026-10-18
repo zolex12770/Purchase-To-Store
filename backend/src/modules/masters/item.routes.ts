@@ -376,11 +376,15 @@ router.get(
     const item = await queryOne(`${ITEM_SELECT} WHERE i.id = $1 AND i.deleted_at IS NULL`, [id]);
     if (!item) throw NotFoundError('Item');
 
+    // pending_qty is the drawers' 'Pending GRN qty': what issued, open orders still have
+    // to deliver on their open lines (open_pending_qty, the Pending PO list's rule,
+    // migration 031). The raw pending_grn_qty counted a draft, a short-closed order's
+    // balance and a closed line's (T3 review follow-up).
     const [summary] = await query(
       `SELECT COUNT(DISTINCT po_id)::int        AS po_count,
               COALESCE(SUM(po_qty), 0)          AS total_ordered_qty,
               COALESCE(SUM(received_qty), 0)    AS total_received_qty,
-              COALESCE(SUM(pending_grn_qty), 0) AS pending_qty,
+              COALESCE(SUM(open_pending_qty), 0) AS pending_qty,
               COALESCE(SUM(amount), 0)          AS total_value,
               COALESCE(AVG(final_rate), 0)      AS avg_rate,
               MIN(final_rate)                   AS min_rate,
@@ -391,10 +395,14 @@ router.get(
     );
 
     // Rate history drives the item's price-trend chart and rate-variance analysis,
-    // and is also the PO side of the Item History modal (Indent -> PO -> GRN).
+    // and is also the PO side of the Item History modal (Indent -> PO -> GRN). Each
+    // row's pending is open_pending_qty (0 unless the order is OPEN or PARTIALLY_RECEIVED
+    // and the line open), the summary's rule, so with every order listed the rows add up
+    // to its pending_qty; the raw balance is not offered, so no drawer can show a draft's
+    // quantity as pending.
     const rateHistory = await query(
       `SELECT b.po_date, b.po_no, b.po_id, b.final_rate, b.rate, b.discount_pct, b.po_qty,
-              b.received_qty, b.pending_grn_qty, b.po_status,
+              b.received_qty, b.open_pending_qty, b.po_status,
               s.supplier_name, b.supplier_id
          FROM v_po_line_balance b
          JOIN suppliers s ON s.id = b.supplier_id
