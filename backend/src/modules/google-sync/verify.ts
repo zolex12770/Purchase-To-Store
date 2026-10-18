@@ -411,7 +411,7 @@ export async function verifyLiveParity(): Promise<VerificationReport> {
       entity: 'Requisition Status',
       formulaField: 'hod_status & store_status',
       status: 'VERIFIED_DERIVED',
-      rule: 'Computed dynamically in v_requisition_header_balance based on approval events and line issue totals.',
+      rule: 'Computed dynamically in v_requisition_header_balance: HOD status from the approval decision; store status ISSUED once every line is issued in full (an over-issue on one line does not cover another).',
     },
     {
       entity: 'Stock & Reorder',

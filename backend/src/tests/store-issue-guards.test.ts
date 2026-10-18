@@ -448,19 +448,24 @@ describe('an over-issue on one line leaves the other lines waiting (review of th
     expect((await issue(full.id, [
       { requisitionLineId: full.lineIds[0]!, issueQty: '1' }, { requisitionLineId: full.lineIds[1]!, issueQty: '3' },
     ])).status).toBe(201);
+    // Stored FULLY_ISSUED with less issued than requested (1 of 3), which neither rule
+    // derives: not the netting rule's doing, so the migration leaves it.
+    const short = await approvedRequisition([{ itemId: xId, qty: '1' }, { itemId: yId, qty: '2' }]);
+    expect((await issue(short.id, [{ requisitionLineId: short.lineIds[0]!, issueQty: '1' }])).status).toBe(201);
+    await query(`UPDATE requisition_headers SET status = 'FULLY_ISSUED' WHERE id = $1`, [short.id]);
     // Nothing issued yet.
     const waiting = await approvedRequisition([{ itemId: xId, qty: '1' }, { itemId: yId, qty: '2' }]);
 
-    const ids = [netted.id, full.id, waiting.id, req.id];
+    const ids = [netted.id, full.id, short.id, waiting.id, req.id];
     const statuses = async () => {
       const rows = await query<{ id: string; status: string }>('SELECT id, status FROM requisition_headers WHERE id = ANY($1::bigint[])', [ids]);
       return ids.map((id) => rows.find((r) => Number(r.id) === id)!.status);
     };
-    expect(await statuses()).toEqual(['FULLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
+    expect(await statuses()).toEqual(['FULLY_ISSUED', 'FULLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
     await query(backfill[0]!);
-    expect(await statuses()).toEqual(['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
+    expect(await statuses()).toEqual(['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
     await query(backfill[0]!);
-    expect(await statuses()).toEqual(['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
+    expect(await statuses()).toEqual(['PARTIALLY_ISSUED', 'FULLY_ISSUED', 'FULLY_ISSUED', 'APPROVED', 'PARTIALLY_ISSUED']);
   });
 });
 
