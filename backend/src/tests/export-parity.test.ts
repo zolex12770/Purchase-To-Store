@@ -467,3 +467,30 @@ describe('Item-level filters: the lines export holds the lines the tiles add up 
     expect(lines.rows).toHaveLength(Number(l.meta.totals?.lineCount));
   });
 });
+
+// Last again: it short-closes an order the figures above count.
+describe('Pending in the exports is the pending the list shows (2026-10-17 E2E run, S2-D1)', () => {
+  beforeAll(async () => {
+    // 2 of its 4 still to come, now not coming.
+    const r = await request(app).post(`/api/v1/purchase-orders/${ids.poPartial}/short-close`).set(auth(adminToken)).send({ reason: 'Rest not needed' });
+    expect(r.status).toBe(200);
+  });
+
+  it('the orders and the lines export carry the rows\' and the tiles\' pending, in every view', async () => {
+    for (const filters of [{}, { view: 'pending' }, { view: 'complete' }, { supplierId: ids.supplierOne }, { status: 'DRAFT' }] as Record<string, unknown>[]) {
+      const l = await list('purchase-orders', filters);
+      const orders = await exportFile('purchase-orders', filters);
+      const lines = await exportFile('po-lines', filters);
+      const rowPending = Object.fromEntries(l.data.map((r) => [String(r.po_no), Number(r.total_pending_qty)]));
+      expect(Object.fromEntries(orders.rows.map((r) => [r['PO No'], Number(r['Pending GRN Qty'])])), JSON.stringify(filters)).toEqual(rowPending);
+      const sum = (rows: Record<string, string>[], col: string) => rows.reduce((s, r) => s + Number(r[col]), 0);
+      expect(sum(lines.rows, 'Pending GRN Qty'), JSON.stringify(filters)).toBe(Number(l.meta.totals?.totalPendingQty));
+      expect(sum(orders.rows, 'Pending Value'), JSON.stringify(filters)).toBe(Number(l.meta.totals?.pending));
+    }
+    // The short-closed order and the draft add nothing; before, the file showed 2 and 3.
+    const done = await exportFile('purchase-orders', { view: 'complete' });
+    expect(done.rows.map((r) => Number(r['Pending GRN Qty']))).toEqual([0, 0]);
+    const draft = await exportFile('purchase-orders', { status: 'DRAFT' });
+    expect(draft.rows.map((r) => Number(r['Pending GRN Qty']))).toEqual([0]);
+  });
+});
