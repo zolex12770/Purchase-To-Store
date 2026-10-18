@@ -8,7 +8,8 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Plus, Pencil, Trash2, Download, ExternalLink, MapPin, Receipt } from 'lucide-react';
-import { api, qs, downloadFile, ApiError, type PageMeta } from '../../lib/api';
+import { api, qs, ApiError, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters, drilldownLink } from '../../lib/useFilters';
 import { useToast } from '../../components/Toast';
@@ -61,6 +62,7 @@ export default function Suppliers() {
   const navigate = useNavigate();
   const { can } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
 
@@ -212,7 +214,7 @@ export default function Suppliers() {
             {can('supplier.export') && (
               <Button
                 variant="secondary" size="sm" icon={<Download size={13} />}
-                onClick={() => void downloadFile(`/io/export/suppliers?format=xlsx${query.replace('?', '&')}`, 'suppliers.xlsx')}
+                onClick={() => void download(`/io/export/suppliers?format=xlsx${query.replace('?', '&')}`, 'suppliers.xlsx')}
               >
                 Export
               </Button>
@@ -253,7 +255,7 @@ export default function Suppliers() {
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(s) => setDetailId(s.id)}
         selectedKey={detailId}
-        onExport={can('supplier.export') ? (format) => void downloadFile(`/io/export/suppliers?format=${format}${query.replace('?', '&')}`, `suppliers.${format}`) : undefined}
+        onExport={can('supplier.export') ? (format) => void download(`/io/export/suppliers?format=${format}${query.replace('?', '&')}`, `suppliers.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle="No suppliers yet"
         emptyMessage="Add your first supplier, or import the Supplier Master from Excel."

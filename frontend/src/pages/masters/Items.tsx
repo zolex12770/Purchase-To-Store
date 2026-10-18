@@ -9,7 +9,8 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Plus, Pencil, Trash2, Download, ExternalLink } from 'lucide-react';
-import { api, qs, downloadFile, ApiError, type PageMeta } from '../../lib/api';
+import { api, qs, ApiError, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters, drilldownLink } from '../../lib/useFilters';
 import { useToast } from '../../components/Toast';
@@ -78,6 +79,7 @@ export default function Items() {
   const navigate = useNavigate();
   const { can } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
 
@@ -230,7 +232,7 @@ export default function Items() {
         actions={
           <>
             {can('item.export') && (
-              <Button variant="secondary" size="sm" icon={<Download size={13} />} onClick={() => void downloadFile(`/io/export/items?format=xlsx${query.replace('?', '&')}`, 'items.xlsx')}>
+              <Button variant="secondary" size="sm" icon={<Download size={13} />} onClick={() => void download(`/io/export/items?format=xlsx${query.replace('?', '&')}`, 'items.xlsx')}>
                 Export
               </Button>
             )}
@@ -278,7 +280,7 @@ export default function Items() {
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(i) => setDetailId(i.id)}
         selectedKey={detailId}
-        onExport={can('item.export') ? (format) => void downloadFile(`/io/export/items?format=${format}${query.replace('?', '&')}`, `items.${format}`) : undefined}
+        onExport={can('item.export') ? (format) => void download(`/io/export/items?format=${format}${query.replace('?', '&')}`, `items.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle="No items yet"
         emptyMessage="Add your first item, or import the Item Master from Excel."

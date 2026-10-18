@@ -204,6 +204,21 @@ function withTimeout(signal?: AbortSignal): { signal: AbortSignal; done: () => v
 }
 const isTimeout = (err: unknown) => err instanceof DOMException && err.name === 'TimeoutError';
 
+/**
+ * A fetch that never got an answer, as the error a screen can show: the caller's own
+ * abort as it was, the time limit as TIMEOUT, anything else as NETWORK_ERROR. A raw
+ * "TypeError: Failed to fetch" reached the screens that download files (C12).
+ */
+function noAnswer(err: unknown): unknown {
+  if (err instanceof DOMException && err.name === 'AbortError') return err;
+  if (isTimeout(err)) return new ApiError(0, 'TIMEOUT', 'The server took too long to answer. Please try again.');
+  return new ApiError(
+    0,
+    'NETWORK_ERROR',
+    'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.',
+  );
+}
+
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, signal, _retried } = options;
 
@@ -221,13 +236,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    if (isTimeout(err)) throw new ApiError(0, 'TIMEOUT', 'The server took too long to answer. Please try again.');
-    throw new ApiError(
-      0,
-      'NETWORK_ERROR',
-      'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.',
-    );
+    throw noAnswer(err);
   } finally {
     limit.done();
   }
@@ -269,9 +278,7 @@ export async function requestWithMeta<T, M = Record<string, unknown>>(
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    if (isTimeout(err)) throw new ApiError(0, 'TIMEOUT', 'The server took too long to answer. Please try again.');
-    throw new ApiError(0, 'NETWORK_ERROR', 'Cannot reach the server. Check the network connection; if it persists, ask the administrator to check that the ERP is running.');
+    throw noAnswer(err);
   } finally {
     limit.done();
   }
@@ -299,26 +306,55 @@ export const api = {
 };
 
 /**
+ * Fetches an authenticated GET as `request` does — the time limit (the body included),
+ * a failure without an answer as an ApiError, one refresh on 401 — and hands back the
+ * response for the caller to read. Downloads and previews had none of it: a lost
+ * connection rejected with a raw TypeError, a stuck one never ended (C12).
+ */
+async function fetchAuthenticated<T>(path: string, read: (res: Response) => Promise<T>, retried = false): Promise<T> {
+  const limit = withTimeout();
+  let res: Response;
+  try {
+    try {
+      res = await fetch(`${BASE}${path}`, {
+        credentials: 'include',
+        signal: limit.signal,
+        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+      });
+    } catch (err) {
+      throw noAnswer(err);
+    }
+    if (!(res.status === 401 && !retried)) {
+      if (!res.ok) throw await toApiError(res);
+      try {
+        return await read(res);
+      } catch (err) {
+        throw err instanceof ApiError ? err : noAnswer(err);
+      }
+    }
+  } finally {
+    limit.done();
+  }
+  // 401: once more after a refresh, as `request` does — never in a loop.
+  if ((await refreshSession()).ok) return fetchAuthenticated(path, read, true);
+  accessToken = null;
+  onUnauthenticated?.();
+  throw await toApiError(res);
+}
+
+/**
  * Triggers a file download through an authenticated request.
  * A plain <a href> cannot carry the bearer token, so the file is fetched as a
- * blob and handed to the browser.
+ * blob and handed to the browser. Rejects with an ApiError the screen can show;
+ * a click handler uses lib/useDownload, which shows it.
  */
 export async function downloadFile(path: string, fallbackName: string): Promise<void> {
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: 'include',
-    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+  const { blob, filename } = await fetchAuthenticated(path, async (res) => {
+    const disposition = res.headers.get('content-disposition') ?? '';
+    const match = /filename="?([^"]+)"?/.exec(disposition);
+    return { blob: await res.blob(), filename: match?.[1] ?? fallbackName };
   });
-
-  if (res.status === 401 && (await refreshSession()).ok) {
-    return downloadFile(path, fallbackName);
-  }
-  if (!res.ok) throw await toApiError(res);
-
-  const disposition = res.headers.get('content-disposition') ?? '';
-  const match = /filename="?([^"]+)"?/.exec(disposition);
-  const filename = match?.[1] ?? fallbackName;
-
-  saveBlob(await res.blob(), filename);
+  saveBlob(blob, filename);
 }
 
 /** Hands a file built in the browser (or fetched) to the browser's download. */
@@ -340,15 +376,7 @@ export function saveBlob(blob: Blob, filename: string): void {
  * returns the text instead of triggering a save.
  */
 export async function fetchHtml(path: string): Promise<string> {
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: 'include',
-    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-  });
-  if (res.status === 401 && (await refreshSession()).ok) {
-    return fetchHtml(path);
-  }
-  if (!res.ok) throw await toApiError(res);
-  return res.text();
+  return fetchAuthenticated(path, (res) => res.text());
 }
 
 /** Uploads a file (import preview) with the bearer token attached. */
@@ -356,13 +384,20 @@ export async function uploadFile<T>(path: string, file: File): Promise<T> {
   const form = new FormData();
   form.append('file', file);
 
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'POST',
-    credentials: 'include',
-    // Content-Type is intentionally omitted so the browser sets the multipart boundary.
-    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-    body: form,
-  });
+  // No time limit: a large file over a slow link may take longer than any answer
+  // should, but a connection that fails is still said so, not a raw TypeError.
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      // Content-Type is intentionally omitted so the browser sets the multipart boundary.
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+      body: form,
+    });
+  } catch (err) {
+    throw noAnswer(err);
+  }
 
   if (!res.ok) throw await toApiError(res);
   const json = (await res.json()) as { data: T };

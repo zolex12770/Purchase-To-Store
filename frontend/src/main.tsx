@@ -14,7 +14,7 @@ import './styles/simple.css';
 import { AuthProvider } from './lib/auth';
 import { ThemeProvider } from './lib/theme';
 import { ToastProvider } from './components/Toast';
-import { ApiError } from './lib/api';
+import { shouldRetryQuery } from './lib/queryRetry';
 import App from './App';
 
 const queryClient = new QueryClient({
@@ -23,11 +23,8 @@ const queryClient = new QueryClient({
       staleTime: 30_000,
       gcTime: 5 * 60_000,
       refetchOnWindowFocus: false,
-      retry: (failureCount, error) => {
-        // Never retry an auth/permission/validation failure — it will not fix itself.
-        if (error instanceof ApiError && error.status > 0 && error.status < 500) return false;
-        return failureCount < 2;
-      },
+      // Never what will not fix itself, nor a request that timed out (C01): lib/queryRetry.ts.
+      retry: shouldRetryQuery,
     },
     mutations: { retry: false },
   },

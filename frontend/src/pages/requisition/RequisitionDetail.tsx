@@ -19,6 +19,7 @@ import {
   Trash2, History, PackageCheck, TriangleAlert, FileText, Download, Undo2,
 } from 'lucide-react';
 import { api, ApiError, downloadFile, fetchHtml } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
@@ -94,6 +95,7 @@ export default function RequisitionDetail() {
   const navigate = useNavigate();
   const { can, user, isSuperAdmin } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
 
   const [action, setAction] = useState<ActionKind | null>(null);
@@ -526,7 +528,7 @@ export default function RequisitionDetail() {
                               <Button variant="ghost" size="sm" icon={<Eye size={13} />} title="Preview" onClick={() => void openIssuePreview(iss.id, iss.issue_slip_no)} />
                               <Button
                                 variant="ghost" size="sm" icon={<FileText size={13} />} title="Download PDF"
-                                onClick={() => void downloadFile(`/requisitions/issues/${iss.id}/pdf`, `${iss.issue_slip_no}.pdf`)}
+                                onClick={() => void download(`/requisitions/issues/${iss.id}/pdf`, `${iss.issue_slip_no}.pdf`)}
                               >
                                 PDF
                               </Button>

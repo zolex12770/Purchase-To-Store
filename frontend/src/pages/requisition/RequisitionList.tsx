@@ -15,7 +15,8 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Plus, CheckCircle2, XCircle, RotateCcw, PackageCheck, Printer, Download } from 'lucide-react';
-import { api, qs, downloadFile, type PageMeta } from '../../lib/api';
+import { api, qs, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters, type FilterState } from '../../lib/useFilters';
 import { useToast } from '../../components/Toast';
@@ -102,6 +103,7 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
   const navigate = useNavigate();
   const { can } = useAuth();
   const toast = useToast();
+  const download = useDownload();
   const qc = useQueryClient();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
 
@@ -275,7 +277,7 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
             {can('requisition.export') && (
               <Button
                 variant="secondary" size="sm" icon={<Download size={13} />}
-                onClick={() => void downloadFile(`/io/export/requisition-lines?format=xlsx${query.replace('?', '&')}`, 'requisition-lines.xlsx')}
+                onClick={() => void download(`/io/export/requisition-lines?format=xlsx${query.replace('?', '&')}`, 'requisition-lines.xlsx')}
               >
                 Export
               </Button>
@@ -367,7 +369,7 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
         onPageChange={(page) => setFilters({ page }, { resetPage: false })}
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(r) => navigate(`/requisitions/${r.id}`)}
-        onExport={can('requisition.export') ? (format) => void downloadFile(`/io/export/requisition-lines?format=${format}${query.replace('?', '&')}`, `requisition-lines.${format}`) : undefined}
+        onExport={can('requisition.export') ? (format) => void download(`/io/export/requisition-lines?format=${format}${query.replace('?', '&')}`, `requisition-lines.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle="No requisitions found"
         emptyMessage={activeCount > 0 ? 'No requisitions match the current filters.' : meta.empty}

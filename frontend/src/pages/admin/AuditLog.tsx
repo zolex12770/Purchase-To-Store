@@ -7,7 +7,8 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Download, Eye, Filter } from 'lucide-react';
-import { api, qs, downloadFile, type PageMeta } from '../../lib/api';
+import { api, qs, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
 import { PageHeader } from '../../layout/AppShell';
@@ -60,6 +61,7 @@ const ACTION_TONE: Record<string, 'success' | 'danger' | 'warning' | 'info' | 'n
 };
 
 export default function AuditLog() {
+  const download = useDownload();
   const { can } = useAuth();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
   const [detailId, setDetailId] = useState<number | null>(null);
@@ -143,7 +145,7 @@ export default function AuditLog() {
         actions={
           can('audit.export') ? (
             <Button variant="secondary" size="sm" icon={<Download size={13} />}
-                    onClick={() => void downloadFile(`/io/export/audit?format=xlsx${query.replace('?', '&')}`, 'audit-log.xlsx')}>
+                    onClick={() => void download(`/io/export/audit?format=xlsx${query.replace('?', '&')}`, 'audit-log.xlsx')}>
               Export
             </Button>
           ) : undefined
@@ -166,7 +168,7 @@ export default function AuditLog() {
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(r) => setDetailId(r.id)}
         selectedKey={detailId}
-        onExport={can('audit.export') ? (format) => void downloadFile(`/io/export/audit?format=${format}${query.replace('?', '&')}`, `audit-log.${format}`) : undefined}
+        onExport={can('audit.export') ? (format) => void download(`/io/export/audit?format=${format}${query.replace('?', '&')}`, `audit-log.${format}`) : undefined}
         emptyTitle="No audit records"
         emptyMessage={activeCount > 0 ? 'No records match the current filters.' : 'Audit records appear as soon as work happens in the system.'}
         compact

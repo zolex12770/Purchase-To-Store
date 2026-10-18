@@ -8,7 +8,8 @@ import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Plus, Download, Printer, AlertTriangle, GitMerge } from 'lucide-react';
-import { api, qs, downloadFile, type PageMeta } from '../../lib/api';
+import { api, qs, type PageMeta } from '../../lib/api';
+import { useDownload } from '../../lib/useDownload';
 import { useAuth } from '../../lib/auth';
 import { useFilters } from '../../lib/useFilters';
 import { PageHeader } from '../../layout/AppShell';
@@ -63,6 +64,7 @@ const STATUS_TABS = [
 ];
 
 export default function PoList() {
+  const download = useDownload();
   const navigate = useNavigate();
   const location = useLocation();
   const { can } = useAuth();
@@ -220,7 +222,7 @@ export default function PoList() {
             <Button variant="secondary" size="sm" icon={<Printer size={13} />} onClick={() => window.print()}>Print</Button>
             {can('po.export') && (
               <Button variant="secondary" size="sm" icon={<Download size={13} />}
-                      onClick={() => void downloadFile(`/io/export/purchase-orders?format=xlsx${query.replace('?', '&')}`, 'purchase-orders.xlsx')}>
+                      onClick={() => void download(`/io/export/purchase-orders?format=xlsx${query.replace('?', '&')}`, 'purchase-orders.xlsx')}>
                 Export
               </Button>
             )}
@@ -304,7 +306,7 @@ export default function PoList() {
         onPageChange={(p) => setFilters({ page: p }, { resetPage: false })}
         onPageSizeChange={(pageSize) => setFilters({ pageSize })}
         onRowClick={(r) => navigate(`/purchase-orders/${r.id}`)}
-        onExport={can('po.export') ? (format) => void downloadFile(`/io/export/purchase-orders?format=${format}${query.replace('?', '&')}`, `purchase-orders.${format}`) : undefined}
+        onExport={can('po.export') ? (format) => void download(`/io/export/purchase-orders?format=${format}${query.replace('?', '&')}`, `purchase-orders.${format}`) : undefined}
         onPrint={() => window.print()}
         emptyTitle={receiptEvidence ? 'No purchase orders in this group'
           : view === 'pending' ? 'Nothing pending' : view === 'complete' ? 'No completed orders yet' : 'No purchase orders found'}
