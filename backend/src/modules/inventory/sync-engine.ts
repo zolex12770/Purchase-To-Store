@@ -30,7 +30,7 @@
  */
 import crypto from 'node:crypto';
 import { withTransaction, txQuery, query, type Queryable } from '../../db/index.js';
-import { requireGoogleKeyFile } from '../../config/google.js';
+import { requireGoogleKeyFile, keyFileReadFailure } from '../../config/google.js';
 import { logger } from '../../core/logger.js';
 import { INVENTORY_CATEGORIES, type InventoryCategory } from '../../domain/inventory.js';
 import {
@@ -143,9 +143,6 @@ export interface CategoryRead {
 
 export { rangesFor };
 
-/** Error codes of the local file system, which a retry cannot change. */
-const FILE_SYSTEM_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR']);
-
 async function readCategory(cfg: CategorySheetConfig): Promise<CategoryRead> {
   const sheets = await getSheetsClient();
   const ranges = rangesFor(cfg);
@@ -174,12 +171,11 @@ async function readCategory(cfg: CategorySheetConfig): Promise<CategoryRead> {
     } catch (err) {
       lastErr = err;
       const status = (err as { code?: unknown }).code ?? (err as { status?: unknown }).status;
-      // Network errors carry a string code (ECONNRESET …); HTTP errors a number. A file
-      // system code is not a network blip: an unreadable key file fails the same way
-      // three times (it was read three times, and its path reported).
-      if (typeof status === 'string' && FILE_SYSTEM_CODES.has(status)) {
-        throw new Error(`the Google key file could not be read (${status})`);
-      }
+      // A file system code is not a network blip: an unreadable key file fails the same
+      // way three times (it was read three times, and its path reported).
+      const unreadable = keyFileReadFailure(err);
+      if (unreadable) throw new Error(`the Google key file could not be read (${unreadable})`);
+      // Network errors carry a string code (ECONNRESET …); HTTP errors a number.
       const transient = typeof status !== 'number' || status === 429 || status >= 500;
       if (!transient || attempt === 3) break;
       await new Promise((r) => setTimeout(r, 1500 * attempt));

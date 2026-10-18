@@ -74,7 +74,7 @@ let app: Express;
 let closeDb: () => Promise<void>;
 let query: Q;
 let adminToken = '';
-let envRef: { GOOGLE_SERVICE_ACCOUNT_KEY_FILE?: string };
+let envRef: { GOOGLE_SERVICE_ACCOUNT_KEY_FILE?: string; GOOGLE_DB_SPREADSHEET_ID: string };
 const auth = (t: string) => ({ Authorization: `Bearer ${t}` });
 const READ_ONLY = 'https://www.googleapis.com/auth/spreadsheets.readonly';
 
@@ -111,7 +111,7 @@ beforeAll(async () => {
   const conn = await getDatabase();
   closeDb = closeDatabase;
   query = db.query as Q;
-  envRef = env as unknown as { GOOGLE_SERVICE_ACCOUNT_KEY_FILE?: string };
+  envRef = env as unknown as typeof envRef;
 
   await conn.query('DROP SCHEMA IF EXISTS public CASCADE');
   await conn.query('CREATE SCHEMA public');
@@ -352,6 +352,102 @@ describe('Refusals that are states of this server, not failed calls to Google', 
       expect(fake.state.requests).toHaveLength(0);
     } finally {
       envRef.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = '';
+    }
+  });
+
+  // C37 follow-up (review of 2026-10-18): the Google replica answered the same state with
+  // 502 INTEGRATION_ERROR, and took a named key file that is not there for configured.
+  it('the Google replica without a spreadsheet or a key answers 503 SYNC_NOT_CONFIGURED, logged as a warning without a stack', async () => {
+    const { logger } = await import('../core/logger.js');
+    const error = vi.spyOn(logger, 'error');
+    const warn = vi.spyOn(logger, 'warn');
+    const sheetBefore = envRef.GOOGLE_DB_SPREADSHEET_ID;
+    try {
+      envRef.GOOGLE_DB_SPREADSHEET_ID = '';
+      const noSheet = await request(app).post('/api/v1/google-db/control-sheets').set(auth(adminToken));
+      expect([noSheet.status, noSheet.body.error.code]).toEqual([503, 'SYNC_NOT_CONFIGURED']);
+      expect(noSheet.body.error.message).toMatch(/^GOOGLE_SHEETS_DATABASE_SPREADSHEET_ID is not set in backend\/\.env\./);
+      envRef.GOOGLE_DB_SPREADSHEET_ID = 'TEST_REPLICA_SHEET_NOT_REAL';
+      const noKey = await request(app).post('/api/v1/google-db/control-sheets').set(auth(adminToken));
+      expect([noKey.status, noKey.body.error.code]).toEqual([503, 'SYNC_NOT_CONFIGURED']);
+      expect(noKey.body.error.message).toMatch(/^The replica needs a service account \(GOOGLE_SERVICE_ACCOUNT_KEY_FILE\)/);
+      // The request line is written once the response has gone.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(error).not.toHaveBeenCalled();
+      expect(warn.mock.calls.map(([message]) => message)).toEqual(expect.arrayContaining([
+        expect.stringMatching(/^SYNC_NOT_CONFIGURED on POST \/api\/v1\/google-db\/control-sheets: GOOGLE_SHEETS_DATABASE_SPREADSHEET_ID is not set/),
+        expect.stringMatching(/^SYNC_NOT_CONFIGURED on POST \/api\/v1\/google-db\/control-sheets: The replica needs a service account/),
+        expect.stringMatching(/^POST \/api\/v1\/google-db\/control-sheets 503 \d+ms$/),
+      ]));
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/"stack"/);
+      expect(fake.state.authOptions).toHaveLength(0);
+    } finally {
+      envRef.GOOGLE_DB_SPREADSHEET_ID = sheetBefore;
+      error.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('a named key file that is missing leaves the Google replica not configured: nothing reaches Google and no path is shown', async () => {
+    const keyFile = path.join(os.tmpdir(), `zolex-test-key-${process.pid}-replica-missing.json`);
+    const sheetBefore = envRef.GOOGLE_DB_SPREADSHEET_ID;
+    envRef.GOOGLE_DB_SPREADSHEET_ID = 'TEST_REPLICA_SHEET_NOT_REAL';
+    envRef.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = keyFile;
+    try {
+      const status = await request(app).get('/api/v1/google-db/status').set(auth(adminToken));
+      expect(status.status).toBe(200);
+      expect(status.body.data.configured).toBe(false);
+      expect(status.body.data.notConfiguredReason).toBe(
+        'Google key file not found: GOOGLE_SERVICE_ACCOUNT_KEY_FILE names a file that does not exist on this server. '
+        + 'The ERP runs normally without it; the Google replica is inactive.',
+      );
+      const control = await request(app).post('/api/v1/google-db/control-sheets').set(auth(adminToken));
+      expect([control.status, control.body.error.code]).toEqual([503, 'SYNC_NOT_CONFIGURED']);
+      expect(control.body.error.message).toMatch(/^Google key file not found/);
+      // A drain and an export are skipped with the reason, as with nothing configured.
+      const drained = await request(app).post('/api/v1/google-db/drain').set(auth(adminToken)).send({});
+      expect(drained.status).toBe(200);
+      expect(drained.body.data).toMatchObject({ status: 'SKIPPED', message: expect.stringMatching(/^Google key file not found/) });
+      const exported = await request(app).post('/api/v1/google-db/export').set(auth(adminToken)).send({});
+      expect(exported.status).toBe(200);
+      expect(exported.body.data).toMatchObject({ queued: false, message: expect.stringMatching(/^Google key file not found/) });
+      for (const res of [status, control, drained, exported]) expect(JSON.stringify(res.body)).not.toContain(path.basename(keyFile));
+      // GoogleAuth was never handed the missing path.
+      expect(fake.state.authOptions).toHaveLength(0);
+      expect(fake.state.requests).toHaveLength(0);
+    } finally {
+      envRef.GOOGLE_DB_SPREADSHEET_ID = sheetBefore;
+      envRef.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = '';
+    }
+  });
+
+  it('a replica key file that is gone by the call fails that call once, without its path', async () => {
+    const client = await import('../modules/google-db/client.js');
+    const keyFile = path.join(os.tmpdir(), `zolex-test-key-${process.pid}-replica-vanished.json`);
+    let calls = 0;
+    // The client was built while the file was there; GoogleAuth reads it at the first call.
+    client.__setClientForTests({
+      spreadsheets: {
+        values: {
+          batchUpdate: async () => {
+            calls += 1;
+            throw Object.assign(new Error(`ENOENT: no such file or directory, open '${keyFile}'`), { code: 'ENOENT' });
+          },
+        },
+      },
+    });
+    try {
+      const failure = await client.batchWrite([{ range: "'Item Master'!A2:B2", values: [['a', 'b']] }])
+        .then(() => null, (e: unknown) => e as { status?: number; code?: string; message?: string } | null);
+      // It answered 502 with GoogleAuth's message, which the drain stores as last_error for sync.view users.
+      expect({ status: failure?.status, code: failure?.code, message: failure?.message }).toEqual({
+        status: 503,
+        code: 'SYNC_NOT_CONFIGURED',
+        message: 'Google replica: batch write failed — the Google key file could not be read (ENOENT).',
+      });
+      expect(calls).toBe(1);
+    } finally {
+      client.__setClientForTests(null);
     }
   });
 

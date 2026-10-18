@@ -51,3 +51,18 @@ export function requireGoogleKeyFile(consequence: string): string {
   if (problem) throw NotConfiguredError(`${problem} ${consequence}`);
   return googleKeyFile()!;
 }
+
+/** Error codes of the local file system, which a retry cannot change. */
+const FILE_SYSTEM_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR']);
+
+/**
+ * The file-system code when a Google call failed because the key file could not be read,
+ * else null. GoogleAuth reads the file at the first call, so a file that went missing
+ * after the check above fails there, with an error whose message names the path: callers
+ * say "the Google key file could not be read (<code>)" instead, and do not retry.
+ * Network errors carry a string code too (ECONNRESET …), HTTP errors a number.
+ */
+export function keyFileReadFailure(err: unknown): string | null {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && FILE_SYSTEM_CODES.has(code) ? code : null;
+}

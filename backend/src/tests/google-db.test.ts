@@ -19,6 +19,9 @@
  * the business views gain fields.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 process.env.NODE_ENV = 'test';
 process.env.SEED_DEMO_DATA = 'false';
@@ -26,8 +29,11 @@ process.env.LOG_LEVEL = 'silent';
 // Must be set BEFORE config/env.js is first imported.
 process.env.GOOGLE_SHEETS_DATABASE_SPREADSHEET_ID = 'TEST_REPLICA_SHEET';
 // The replica only needs a key to be configured; the fake Sheets API below is injected,
-// so the suite names a file that does not exist, never the real key.
-process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = 'TEST-NOT-A-REAL-SERVICE-ACCOUNT-KEY.json';
+// so the suite names a placeholder file of its own, never the real key. The file must
+// exist: a named key file that is missing leaves the replica not configured (C37).
+const KEY_FILE = path.join(os.tmpdir(), `zolex-test-replica-key-${process.pid}.json`);
+fs.writeFileSync(KEY_FILE, '{}');
+process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE = KEY_FILE;
 process.env.GOOGLE_SHEETS_SYNC_ENABLED = 'true';
 
 /* ── Fake Sheets API ────────────────────────────────────────────────────────── */
@@ -266,6 +272,7 @@ beforeAll(async () => {
 afterAll(async () => {
   clientMod?.__setClientForTests(null);
   await closeDb?.();
+  fs.rmSync(KEY_FILE, { force: true });
 });
 
 /* ── 1. Shape: eleven business tabs, no table dumps ─────────────────────────── */
