@@ -19,7 +19,6 @@ import crypto from 'node:crypto';
 import { query, queryOne, withTransaction } from '../../db/index.js';
 import { env, paths } from '../../config/env.js';
 import { requireGoogleKeyFile } from '../../config/google.js';
-import { IntegrationError } from '../../core/errors.js';
 import { logger } from '../../core/logger.js';
 import { type AuditActor, audit } from '../../core/audit.js';
 import { collectBackupData, type BackupPayload } from '../../db/restore.js';
@@ -72,13 +71,11 @@ export interface VerificationReport {
 /**
  * Only the configured key: the fixed fallback path let a staging copy started without
  * the variable read the live sheets (2026-10-16 audit, F02). Checked before anything
- * else, so an unconfigured server neither reads Google nor writes a safety backup.
+ * else, so an unconfigured server neither reads Google nor writes a safety backup; a
+ * named key file that is not on disk is refused by the same check (config/google.ts).
  */
 function getGoogleSheetsClient(consequence: string) {
   const keyFile = requireGoogleKeyFile(consequence);
-  if (!fs.existsSync(keyFile)) {
-    throw IntegrationError(`The service-account key file named by GOOGLE_SERVICE_ACCOUNT_KEY_FILE does not exist on this server. ${consequence}`);
-  }
   const auth = new google.auth.GoogleAuth({
     keyFile,
     scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],

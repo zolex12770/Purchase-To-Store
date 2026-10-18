@@ -1568,7 +1568,8 @@ router.post(
       ...describePlan(result.plan),
       rowsPosted: result.rowsPosted,
       date: result.date,
-      message: `${t.items} item(s) aligned with ${result.rowsPosted} ledger row(s) (net ${t.net}); ${t.refused} item(s) refused. `
+      runId: result.runId,
+      message: `${t.items} item(s) aligned with ${result.rowsPosted} ledger row(s) (net ${t.net}), run ${result.runId}; ${t.refused} item(s) refused. `
         + 'Live stock was not changed.',
     });
   }),

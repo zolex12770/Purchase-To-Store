@@ -109,9 +109,10 @@ describe('Priority 1 & 2 — Live Data Verify and Master Sync Controls', () => {
   // google-isolation.test.ts; here the server has no key, as a staging copy has none.
   it('GET /api/v1/google-sync/verify says plainly that Google is not configured, and reads nothing', async () => {
     const res = await request(app).get('/api/v1/google-sync/verify').set(auth(adminToken));
-    expect(res.status).toBe(502);
+    // A state of this server, not a failed call to Google (S6-D1: it answered 502).
+    expect(res.status).toBe(503);
     expect(res.body.success).toBe(false);
-    expect(res.body.error.code).toBe('INTEGRATION_ERROR');
+    expect(res.body.error.code).toBe('SYNC_NOT_CONFIGURED');
     expect(res.body.error.message).toMatch(/not configured.*GOOGLE_SERVICE_ACCOUNT_KEY_FILE/);
     expect(res.body.error.message).not.toMatch(/secure|\.json/i);
   });
@@ -123,7 +124,8 @@ describe('Priority 1 & 2 — Live Data Verify and Master Sync Controls', () => {
         .post('/api/v1/google-sync/reconcile')
         .set(auth(adminToken))
         .send({ dryRun });
-      expect(res.status).toBe(502);
+      expect(res.status).toBe(503);
+      expect(res.body.error.code).toBe('SYNC_NOT_CONFIGURED');
       expect(res.body.error.message).toMatch(/not configured/);
     }
     const after = await dbQuery<{ n: number }>('SELECT COUNT(*)::int AS n FROM backup_metadata');

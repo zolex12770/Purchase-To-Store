@@ -32,16 +32,23 @@ export async function startSyncScheduler(): Promise<void> {
   const cfg = syncConfig();
   const enabled = await isSyncEnabled().catch(() => false);
 
-  if (!cfg.configured) {
+  if (cfg.mode === 'none') {
     logger.info('Google sync : not configured (the ERP runs normally from SQL).');
     return;
   }
 
+  // Armed whenever credentials are NAMED: a key file missing at start-up (config/google.ts)
+  // is reported here and skipped by each tick, and the runs resume once the file is back,
+  // as they did before the missing file counted as "not configured".
   const minutes = Math.max(1, env.GOOGLE_SYNC_INTERVAL_MINUTES);
   timer = setInterval(() => void tick(), minutes * 60 * 1000);
   // Do not hold the event loop open on shutdown.
   timer.unref?.();
 
+  if (!cfg.configured) {
+    logger.warn(`Google sync : ${cfg.reason ?? 'the credentials cannot be used.'} Polling every ${minutes} min; no run starts until they can.`);
+    return;
+  }
   logger.info(
     `Google sync : credentials present (${cfg.mode}); polling every ${minutes} min while the toggle is ON ` +
     `(currently ${enabled ? 'ON' : 'OFF'}).`,

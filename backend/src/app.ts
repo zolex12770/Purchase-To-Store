@@ -61,7 +61,10 @@ export function createApp(): Express {
     res.on('finish', () => {
       const ms = Date.now() - started;
       if (req.path.startsWith('/api')) {
-        const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'debug';
+        // An expected refusal answered 5xx (an integration that is not configured, or
+        // failed with a message of its own) is a warning, not an error (S6-D1).
+        const level = res.statusCode >= 500 && res.locals.expectedError !== true ? 'error'
+          : res.statusCode >= 400 ? 'warn' : 'debug';
         logger[level](`${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`, {
           requestId,
           userId: req.user?.id ?? null,
@@ -253,14 +256,24 @@ export function createApp(): Express {
       }
     }
 
-    if (!appErr.expected || appErr.status >= 500) {
+    // A stack only for what nobody raised on purpose. An AppError the code threw knowingly
+    // (Google not configured, an upstream refusal) says everything in its message; its
+    // stack only names the line that raised it. Every not-configured refusal used to be
+    // logged twice at error level, as "Unhandled error" with the stack (S6-D1).
+    if (!appErr.expected) {
       logger.error(`Unhandled error on ${req.method} ${req.originalUrl}`, {
         requestId,
         userId: req.user?.id ?? null,
         error: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack?.split('\n').slice(0, 6).join(' | ') : undefined,
       });
+    } else if (appErr.status >= 500) {
+      logger.warn(`${appErr.code} on ${req.method} ${req.originalUrl}: ${appErr.message}`, {
+        requestId,
+        userId: req.user?.id ?? null,
+      });
     }
+    res.locals.expectedError = appErr.expected;
 
     if (res.headersSent) return;
 

@@ -11,7 +11,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { getDatabase, type Queryable } from './driver.js';
-import { PLANNER_TABLES } from './statistics.js';
 import { logger } from '../core/logger.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -144,7 +143,10 @@ const POST_MIGRATION: Record<string, string[]> = {
   // 2026-10-17 its totals took 2.9 s under 'Receipt on store sheet only' and the
   // receipt evidence summary 18 to 90 s, against 0.03 s and 0.1 to 0.3 s once analysed.
   // A database restored later is analysed by the restore itself (db/statistics.ts).
-  '030_store_grn_link_holds': PLANNER_TABLES.map((t) => `ANALYZE ${t}`),
+  // The whole database, not only the PO and GRN tables it first named: the indent and
+  // requisition tables of production had never been analysed either (C01, 2026-10-18),
+  // and the whole copy of 2026-10-17 takes about 1 s, before the server listens.
+  '030_store_grn_link_holds': ['ANALYZE'],
 };
 
 /**

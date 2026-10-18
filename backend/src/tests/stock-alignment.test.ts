@@ -247,6 +247,9 @@ describe('Stock-ledger alignment — dry run, apply, re-run, undo', () => {
     expect(res.body.data).toMatchObject({ dryRun: false, rowsPosted: 7, totals: { items: 3, refused: 2 } });
     const today = (await query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`))[0].d;
     const stamp = today.replace(/-/g, '');
+    // Each run numbers its rows under a short id of its own (a second run must not reuse them).
+    const run = res.body.data.runId as string;
+    expect(run).toMatch(/^[0-9a-f]{6}$/);
 
     const rows = await query<{
       item_code: string; txn_type: string; reference_type: string; reference_no: string; inward_qty: string; outward_qty: string;
@@ -259,9 +262,9 @@ describe('Stock-ledger alignment — dry run, apply, re-run, undo', () => {
     );
     const a = ids['ALN-A'];
     expect(rows.filter((r) => r.item_code === 'ALN-A').map((r) => [r.reference_no, r.inward_qty, r.outward_qty, r.balance_qty, r.remarks])).toEqual([
-      [`ALN-${stamp}-${a}-001`, '100.0000', '0.0000', '151.0000', 'Opening 2026-04-01 - General Item Live Stock!BI1088'],
-      [`ALN-${stamp}-${a}-002`, '0.0000', '32.0000', '119.0000', 'Issues May-26 - Issue Register (Store Outward Entry) rows 7,8,9'],
-      [`ALN-${stamp}-${a}-003`, '0.0000', '5.0000', '114.0000', 'Adjustment 2026-07-03 - Stock Adjustment row 2 (GENERAL sheet)'],
+      [`ALN-${stamp}-${run}-${a}-001`, '100.0000', '0.0000', '151.0000', 'Opening 2026-04-01 - General Item Live Stock!BI1088'],
+      [`ALN-${stamp}-${run}-${a}-002`, '0.0000', '32.0000', '119.0000', 'Issues May-26 - Issue Register (Store Outward Entry) rows 7,8,9'],
+      [`ALN-${stamp}-${run}-${a}-003`, '0.0000', '5.0000', '114.0000', 'Adjustment 2026-07-03 - Stock Adjustment row 2 (GENERAL sheet)'],
     ]);
     expect(rows.filter((r) => r.item_code === 'ALN-B').map((r) => [r.balance_qty, r.remarks])).toEqual([
       ['55.0000', 'Opening 2026-04-01 - RM Stock Live!BG655'],
@@ -394,6 +397,29 @@ describe('Stock-ledger alignment — dry run, apply, re-run, undo', () => {
     expect(undo.body.data.undone).toEqual([{ itemId: ids['ALN-A'], itemCode: 'ALN-A', rowsReversed: 3, net: '-63.0000' }]);
     expect(await ledgerOf('ALN-A')).toBe('51.0000');
     expect(await count(`SELECT COUNT(*)::int AS n FROM stock_ledger WHERE item_id = $1 AND txn_type = 'STOCK_ALIGNMENT'`, [ids['ALN-A']])).toBe(12);
+
+    // Two runs on one day, each undone: the second run's numbers are its own (they were the
+    // first run's again, ALN-<date>-<item>-001…), and each undo row carries the number of the
+    // row it reverses, so the ledger names the run every row belongs to.
+    const all = await query<{ id: string; reference_id: string | null; reference_no: string }>(
+      `SELECT id, reference_id, reference_no FROM stock_ledger WHERE item_id = $1 AND txn_type = 'STOCK_ALIGNMENT' ORDER BY id`,
+      [ids['ALN-A']],
+    );
+    const originals = all.filter((r) => r.reference_id === null);
+    expect(originals).toHaveLength(6);
+    const runOf = (no: string) => /^ALN-\d{8}-([0-9a-f]{6})-\d+-\d{3}$/.exec(no)?.[1];
+    const [first, second] = [originals.slice(0, 3), originals.slice(3)].map((rs) => new Set(rs.map((r) => runOf(r.reference_no))));
+    expect([first!.size, second!.size]).toEqual([1, 1]);
+    expect([...first!][0]).toBeDefined();
+    expect([...first!][0]).not.toBe([...second!][0]);
+    expect(new Set(originals.map((r) => r.reference_no)).size).toBe(6);
+    expect(res.body.data.runId).toBe([...second!][0]);
+    const byId = new Map(all.map((r) => [r.id, r.reference_no]));
+    for (const u of all.filter((r) => r.reference_id !== null)) expect(u.reference_no).toBe(byId.get(u.reference_id!));
+    const cancel = await query<{ after_data: { referenceNos: string[] } }>(
+      `SELECT after_data FROM audit_logs WHERE entity = 'stock_alignment' AND action = 'CANCEL' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(cancel[0]!.after_data.referenceNos).toEqual(originals.slice(3).map((r) => r.reference_no));
   });
 });
 

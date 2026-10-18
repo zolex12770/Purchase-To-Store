@@ -15,6 +15,7 @@ export type ErrorCode =
   | 'CONFLICT'
   | 'BUSINESS_RULE_VIOLATION'
   | 'INTEGRATION_ERROR'
+  | 'SYNC_NOT_CONFIGURED'
   | 'RATE_LIMITED'
   | 'PAYLOAD_TOO_LARGE'
   | 'SERVER_ERROR';
@@ -78,6 +79,16 @@ export const BusinessRuleError = (message: string, details?: Record<string, unkn
 
 export const IntegrationError = (message: string, details?: Record<string, unknown>) =>
   new AppError('INTEGRATION_ERROR', 502, message, { details });
+
+/**
+ * An integration this server is not set up for: no Google key configured, or the
+ * configured key file missing. A state of the deployment, not a failed call to Google,
+ * so not a 502: 503 says the service is unavailable on this server and the code says
+ * why. It is expected, so it is logged as a warning without a stack (S6-D1: every such
+ * refusal answered 502 and was logged as an unhandled error with its stack).
+ */
+export const NotConfiguredError = (message: string, details?: Record<string, unknown>) =>
+  new AppError('SYNC_NOT_CONFIGURED', 503, message, { details });
 
 export const ServerError = (message = 'An unexpected error occurred.') =>
   new AppError('SERVER_ERROR', 500, message, { expected: false });

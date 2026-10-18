@@ -124,6 +124,7 @@ const NOT_SYNCED = 'The inventory sheets were not read and nothing was changed.'
 
 async function getSheetsClient() {
   // Only the configured key: a fixed fallback path let a staging copy read the live sheets (F02).
+  // A named file that is not there is refused here too, before GoogleAuth is given its path.
   const keyFile = requireGoogleKeyFile(NOT_SYNCED);
   const { google } = await import('googleapis');
   const { GoogleAuth } = await import('google-auth-library');
@@ -141,6 +142,9 @@ export interface CategoryRead {
 }
 
 export { rangesFor };
+
+/** Error codes of the local file system, which a retry cannot change. */
+const FILE_SYSTEM_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR']);
 
 async function readCategory(cfg: CategorySheetConfig): Promise<CategoryRead> {
   const sheets = await getSheetsClient();
@@ -170,7 +174,12 @@ async function readCategory(cfg: CategorySheetConfig): Promise<CategoryRead> {
     } catch (err) {
       lastErr = err;
       const status = (err as { code?: unknown }).code ?? (err as { status?: unknown }).status;
-      // Network errors carry a string code (ECONNRESET …); HTTP errors a number.
+      // Network errors carry a string code (ECONNRESET …); HTTP errors a number. A file
+      // system code is not a network blip: an unreadable key file fails the same way
+      // three times (it was read three times, and its path reported).
+      if (typeof status === 'string' && FILE_SYSTEM_CODES.has(status)) {
+        throw new Error(`the Google key file could not be read (${status})`);
+      }
       const transient = typeof status !== 'number' || status === 429 || status >= 500;
       if (!transient || attempt === 3) break;
       await new Promise((r) => setTimeout(r, 1500 * attempt));
@@ -1044,6 +1053,8 @@ async function exclusive<T>(scope: string, runId: string, fn: () => Promise<T>, 
 /**
  * Without credentials a run is refused up front, so the caller hears "not configured"
  * rather than five failed reads and a "try again" (a test's own reader needs none).
+ * A configured key file that is missing is refused the same way, as a configuration
+ * error (503 SYNC_NOT_CONFIGURED): no read, no retry, no path in the message.
  */
 function assertSheetsConfigured(opts: SyncOptions): void {
   if (!opts.reader) requireGoogleKeyFile(NOT_SYNCED);

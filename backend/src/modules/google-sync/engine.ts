@@ -18,7 +18,9 @@ import { query, queryOne, withTransaction, txQuery, txQueryOne, type Queryable }
 import { env } from '../../config/env.js';
 import { logger } from '../../core/logger.js';
 import { audit, SYSTEM_ACTOR, type AuditActor } from '../../core/audit.js';
-import { IntegrationError } from '../../core/errors.js';
+import { IntegrationError, NotConfiguredError, ConflictError } from '../../core/errors.js';
+import { googleKeyFile, googleKeyFileProblem, GOOGLE_KEY_FILE_NOT_FOUND } from '../../config/google.js';
+import { analyseStaleTables } from '../../db/statistics.js';
 import { parseNumericInput, toRate } from '../../domain/money.js';
 
 export interface SyncOptions {
@@ -106,11 +108,20 @@ export interface SyncConfig {
 /**
  * Reports whether credentials exist WITHOUT throwing.
  * Absent credentials must degrade to a clear "not configured" state, never a crash
- * (SRS §8 — the ERP has to keep working with sync off).
+ * (SRS §8 — the ERP has to keep working with sync off). A named key file that is not
+ * on disk is not configured either (the check config/google.ts gives every reader):
+ * it used to count as configured, and each sheet then failed with an ENOENT naming
+ * the path.
  */
 export function syncConfig(): SyncConfig {
   const sheetId = env.GOOGLE_SHEET_ID;
-  if (env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE && env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE.trim()) {
+  if (googleKeyFile()) {
+    if (googleKeyFileProblem() === GOOGLE_KEY_FILE_NOT_FOUND) {
+      return {
+        configured: false, mode: 'service-account', sheetId,
+        reason: `${GOOGLE_KEY_FILE_NOT_FOUND} The ERP operates normally from its own database; the sheets are read again once the file is back.`,
+      };
+    }
     return { configured: true, mode: 'service-account', sheetId };
   }
   if (env.GOOGLE_API_KEY && env.GOOGLE_API_KEY.trim()) {
@@ -147,7 +158,7 @@ function isTransientReadError(message: string): boolean {
 export async function readSheet(sheetName: string): Promise<string[][]> {
   const cfg = syncConfig();
   if (!cfg.configured) {
-    throw IntegrationError(cfg.reason ?? 'Google Sheets is not configured.');
+    throw NotConfiguredError(cfg.reason ?? 'Google Sheets is not configured.');
   }
 
   const { google } = await import('googleapis');
@@ -156,7 +167,7 @@ export async function readSheet(sheetName: string): Promise<string[][]> {
   if (cfg.mode === 'service-account') {
     const { GoogleAuth } = await import('google-auth-library');
     auth = new GoogleAuth({
-      keyFile: env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE,
+      keyFile: googleKeyFile()!,
       scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     });
   }
@@ -1778,13 +1789,15 @@ export function isSyncRunning(): boolean {
 }
 
 export async function runSync(options: SyncOptions): Promise<SyncResult> {
+  // Neither refusal is a failed call to Google (502): a run in progress is the state of
+  // this server (409), and so are missing credentials (503 SYNC_NOT_CONFIGURED, S6-D1).
   if (running) {
-    throw IntegrationError('A synchronisation is already in progress. Please wait for it to finish.');
+    throw ConflictError('A synchronisation is already in progress. Please wait for it to finish.');
   }
 
   const cfg = syncConfig();
   if (!cfg.configured && !options.reader) {
-    throw IntegrationError(cfg.reason ?? 'Google Sheets is not configured.');
+    throw NotConfiguredError(cfg.reason ?? 'Google Sheets is not configured.');
   }
 
   // The flag is released in `finally`. It used to be cleared only on the last
@@ -2048,6 +2061,14 @@ async function runSyncLocked(options: SyncOptions, cfg: SyncConfig): Promise<Syn
   }
 
   logger.info(`Google sync ${status} in ${durationMs}ms — ${message}`);
+
+  // PGlite never analyses a table on its own, so rows a run brings in stay unknown to the
+  // planner until something does: the PO register this sync imported on 2026-10-16 was
+  // never analysed, and a date-filtered KPI then ran for about 200 s with every other
+  // request waiting (C01). Only the tables the run changed beyond autovacuum's rule.
+  if (!options.dryRun && (totals.inserted > 0 || totals.updated > 0)) {
+    await analyseStaleTables(`after sync job #${jobId}`);
+  }
 
   return { jobId, status, durationMs, sheets: outcomes, totals, message };
 }

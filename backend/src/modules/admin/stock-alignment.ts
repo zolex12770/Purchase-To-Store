@@ -19,9 +19,14 @@
  *   · the dry run returns a selectionHash over exactly what it would write, and
  *     applying requires it: the plan is rebuilt in one transaction with the items
  *     locked, so a sync or a stock posting in between ends in 409, nothing written;
- *   · undo appends the opposite rows; nothing is ever deleted.
+ *   · undo appends the opposite rows; nothing is ever deleted;
+ *   · each run numbers its rows ALN-<date>-<run>-<item>-<NNN>, the run a short id of
+ *     its own, and an undo row carries the number of the row it reverses. The numbers
+ *     were ALN-<date>-<item>-<NNN>, so aligning an item again on the day its alignment
+ *     was undone gave its new rows the numbers of the undone ones (rows posted that way
+ *     keep their numbers).
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { txQuery, type Queryable } from '../../db/index.js';
 import { dec, toQty } from '../../domain/money.js';
 import { BusinessRuleError, ConflictError } from '../../core/errors.js';
@@ -206,6 +211,23 @@ async function jsonBatch(tx: Queryable, sql: string, rows: object[], extra: unkn
   }
 }
 
+/**
+ * A short id for one alignment run, unused by any ledger number of that day: the
+ * reference numbers of one run never repeat another run's (stock_ledger.reference_no
+ * has no unique index, so this check is what keeps them apart).
+ */
+async function newRunId(run: Run, stamp: string): Promise<string> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const id = randomBytes(3).toString('hex');
+    const [{ taken }] = await run<{ taken: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM stock_ledger WHERE reference_type = $1 AND reference_no LIKE $2) AS taken`,
+      [ALIGNMENT_REFERENCE_TYPE, `ALN-${stamp}-${id}-%`],
+    );
+    if (!taken) return id;
+  }
+  throw ConflictError('No unused alignment run number could be drawn; nothing was written. Try again.');
+}
+
 const INSERT_ROWS = `
   INSERT INTO stock_ledger (item_id, txn_type, reference_type, reference_id, reference_no,
                             inward_qty, outward_qty, balance_qty, uom_id, remarks, txn_date, created_by)
@@ -223,7 +245,7 @@ export async function applyAlignment(
   tx: Queryable,
   entries: AlignmentEntry[],
   ctx: { expectedHash: string; actor: AuditActor; userId: number | null },
-): Promise<{ plan: AlignmentPlan; rowsPosted: number; date: string }> {
+): Promise<{ plan: AlignmentPlan; rowsPosted: number; date: string; runId: string }> {
   const run: Run = (sql, params) => txQuery(tx, sql, params);
   const plan = await planAlignment(run, entries, { lock: true });
   if (plan.selectionHash !== ctx.expectedHash) {
@@ -237,6 +259,8 @@ export async function applyAlignment(
 
   const [{ today }] = await run<{ today: string }>('SELECT CURRENT_DATE::text AS today', []);
   const stamp = today.replace(/-/g, '');
+  const runId = await newRunId(run, stamp);
+  const prefix = `ALN-${stamp}-${runId}`;
   const rows: object[] = [];
   for (const item of plan.accepted) {
     let balance = dec(item.ledgerBalance);
@@ -245,7 +269,7 @@ export async function applyAlignment(
       balance = balance.plus(qty);
       rows.push({
         item_id: item.itemId, reference_id: null,
-        reference_no: `ALN-${stamp}-${item.itemId}-${String(i + 1).padStart(3, '0')}`,
+        reference_no: `${prefix}-${item.itemId}-${String(i + 1).padStart(3, '0')}`,
         inward: qty.isPositive() ? toQty(qty) : '0', outward: qty.isNegative() ? toQty(qty.abs()) : '0',
         balance: toQty(balance), uom_id: item.uomId, remarks: remarksOf(e),
       });
@@ -281,7 +305,8 @@ export async function applyAlignment(
       entityLabel: item.itemCode,
       before: { ledgerBalance: item.ledgerBalance, liveStock: item.liveStock },
       after: {
-        referenceNos: `ALN-${stamp}-${item.itemId}-001…${String(n).padStart(3, '0')}`,
+        runId,
+        referenceNos: `${prefix}-${item.itemId}-001…${String(n).padStart(3, '0')}`,
         entries: item.entries.map(({ component, qty, reference, evidence }) => ({ component, qty, reference, evidence })),
         ledgerBalance: toQty(dec(item.ledgerBalance).plus(dec(item.entriesNet))),
         selectionHash: plan.selectionHash,
@@ -295,11 +320,11 @@ export async function applyAlignment(
     action: 'POST',
     entity: 'stock_alignment',
     entityLabel: `alignment run ${plan.selectionHash.slice(0, 12)}`,
-    after: { ...plan.totals, rowsPosted: rows.length, date: today, selectionHash: plan.selectionHash },
-    message: `One-time stock-ledger alignment: ${plan.totals.items} item(s) aligned with ${rows.length} ledger row(s) ` +
+    after: { ...plan.totals, rowsPosted: rows.length, date: today, selectionHash: plan.selectionHash, runId, referencePrefix: prefix },
+    message: `One-time stock-ledger alignment ${prefix}: ${plan.totals.items} item(s) aligned with ${rows.length} ledger row(s) ` +
       `(net ${plan.totals.net}); ${plan.totals.refused} item(s) refused. Live stock was not changed.`,
   });
-  return { plan, rowsPosted: rows.length, date: today };
+  return { plan, rowsPosted: rows.length, date: today, runId };
 }
 
 export interface UndoResult {
@@ -355,6 +380,8 @@ export async function undoAlignment(
   const [{ today }] = await txQuery<{ today: string }>(tx, 'SELECT CURRENT_DATE::text AS today');
   const result: UndoResult = { undone: [], skipped: [], rowsPosted: 0, date: today };
   const rows: object[] = [];
+  /** The numbers each item's undo reverses: its one run in place (planAlignment allows no second). */
+  const reversedNos = new Map<number, string[]>();
   for (const itemId of ids) {
     const item = itemById.get(itemId);
     const list = openByItem.get(itemId) ?? [];
@@ -368,10 +395,13 @@ export async function undoAlignment(
     }
     let balance = dec(ledgerById.get(itemId)?.balance ?? 0);
     let net = dec(0);
+    reversedNos.set(itemId, list.map((r) => r.reference_no));
     for (const r of list) {
       const back = dec(r.net).negated();
       balance = balance.plus(back);
       net = net.plus(back);
+      // The undo row carries the number of the row it reverses, as a GRN reversal carries
+      // its GRN's: with the run in that number, it names exactly the run it takes back.
       rows.push({
         item_id: itemId, reference_id: Number(r.id), reference_no: r.reference_no,
         inward: back.isPositive() ? toQty(back) : '0', outward: back.isNegative() ? toQty(back.abs()) : '0',
@@ -394,7 +424,7 @@ export async function undoAlignment(
       entity: 'stock_alignment',
       entityId: u.itemId,
       entityLabel: u.itemCode,
-      after: { rowsReversed: u.rowsReversed, net: u.net, reason: ctx.reason },
+      after: { rowsReversed: u.rowsReversed, net: u.net, reason: ctx.reason, referenceNos: reversedNos.get(u.itemId) ?? [] },
       message: `Opening alignment of ${u.itemCode} undone: ${u.rowsReversed} opposite ledger row(s) appended (net ${u.net}); ` +
         `the original rows are kept and the live stock was not changed. Reason: ${ctx.reason}`,
     });
