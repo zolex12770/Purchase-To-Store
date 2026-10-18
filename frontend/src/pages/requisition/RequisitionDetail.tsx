@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { api, ApiError, downloadFile, fetchHtml } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
+import { mayChangeRequisition, maySubmitRequisition } from '../../lib/requisitionAccess';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
 import {
@@ -224,6 +225,13 @@ export default function RequisitionDetail() {
   const isIssuable = data.status === 'APPROVED' || data.status === 'PARTIALLY_ISSUED' || data.status === 'FULLY_ISSUED';
   const editable = isDraft || isPending || isReturned;
 
+  // Edit, Submit, Delete, Reopen and Cancel also need the server's owner check
+  // (assertOwnRequisition): the permission alone showed them to colleagues, who
+  // got 403 (E2E S1-06; a wrong HOD saw Edit, S4).
+  const viewer = { id: user?.id, isSuperAdmin };
+  const mayChange = mayChangeRequisition(data, viewer);
+  const maySubmit = maySubmitRequisition(data, viewer);
+
   const ownRequisition = data.requester_user_id === user?.id;
   const blockedBySelfApproval = ownRequisition && !isSuperAdmin;
   const wrongHod = data.hod_user_id !== null && data.hod_user_id !== user?.id && !isSuperAdmin;
@@ -269,13 +277,17 @@ export default function RequisitionDetail() {
             <Button variant="secondary" size="sm" icon={<Eye size={13} />} onClick={() => void openPreview()}>Preview</Button>
             <Button variant="secondary" size="sm" icon={<Download size={13} />} loading={downloading} onClick={() => void downloadPdf()}>Download PDF</Button>
 
-            {editable && (can('requisition.edit') || can('requisition.approve')) && (
+            {editable && (can('requisition.edit') || can('requisition.approve')) && mayChange && (
               <Button variant="secondary" size="sm" icon={<Pencil size={13} />} onClick={() => navigate(`/requisitions/${id}/edit`)}>Edit</Button>
             )}
-            {isDraft && can('requisition.create') && (
-              <Button variant="primary" size="sm" icon={<Send size={13} />} onClick={() => setAction('submit')}>Submit</Button>
+            {/* A RETURNED requisition goes back to the HOD from here too; it offered no
+                Submit at all (E2E S4-05). */}
+            {(isDraft || isReturned) && can('requisition.create') && maySubmit && (
+              <Button variant="primary" size="sm" icon={<Send size={13} />} onClick={() => setAction('submit')}>
+                {isReturned ? 'Resubmit' : 'Submit'}
+              </Button>
             )}
-            {isDraft && can('requisition.delete') && (
+            {isDraft && can('requisition.delete') && mayChange && (
               <Button variant="ghost" size="sm" icon={<Trash2 size={13} />} onClick={() => setAction('delete')}>Delete</Button>
             )}
 
@@ -310,7 +322,7 @@ export default function RequisitionDetail() {
               </Button>
             )}
 
-            {isRejected && can('requisition.edit') && (
+            {isRejected && can('requisition.edit') && mayChange && (
               <Button variant="secondary" size="sm" icon={<RotateCcw size={13} />} onClick={() => setAction('reopen')}>
                 Reopen as draft
               </Button>
@@ -322,7 +334,7 @@ export default function RequisitionDetail() {
               </Button>
             )}
 
-            {(isDraft || (data.status === 'APPROVED' && !hasAnyIssue)) && can('requisition.edit') && (
+            {(isDraft || (data.status === 'APPROVED' && !hasAnyIssue)) && can('requisition.edit') && mayChange && (
               <Button variant="ghost" size="sm" icon={<Ban size={13} />} onClick={() => { setReason(''); setAction('cancel'); }}>
                 Cancel
               </Button>
@@ -607,7 +619,7 @@ export default function RequisitionDetail() {
         onConfirm={() => action && run.mutate(action)}
         loading={run.isPending}
         title={
-          action === 'submit' ? 'Submit for HOD approval?'
+          action === 'submit' ? (isReturned ? 'Resubmit for HOD approval?' : 'Submit for HOD approval?')
             : action === 'approve' ? 'Approve this requisition?'
             : action === 'reject' ? 'Reject this requisition?'
             : action === 'return' ? 'Return for correction?'
@@ -616,7 +628,7 @@ export default function RequisitionDetail() {
             : 'Delete this draft?'
         }
         confirmLabel={
-          action === 'submit' ? 'Submit'
+          action === 'submit' ? (isReturned ? 'Resubmit' : 'Submit')
             : action === 'approve' ? 'Approve'
             : action === 'reject' ? 'Reject'
             : action === 'return' ? 'Return'
@@ -630,7 +642,9 @@ export default function RequisitionDetail() {
         reasonValue={reason}
         onReasonChange={setReason}
         message={
-          action === 'submit' ? <>Requisition <strong>{data.requisition_no}</strong> will go to your department's HOD and can no longer be freely edited.</>
+          action === 'submit' ? (isReturned
+            ? <>Requisition <strong>{data.requisition_no}</strong> goes back to the HOD as it stands now. To correct it first, use <strong>Edit</strong>.</>
+            : <>Requisition <strong>{data.requisition_no}</strong> will go to your department's HOD and can no longer be freely edited.</>)
             : action === 'approve' ? <>It moves to the Store Issue Queue, ready for material to be issued.</>
             : action === 'reject' ? <>The reason is recorded on the document and in the audit trail.</>
             : action === 'return' ? <>The requester can edit and resubmit it — the reason is recorded in the audit trail.</>
@@ -682,7 +696,10 @@ export default function RequisitionDetail() {
           setIssueOpen(false);
           void qc.invalidateQueries({ queryKey: ['requisitions'] });
           void qc.invalidateQueries({ queryKey: ['requisition', id] });
+          void qc.invalidateQueries({ queryKey: ['inventory-requisition-queue'] });
+          void qc.invalidateQueries({ queryKey: ['inventory-stock'] });
         }}
+        onStale={() => void qc.invalidateQueries({ queryKey: ['requisition', id] })}
       />
 
       <Modal
@@ -705,6 +722,9 @@ export default function RequisitionDetail() {
           <iframe
             ref={previewFrameRef}
             title={`Requisition ${data.requisition_no} preview`}
+            // No allow-scripts: the document never runs anything, whatever it holds.
+            // Same origin so Print can reach it; modals so it may open the print dialog.
+            sandbox="allow-same-origin allow-modals"
             srcDoc={previewHtml ?? ''}
             style={{ width: '100%', height: '72vh', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', background: '#fff' }}
           />
@@ -731,6 +751,7 @@ export default function RequisitionDetail() {
           <iframe
             ref={issuePreviewFrameRef}
             title={`Issue slip ${issuePreview?.slipNo ?? ''} preview`}
+            sandbox="allow-same-origin allow-modals"
             srcDoc={issuePreviewHtml ?? ''}
             style={{ width: '100%', height: '72vh', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', background: '#fff' }}
           />
@@ -743,17 +764,28 @@ export default function RequisitionDetail() {
 /* ── Store Issue modal ────────────────────────────────────────────────────── */
 
 function StoreIssueModal({
-  open, onClose, requisition, onIssued,
-}: { open: boolean; onClose: () => void; requisition: RequisitionDoc; onIssued: () => void }) {
+  open, onClose, requisition, onIssued, onStale,
+}: { open: boolean; onClose: () => void; requisition: RequisitionDoc; onIssued: () => void; onStale: () => void }) {
   const toast = useToast();
   const [qtyByLine, setQtyByLine] = useState<Record<number, string>>({});
   const [remarks, setRemarks] = useState('');
   const [confirmedExcess, setConfirmedExcess] = useState(false);
+  // A double click posted two slips and deducted the stock twice (E2E S4-12):
+  // `loading` disables the button only after the next render. This ref is set
+  // before the request goes, so the second click of a double click finds it set.
+  const inFlight = useRef(false);
 
   const issue = useMutation({
     mutationFn: () => {
+      // expectedIssuedQty is the issued quantity this dialog shows; the server
+      // refuses the issue (409) if it has moved since, so a repeat or a stale
+      // dialog cannot issue twice.
       const lines = requisition.lines
-        .map((l) => ({ requisitionLineId: l.requisition_line_id, issueQty: qtyByLine[l.requisition_line_id] ?? '' }))
+        .map((l) => ({
+          requisitionLineId: l.requisition_line_id,
+          issueQty: qtyByLine[l.requisition_line_id] ?? '',
+          expectedIssuedQty: l.issued_qty,
+        }))
         .filter((l) => Number(l.issueQty) > 0);
       return api.post<{ issueSlipNo: string; status: string; message: string }>(`/requisitions/${requisition.id}/issue`, { lines, remarks });
     },
@@ -763,9 +795,18 @@ function StoreIssueModal({
       onIssued();
     },
     onError: (err) => {
-      toast.fromError(err instanceof ApiError ? err : err);
+      toast.fromError(err);
+      // The figures changed under the dialog: show the current ones before anyone issues again.
+      if (err instanceof ApiError && err.status === 409) onStale();
     },
+    onSettled: () => { inFlight.current = false; },
   });
+
+  const submit = () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    issue.mutate();
+  };
 
   // Suggested Issue Qty defaults to the pending (requested - issued) quantity
   // when the modal opens, but stays fully editable in both directions — Store
@@ -795,13 +836,14 @@ function StoreIssueModal({
     <Modal
       open={open}
       onClose={onClose}
+      busy={issue.isPending}
       title="Issue material"
       subtitle={`${requisition.requisition_no} · Stock availability is checked when you confirm — over-issue against the requested quantity is allowed, over-issue beyond current stock is not.`}
       size="lg"
       footer={
         <>
-          <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" loading={issue.isPending} disabled={!canSubmit} onClick={() => issue.mutate()}>
+          <Button variant="ghost" onClick={onClose} disabled={issue.isPending}>Cancel</Button>
+          <Button variant="primary" loading={issue.isPending} disabled={!canSubmit} onClick={submit}>
             Issue material
           </Button>
         </>

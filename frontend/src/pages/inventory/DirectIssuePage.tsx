@@ -8,19 +8,19 @@
  *  - Exactly-once deduction from inventory ledger.
  *  - Printable issue slip generation and audit history.
  */
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Plus, Printer, Eye, Search, Trash2,
 } from 'lucide-react';
-import { api, qs, type PageMeta } from '../../lib/api';
+import { api, qs, fetchHtml, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
 import { DataTable, type Column } from '../../components/DataTable';
 import { StatTile } from '../../components/KpiCard';
 import {
-  Button, Card, CardBody, Badge, Modal, Field, Textarea,
+  Button, Card, CardBody, Badge, Modal, Field, Textarea, LoadingBlock,
 } from '../../components/ui';
 import { qty, formatDate, count, toShortUom } from '../../lib/format';
 import { useLookupOptions, useUserOptions, type ItemOption } from '../../lib/masters';
@@ -139,6 +139,10 @@ export default function DirectIssuePage() {
   });
 
   // Mutation: Create Direct Issue
+  // Posting deducts stock, and the button disabled itself only after the next
+  // render, so a quick second click posted a second issue: the same hole as the
+  // requisition issue (E2E S4-12). The ref is set before the request goes.
+  const submitting = useRef(false);
   const createMutation = useMutation({
     mutationFn: (payload: any) => api.post<{ id: number; issueNo: string; message: string }>('/inventory/direct-issues', payload),
     onSuccess: (res) => {
@@ -150,7 +154,39 @@ export default function DirectIssuePage() {
       void qc.invalidateQueries({ queryKey: ['direct-issues'] });
     },
     onError: (err) => toast.fromError(err, 'Failed to post direct issue'),
+    onSettled: () => { submitting.current = false; },
   });
+
+  // The slip is fetched with the session's token and shown in a preview. Opened
+  // as a new window it carried no token (the access token lives in memory only)
+  // and showed a 401 page (E2E S4-24).
+  const [slip, setSlip] = useState<{ id: number; issueNo: string; cancelled: boolean } | null>(null);
+  const [slipHtml, setSlipHtml] = useState<string | null>(null);
+  const [slipLoading, setSlipLoading] = useState(false);
+  const slipFrameRef = useRef<HTMLIFrameElement>(null);
+
+  const openSlip = async (issue: { id: number; issue_no: string; status?: string }) => {
+    setSlip({ id: issue.id, issueNo: issue.issue_no, cancelled: issue.status === 'CANCELLED' });
+    setSlipHtml(null);
+    setSlipLoading(true);
+    try {
+      setSlipHtml(await fetchHtml(`/inventory/direct-issues/${issue.id}/print`));
+    } catch (err) {
+      toast.fromError(err, 'Could not load the issue slip');
+      setSlip(null);
+    } finally {
+      setSlipLoading(false);
+    }
+  };
+
+  const closeSlip = () => { setSlip(null); setSlipHtml(null); };
+
+  const printSlip = () => {
+    const win = slipFrameRef.current?.contentWindow;
+    if (!win) return;
+    win.focus();
+    win.print();
+  };
 
   const [cancelOpen, setCancelOpen] = useState(false);
   const [cancelReason, setCancelReason] = useState('');
@@ -238,6 +274,7 @@ export default function DirectIssuePage() {
   };
 
   const handleSubmitNewIssue = () => {
+    if (submitting.current) return;
     if (!recipientUserId) {
       toast.error('Recipient is required', 'Please select an authorized employee recipient.');
       return;
@@ -260,6 +297,7 @@ export default function DirectIssuePage() {
       }
     }
 
+    submitting.current = true;
     createMutation.mutate({
       recipientUserId,
       departmentId,
@@ -385,7 +423,7 @@ export default function DirectIssuePage() {
             size="sm"
             variant="secondary"
             icon={<Printer size={13} />}
-            onClick={() => window.open(`/api/v1/inventory/direct-issues/${r.id}/print`, '_blank')}
+            onClick={() => void openSlip(r)}
           >
             Slip
           </Button>
@@ -533,6 +571,7 @@ export default function DirectIssuePage() {
       <Modal
         open={newModalOpen}
         onClose={() => setNewModalOpen(false)}
+        busy={createMutation.isPending}
         title="New Direct Issue from Store"
         size="lg"
       >
@@ -821,7 +860,7 @@ export default function DirectIssuePage() {
               <Button
                 variant="secondary"
                 icon={<Printer size={14} />}
-                onClick={() => window.open(`/api/v1/inventory/direct-issues/${detailData.id}/print`, '_blank')}
+                onClick={() => void openSlip(detailData)}
               >
                 Print Slip
               </Button>
@@ -856,6 +895,36 @@ export default function DirectIssuePage() {
           </div>
         </Modal>
       )}
+
+      {/* ── Modal: Issue slip preview ──────────────────────────────────────── */}
+      <Modal
+        open={slip !== null}
+        onClose={closeSlip}
+        title={`Direct Issue Slip — ${slip?.issueNo ?? ''}${slip?.cancelled ? ' (cancelled)' : ''}`}
+        subtitle="The printable slip, as it prints"
+        size="xl"
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeSlip}>Close</Button>
+            <Button variant="primary" icon={<Printer size={14} />} onClick={printSlip} disabled={!slipHtml}>Print</Button>
+          </>
+        }
+      >
+        {slipLoading ? (
+          <LoadingBlock height={500} label="Loading the slip…" />
+        ) : (
+          <iframe
+            ref={slipFrameRef}
+            title={`Direct issue slip ${slip?.issueNo ?? ''}`}
+            // No allow-scripts: the slip carries what users typed and never runs
+            // anything (it was unescaped once, E2E S4-24b). Same origin so Print can
+            // reach it; modals so it may open the print dialog.
+            sandbox="allow-same-origin allow-modals"
+            srcDoc={slipHtml ?? ''}
+            style={{ width: '100%', height: '72vh', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', background: '#fff' }}
+          />
+        )}
+      </Modal>
     </div>
   );
 }

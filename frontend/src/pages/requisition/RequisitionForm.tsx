@@ -19,9 +19,12 @@ import { useToast } from '../../components/Toast';
 import { useLookupOptions, useUserOptions, fetchItemProfile, type ItemProfile } from '../../lib/masters';
 import { ItemSelect } from '../../components/MasterSelect';
 import { matchCostCentre } from '../../lib/costCentreMatch';
+import {
+  mayChangeRequisition, maySubmitRequisition, requisitionFormMode, requisitionFormActions, type RequisitionParties,
+} from '../../lib/requisitionAccess';
 import { PageHeader } from '../../layout/AppShell';
 import {
-  Button, Card, CardBody, CardHeader, Field, Input, Select, EmptyState, LoadingBlock,
+  Button, Card, CardBody, CardHeader, Field, Input, Select, EmptyState, LoadingBlock, Banner,
 } from '../../components/ui';
 import { qty, today, text, toShortUom } from '../../lib/format';
 
@@ -181,7 +184,16 @@ export default function RequisitionForm() {
     qty: validLines.reduce((s, l) => s + Number(l.requestedQty || 0), 0),
   };
   const existingStatus = (existing.data as { status?: string } | undefined)?.status;
-  const editingPending = isEdit && (existingStatus === 'PENDING_APPROVAL' || existingStatus === 'RETURNED');
+  // A RETURNED requisition is back with its raiser to correct and resubmit; only
+  // one awaiting approval is saved without resubmitting (E2E S4-05).
+  const mode = requisitionFormMode(isEdit, existingStatus);
+  const parties = existing.data as RequisitionParties | undefined;
+  const viewer = { id: user?.id, isSuperAdmin };
+  const mayChange = !isEdit || (parties ? mayChangeRequisition(parties, viewer) : false);
+  const formActions = requisitionFormActions(mode, {
+    mayChange,
+    maySubmit: !isEdit || (parties ? maySubmitRequisition(parties, viewer) : false),
+  });
 
   const save = useMutation({
     mutationFn: ({ submit }: { submit: boolean }) => {
@@ -196,7 +208,9 @@ export default function RequisitionForm() {
     },
     onSuccess: (res, vars) => {
       toast.success(
-        vars.submit ? 'Requisition submitted for HOD approval' : isEdit ? 'Requisition saved' : 'Requisition created',
+        vars.submit
+          ? (mode === 'returned' ? 'Requisition resubmitted for HOD approval' : 'Requisition submitted for HOD approval')
+          : isEdit ? 'Requisition saved' : 'Requisition created',
         res.requisition_no,
       );
       void qc.invalidateQueries({ queryKey: ['requisitions'] });
@@ -235,21 +249,35 @@ export default function RequisitionForm() {
             <Button variant="ghost" size="sm" icon={<ArrowLeft size={13} />} onClick={() => navigate('/requisitions')}>
               Cancel
             </Button>
-            <Button variant="secondary" size="sm" icon={<Save size={13} />}
-                    loading={save.isPending && !save.variables?.submit}
-                    onClick={() => attemptSave(false)}>
-              {editingPending ? 'Save changes' : 'Save draft'}
-            </Button>
-            {!editingPending && (
+            {formActions.save && (
+              <Button variant="secondary" size="sm" icon={<Save size={13} />}
+                      loading={save.isPending && !save.variables?.submit}
+                      onClick={() => attemptSave(false)}>
+                {formActions.save}
+              </Button>
+            )}
+            {formActions.submit && (
               <Button variant="primary" size="sm" icon={<Send size={13} />}
                       loading={save.isPending && save.variables?.submit === true}
                       onClick={() => attemptSave(true)}>
-                Submit for HOD approval
+                {formActions.submit}
               </Button>
             )}
           </>
         }
       />
+
+      {/* The server would refuse the save (assertOwnRequisition / assertRequisitionEditable),
+          so the form says so instead of offering it (E2E S1-06: PU opened a colleague's edit form). */}
+      {isEdit && (mode === 'locked' || !mayChange) && (
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Banner tone="warning">
+            {mode === 'locked'
+              ? <>This requisition is {String(existingStatus ?? '').replace(/_/g, ' ').toLowerCase()} and can no longer be edited.</>
+              : <>This requisition was raised by someone else. Only the person who raised it, its HOD or an administrator can change it.</>}
+          </Banner>
+        </div>
+      )}
 
       <Card style={{ marginBottom: 'var(--sp-4)' }}>
         <CardHeader title="Requisition header" subtitle="The requisition number is issued by the system when you save" />
@@ -437,8 +465,13 @@ export default function RequisitionForm() {
       >
         <Info size={14} style={{ flexShrink: 0 }} />
         <span>
-          {editingPending ? (
-            <>This requisition is <strong>awaiting HOD approval</strong> (or was returned for correction). Saving keeps it in the workflow — no need to resubmit unless returned.</>
+          {mode === 'pending' ? (
+            <>This requisition is <strong>awaiting HOD approval</strong>. Saving keeps it with the HOD, who then approves, returns or rejects it.</>
+          ) : mode === 'returned' ? (
+            <>
+              This requisition was <strong>returned for correction</strong>. <strong>Save changes</strong> keeps it with
+              you; <strong>Resubmit for HOD approval</strong> sends the corrected requisition back to the HOD.
+            </>
           ) : (
             <>
               <strong>Save draft</strong> keeps this editable. <strong>Submit for HOD approval</strong> sends it to your

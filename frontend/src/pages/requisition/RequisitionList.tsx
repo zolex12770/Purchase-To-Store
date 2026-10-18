@@ -17,6 +17,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Plus, CheckCircle2, XCircle, RotateCcw, PackageCheck, Printer, Download } from 'lucide-react';
 import { api, qs, downloadFile, type PageMeta } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
+import { mayApproveRequisition, mayDecideRequisition } from '../../lib/requisitionAccess';
 import { useFilters, type FilterState } from '../../lib/useFilters';
 import { useToast } from '../../components/Toast';
 import { PageHeader } from '../../layout/AppShell';
@@ -35,6 +36,8 @@ interface RequisitionRow {
   store_status: 'PENDING' | 'ISSUED';
   employee_name: string;
   employee_code: string;
+  requester_user_id: number | null;
+  hod_user_id: number | null;
   department_name: string | null;
   hod_name: string | null;
   machine_name: string | null;
@@ -100,7 +103,8 @@ const SCOPE_META: Record<string, { title: string; subtitle: string; empty: strin
 
 export default function RequisitionList({ scope }: { scope?: RequisitionScope }) {
   const navigate = useNavigate();
-  const { can } = useAuth();
+  const { can, user, isSuperAdmin } = useAuth();
+  const viewer = { id: user?.id, isSuperAdmin };
   const toast = useToast();
   const qc = useQueryClient();
   const { filters, setFilters, clearFilters, activeCount } = useFilters();
@@ -240,11 +244,16 @@ export default function RequisitionList({ scope }: { scope?: RequisitionScope })
       key: 'actions', header: '', align: 'right', locked: true, width: '120px',
       render: (r) => (
         <div className="row" style={{ gap: 2, justifyContent: 'flex-end' }} onClick={(e) => e.stopPropagation()}>
-          {r.status === 'PENDING_APPROVAL' && can('requisition.approve') && (
+          {/* Only this requisition's HOD (or a Super Admin) decides it; every employee
+              holds requisition.approve, so the permission alone offered the decision on
+              every pending row, and the server refused it (403). */}
+          {r.status === 'PENDING_APPROVAL' && can('requisition.approve') && mayDecideRequisition(r, viewer) && (
             <>
-              <Button variant="ghost" size="sm" title="Approve" onClick={() => { setAction({ row: r, kind: 'approve' }); setReason(''); }}>
-                <CheckCircle2 size={14} style={{ color: 'var(--success-600)' }} />
-              </Button>
+              {mayApproveRequisition(r, viewer) && (
+                <Button variant="ghost" size="sm" title="Approve" onClick={() => { setAction({ row: r, kind: 'approve' }); setReason(''); }}>
+                  <CheckCircle2 size={14} style={{ color: 'var(--success-600)' }} />
+                </Button>
+              )}
               <Button variant="ghost" size="sm" title="Return for correction" onClick={() => { setAction({ row: r, kind: 'return' }); setReason(''); }}>
                 <RotateCcw size={14} style={{ color: 'var(--warning-600)' }} />
               </Button>

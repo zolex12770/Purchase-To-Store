@@ -252,6 +252,7 @@ router.get(
     const rows = await query(
       `SELECT h.id, h.requisition_no, h.requisition_date, h.status,
               h.employee_name, h.employee_code, h.department_name, h.hod_name, h.machine_id, h.cost_centre_id,
+              h.requester_user_id, h.hod_user_id,
               cc.name AS cost_centre_name, m.name AS machine_name,
               b.hod_status, b.store_status,
               b.line_count, b.total_requested_qty, b.total_issued_qty, b.total_pending_qty, b.total_excess_qty,
