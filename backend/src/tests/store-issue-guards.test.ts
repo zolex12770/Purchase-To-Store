@@ -186,10 +186,12 @@ describe('a store issue sent twice, or from a stale dialog, is refused (S4-12)',
     const plain = await approvedRequisition([{ itemId, qty: '1' }]);
     expect((await issue(plain.id, [{ requisitionLineId: plain.lineIds[0]!, issueQty: '1' }])).status).toBe(201);
     expect((await issue(plain.id, [{ requisitionLineId: plain.lineIds[0]!, issueQty: '1' }])).status).toBe(201);
-    const bad = await issue(plain.id, [{ requisitionLineId: plain.lineIds[0]!, issueQty: '1', expectedIssuedQty: '-1' }]);
-    expect(bad.status).toBe(422);
-    const blank = await issue(plain.id, [{ requisitionLineId: plain.lineIds[0]!, issueQty: '1', expectedIssuedQty: ' ' }]);
-    expect(blank.status).toBe(422);
+    for (const expectedIssuedQty of ['-1', ' ', 'two']) {
+      const bad = await issue(plain.id, [{ requisitionLineId: plain.lineIds[0]!, issueQty: '1', expectedIssuedQty }]);
+      expect(bad.status, expectedIssuedQty).toBe(422);
+      expect(bad.body.error.issues, expectedIssuedQty).toEqual([{ field: 'lines.0.expectedIssuedQty', message: 'Must be a quantity of zero or more.' }]);
+    }
+    expect((await requisition(plain.id)).issues).toHaveLength(2);
   });
 });
 
