@@ -4,7 +4,8 @@
  * Post-GRN QC inspection lifecycle:
  * - Material with `qc_required = true` is held in QC before entering usable stock.
  * - Inspectors record test findings, accepted/rejected quantities, and dispositions.
- * - On QC Passed / Accepted with Deviation, accepted quantity is released into live stock.
+ * - On QC Passed / Accepted with Deviation, accepted quantity is released into live stock;
+ *   a pass accepts some of the lot (one of nothing is refused: that is QC Failed).
  * - On QC Failed (Full Rejection / RTV), the whole lot is rejected: nothing is accepted,
  *   and it remains isolated and routed for RTV/Scrap.
  */
@@ -300,6 +301,18 @@ router.post(
         throw ValidationError(
           'A failed inspection rejects the whole lot; record a partial acceptance as Accepted with deviation.',
           [{ field: 'acceptedQty', message: 'A failed inspection accepts nothing.' }],
+        );
+      }
+
+      // The other way round, a pass releases what it accepts, so it accepts something.
+      // QC Passed or Accepted with deviation of 0 accepted and all rejected was recorded
+      // as a pass that released nothing: the GRN read QC_PASSED, the QC tiles counted
+      // it as passed, and a pass is never decided again, so the rejected lot could not
+      // be put right (T3 follow-up review). The amount is checked as stored: 0.00001 is 0.
+      if (isPass && !dec(accepted).greaterThan(0)) {
+        throw ValidationError(
+          'A pass accepts some of the lot; to reject the whole lot, record QC Failed.',
+          [{ field: 'acceptedQty', message: 'A pass accepts more than 0.' }],
         );
       }
 
