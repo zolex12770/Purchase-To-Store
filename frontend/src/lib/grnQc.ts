@@ -127,26 +127,101 @@ export function grnSaveOutcome(args: { postedEdit: boolean; post: boolean; qcSta
   return { title: 'GRN saved as draft', detail: args.grnNo, justSaved: 'draft' };
 }
 
-/** POST /qc/inspections/:id/decide answers with what happened to the stock. */
+/** POST /qc/inspections/:id/decide answers with what happened to the stock and the split it recorded. */
 export interface QcDecisionResult {
   status: string;
   stockMoved: boolean;
   message: string;
   overallQcStatus?: string;
-}
-
-/** The toast after a QC decision: whether stock moved, not always 'stock updated'. */
-export function qcDecisionToast(res: QcDecisionResult): { title: string; detail: string } {
-  if (res.stockMoved) return { title: 'Decision recorded: accepted quantity added to stock', detail: res.message };
-  const why = isQcOpen(res.status)
-    ? 'The material stays held out of stock until QC passes or fails it.'
-    : 'Nothing was accepted, so nothing went into stock.';
-  return { title: 'Decision recorded: stock unchanged', detail: `${res.message} ${why}` };
+  /** Accepted and rejected as recorded: on the inspection, and on the GRN line for a final decision. */
+  acceptedQty: string;
+  rejectedQty: string;
 }
 
 /** Quantities in ten-thousandths, as the database stores them (NUMERIC(18,4)): 0.1 + 0.2 is 0.3. */
 const units = (v: string | number | null | undefined): number => Math.round(Number(v || 0) * 10_000);
 const shown = (u: number): string => String(u / 10_000);
+
+/**
+ * The toast after a QC decision: whether stock moved, not always 'stock updated', and a
+ * final decision's accepted and rejected quantities as the server recorded them. It said
+ * 'Nothing was accepted' for any final decision that moved no stock, so a failed
+ * inspection recorded with 2 accepted was told as accepting nothing (T3 review follow-up).
+ */
+export function qcDecisionToast(res: QcDecisionResult): { title: string; detail: string } {
+  if (isQcOpen(res.status)) {
+    return {
+      title: 'Decision recorded: stock unchanged',
+      detail: `${res.message} The material stays held out of stock until QC passes or fails it.`,
+    };
+  }
+  const accepted = units(res.acceptedQty);
+  const rejected = units(res.rejectedQty);
+  if (res.stockMoved) {
+    return {
+      title: 'Decision recorded: accepted quantity added to stock',
+      detail: `${res.message} ${shown(accepted)} accepted into stock${rejected > 0 ? `; ${shown(rejected)} rejected` : ''}.`,
+    };
+  }
+  return {
+    title: 'Decision recorded: stock unchanged',
+    detail: accepted === 0
+      ? `${res.message} Nothing was accepted${rejected > 0 ? ` (${shown(rejected)} rejected)` : ''}, so nothing went into stock.`
+      : `${res.message} ${shown(accepted)} accepted${rejected > 0 ? ` and ${shown(rejected)} rejected` : ''} were recorded, but nothing went into stock.`,
+  };
+}
+
+/** Why the QC form fixes the split of a failed inspection, shown under its quantities. */
+export const QC_FAILED_SPLIT_HINT = 'A failed inspection rejects the whole lot. To accept part of it, choose Accepted with Deviation.';
+
+/**
+ * The split the QC form shows and sends. QC Failed is 'Full Rejection / RTV': nothing
+ * accepted and all that was received rejected, the only split the server records for it
+ * (qc/routes.ts refuses an accepted quantity). Other decisions send what was entered.
+ */
+export function qcDecisionSplit(
+  status: string, accepted: string, rejected: string, received: string,
+): { accepted: string; rejected: string; fixed: boolean } {
+  if (status === 'QC_FAILED') return { accepted: '0', rejected: received, fixed: true };
+  return { accepted, rejected, fixed: false };
+}
+
+/** The decisions that release what they accept into stock (backend qc/routes.ts isPass). */
+export const QC_PASS_DECISIONS: readonly string[] = ['QC_PASSED', 'ACCEPTED_WITH_DEVIATION'];
+/** A final decision accounts for everything received: what is not accepted is rejected. */
+export const QC_FINAL_DECISIONS: readonly string[] = [...QC_PASS_DECISIONS, 'QC_FAILED'];
+
+/** The quantities the QC form holds, as its inputs hold them. */
+export interface QcFormSplit { accepted: string; rejected: string }
+
+/**
+ * The quantities the QC form holds once its decision changes from `from` to `to`. QC Passed
+ * is full acceptance and QC Failed full rejection, so each sets its own split. Leaving QC
+ * Failed for any other decision empties the quantities, to be entered afresh: the failed
+ * split (0 accepted, all received rejected) stayed in the form, so Update on a failed
+ * inspection and then Accepted with Deviation sent a pass of 0 accepted, which the server
+ * recorded as passed and, being a pass, never let be decided again (T3 follow-up review).
+ * Between the other decisions, what was entered stays.
+ */
+export function qcSplitOnDecisionChange(from: string, to: string, form: QcFormSplit, received: string): QcFormSplit {
+  if (to === 'QC_PASSED') return { accepted: received, rejected: '0' };
+  if (to === 'QC_FAILED') return { accepted: '0', rejected: received };
+  if (from === 'QC_FAILED') return { accepted: '', rejected: '' };
+  return form;
+}
+
+/** Why the QC form does not send a pass of nothing (the server refuses one too, qc/routes.ts). */
+export const QC_PASS_NOTHING_ACCEPTED = 'A pass accepts some of the lot. Enter the accepted quantity, or choose QC Failed to reject all of it.';
+
+/**
+ * Why the QC form cannot send this decision, or null: the server's own rules, checked
+ * before it is asked. A pass releases what it accepts, so it accepts something (in stored
+ * units: 0.00001 is 0); a final decision accounts for all that was received.
+ */
+export function qcDecisionProblem(status: string, form: QcFormSplit, received: string): string | null {
+  if (QC_PASS_DECISIONS.includes(status) && units(form.accepted) <= 0) return QC_PASS_NOTHING_ACCEPTED;
+  return qcSplitProblem(form.accepted, form.rejected, received, QC_FINAL_DECISIONS.includes(status));
+}
 
 /** What is left to reject once `accepted` of `received` is accepted, as the form fills it in: 0.3 − 0.1 is 0.2, not 0.19999999999999998. */
 export function qcRemainder(received: string | number, accepted: string | number): string | null {

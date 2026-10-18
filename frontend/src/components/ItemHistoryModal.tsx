@@ -33,7 +33,9 @@ interface ItemHistoryData {
   }[];
   rateHistory: {
     po_id: number; po_no: string; po_date: string; supplier_name: string;
-    po_qty: string; final_rate: string; received_qty: string; pending_grn_qty: string; po_status: string;
+    po_qty: string; final_rate: string; received_qty: string; po_status: string;
+    /** Still to be delivered: 0 unless the order is issued and open and the line open (migration 031). */
+    open_pending_qty: string;
   }[];
   grnHistory: {
     grn_line_id: number; grn_id: number; grn_no: string; grn_date: string; grn_status: string;
@@ -149,7 +151,7 @@ export function ItemHistoryModal({ itemId, onClose }: { itemId: number | null; o
           </Section>
 
           <Section title="Purchase order history" count={d.rateHistory.length}>
-            <thead><tr><th>Date</th><th>PO no</th><th>Supplier</th><th className="right">PO qty</th><th className="right">Rate</th><th className="right">Received</th><th>Status</th></tr></thead>
+            <thead><tr><th>Date</th><th>PO no</th><th>Supplier</th><th className="right">PO qty</th><th className="right">Rate</th><th className="right">Received</th><th className="right">Pending</th><th>Status</th></tr></thead>
             <tbody>
               {d.rateHistory.map((r) => (
                 <tr key={r.po_id}>
@@ -159,6 +161,8 @@ export function ItemHistoryModal({ itemId, onClose }: { itemId: number | null; o
                   <td className="right num">{qty(r.po_qty)}</td>
                   <td className="right num">{money(r.final_rate)}</td>
                   <td className="right num cell-strong">{qty(r.received_qty)}</td>
+                  {/* The 'Pending GRN qty' tile's rule: a draft, a short-closed order and a closed line show 0. */}
+                  <td className="right num" style={pendingStyle(r.open_pending_qty)}>{qty(r.open_pending_qty)}</td>
                   <td><StatusBadge status={r.po_status} plain /></td>
                 </tr>
               ))}

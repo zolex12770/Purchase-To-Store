@@ -15,8 +15,10 @@
  *      short-closed, a cancelled and a draft order, and leave out a closed line.
  *   2. The dashboard's pending KPIs, the Pending PO list, the receipt evidence summary
  *      and the exports (orders and lines) agree to the rupee and the unit.
- *   3. The item profile, the item master and the inventory overview count only issued,
- *      open orders; the stock register still counts a draft as supply in the pipeline.
+ *   3. The item profile, the item master, the item drawers (GET /items/:id: the Item Master
+ *      and Item History 'Pending GRN qty' and each order's row) and the inventory overview
+ *      count only issued, open orders; the stock register still counts a draft as supply
+ *      in the pipeline.
  *   4. The raw balance stays on the line for the GRN quantity guards.
  *
  * Real PGlite database, migrated and seeded from scratch.
@@ -220,6 +222,33 @@ describe('Pending GRN on the item and the inventory overview: issued, open order
     expect(num(profile.live.pendingGrnQty)).toBe(10);
     const item = (await request(app).get(api(`/items/${ids.cable}`)).set(auth(adminToken))).body.data;
     expect(num(item.pending_grn_qty)).toBe(10);
+  });
+
+  it("the Item Master and Item History drawers: the 'Pending GRN qty' tile and each order's row (GET /items/:id)", async () => {
+    type RateRow = { po_id: number; open_pending_qty?: string; pending_grn_qty?: string };
+    const detail = async (itemId: number) => {
+      const res = await request(app).get(api(`/items/${itemId}`)).set(auth(adminToken));
+      expect(res.status).toBe(200);
+      return res.body.data as { summary: { pending_qty: string }; rateHistory: RateRow[] };
+    };
+    const rowsOf = (rows: RateRow[]) =>
+      rows.map((r) => [Number(r.po_id), num(r.open_pending_qty)]).sort((a, b) => a[0]! - b[0]!);
+    const byId = (pairs: number[][]) => pairs.sort((a, b) => a[0]! - b[0]!);
+
+    // Before: 21, every non-cancelled order's raw balance: the open order's 10, the
+    // short-closed order's 6, the draft's 3 and the closed line's 2 (T3 review follow-up).
+    const cable = await detail(ids.cable);
+    expect(num(cable.summary.pending_qty)).toBe(10);
+    expect(rowsOf(cable.rateHistory))
+      .toEqual(byId([[ids.open, 10], [ids.shortClosed, 0], [ids.draft, 0], [ids.closedLine, 0]]));
+    expect(cable.rateHistory.reduce((s, r) => s + num(r.open_pending_qty), 0)).toBe(num(cable.summary.pending_qty));
+    // The raw balance is not offered to the drawers, so neither can show it as pending.
+    expect(cable.rateHistory.some((r) => 'pending_grn_qty' in r)).toBe(false);
+
+    // The cancelled order is not listed; the open bolt line of the mixed order is pending.
+    const bolt = await detail(ids.bolt);
+    expect(num(bolt.summary.pending_qty)).toBe(4);
+    expect(rowsOf(bolt.rateHistory)).toEqual([[ids.closedLine, 4]]);
   });
 
   it("the overview's 'Pipeline POs (Awaiting GRN)' is the Pending PO list", async () => {

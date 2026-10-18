@@ -50,7 +50,8 @@ interface Item {
 
 interface ItemDetail extends Item {
   summary: { po_count: number; total_ordered_qty: string; total_received_qty: string; pending_qty: string; total_value: string; avg_rate: string; min_rate: string | null; max_rate: string | null };
-  rateHistory: { po_date: string; po_no: string; po_id: number; final_rate: string; rate: string; discount_pct: string; po_qty: string; supplier_name: string; supplier_id: number }[];
+  /** open_pending_qty: what this order still has to deliver, 0 unless it is issued and open (migration 031). */
+  rateHistory: { po_date: string; po_no: string; po_id: number; final_rate: string; rate: string; discount_pct: string; po_qty: string; open_pending_qty: string; supplier_name: string; supplier_id: number }[];
   suppliers: { supplier_id: number; supplier_name: string; po_count: number; total_qty: string; total_value: string; avg_rate: string }[];
   openIndents: { indent_line_id: number; indent_id: number; indent_no: string; indent_date: string; indent_qty: string; ordered_qty: string; pending_qty: string }[];
   requisitions: {
@@ -450,7 +451,7 @@ export default function Items() {
                 <div className="table-wrap" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', maxHeight: 280 }}>
                   <table className="table table-compact">
                     <thead>
-                      <tr><th>PO No</th><th>Date</th><th>Supplier</th><th className="right">Qty</th><th className="right">Rate</th><th className="right">Disc %</th><th className="right">Final rate</th></tr>
+                      <tr><th>PO No</th><th>Date</th><th>Supplier</th><th className="right">Qty</th><th className="right">Pending GRN</th><th className="right">Rate</th><th className="right">Disc %</th><th className="right">Final rate</th></tr>
                     </thead>
                     <tbody>
                       {detail.data.rateHistory.map((r, i) => (
@@ -459,6 +460,8 @@ export default function Items() {
                           <td>{formatDate(r.po_date)}</td>
                           <td className="cell-wrap" style={{ minWidth: 130, maxWidth: 220 }}>{r.supplier_name}</td>
                           <td className="right num">{qty(r.po_qty)}</td>
+                          {/* The 'Pending GRN qty' tile's own rule: a draft, a short-closed order and a closed line show 0. */}
+                          <td className="right num" style={{ color: Number(r.open_pending_qty) > 0 ? 'var(--warning-600)' : 'var(--text-faint)' }}>{qty(r.open_pending_qty)}</td>
                           <td className="right num cell-muted">{money(r.rate)}</td>
                           <td className="right num">{Number(r.discount_pct) > 0 ? percent(r.discount_pct) : '—'}</td>
                           <td className="right num cell-strong">{money(r.final_rate)}</td>
